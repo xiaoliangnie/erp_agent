@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>订单换货 · 蜀黍家</title>
+<style>
+:root{--bg:#f4f6f8;--panel:#fff;--ink:#17202a;--muted:#68737d;--line:#dfe4e8;--accent:#245c43;--accent2:#eaf3ee;--warn:#8a5700;--danger:#a53333;--radius:12px}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}.top{height:58px;padding:0 28px;display:flex;align-items:center;gap:20px;background:#fff;border-bottom:1px solid var(--line)}h1{font-size:18px;margin:0 auto 0 0}.top a{color:var(--muted);text-decoration:none}.top a:hover{color:var(--ink)}main{max-width:1280px;margin:24px auto;padding:0 22px;display:grid;grid-template-columns:minmax(340px,420px) 1fr;gap:18px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:20px;box-shadow:0 3px 14px #24312a0a}.panel h2{font-size:16px;margin:0 0 4px}.desc{color:var(--muted);font-size:13px;margin:0 0 18px}.field{margin:13px 0}.field label{display:block;font-weight:600;font-size:13px;margin-bottom:6px}input,textarea,button{font:inherit}input,textarea{width:100%;border:1px solid #cfd6db;border-radius:8px;padding:10px 11px;background:#fff;color:var(--ink)}textarea{min-height:124px;resize:vertical}input:focus,textarea:focus{outline:2px solid #bdd7c9;border-color:var(--accent)}button{border:0;border-radius:8px;padding:10px 14px;cursor:pointer;background:#edf0f2;color:var(--ink)}button.primary{background:var(--accent);color:#fff}button.danger{color:var(--danger);background:#fff0f0}button:disabled{opacity:.45;cursor:not-allowed}.security{padding:12px;border-radius:9px;background:#f7f8f9;border:1px solid var(--line);margin-bottom:16px}.security-grid{display:grid;grid-template-columns:1fr 1fr auto;gap:8px}.statusline{display:flex;align-items:center;gap:8px;margin:0 0 14px}.dot{width:9px;height:9px;border-radius:50%;background:#aaa}.dot.online{background:#2c9463;box-shadow:0 0 0 4px #dff3e8}.dot.offline{background:#c8913b}.small{font-size:12px;color:var(--muted)}.jobs{display:grid;gap:10px}.job{border:1px solid var(--line);border-radius:10px;overflow:hidden}.job-head{padding:11px 13px;display:flex;align-items:center;gap:10px;background:#fafbfb;cursor:pointer}.job-id{font-family:ui-monospace,monospace;font-size:12px}.pill{font-size:12px;padding:2px 8px;border-radius:999px;background:#e9edf0;color:#4a5660}.pill.awaiting_confirm{background:#fff1cf;color:#805200}.pill.executing,.pill.confirmed{background:#e1f0e8;color:#1e6546}.pill.done{background:#e4f4e9;color:#1f6d47}.pill.failed,.pill.cancelled{background:#fde7e7;color:#963434}.job-body{padding:13px;display:none}.job.open .job-body{display:block}.actions{display:flex;gap:8px;justify-content:flex-end;margin:10px 0}.plan{width:100%;border-collapse:collapse;font-size:12px}.plan th,.plan td{text-align:left;border-bottom:1px solid var(--line);padding:7px 6px;vertical-align:top}.ok{color:#19734c}.skip{color:#9b3a3a}.notice{padding:11px;border-left:3px solid #c89943;background:#fff9ea;color:#704900;font-size:12px;margin:12px 0}.empty{padding:48px 10px;text-align:center;color:var(--muted)}#message{min-height:20px;margin-top:10px;color:var(--danger)}@media(max-width:860px){main{grid-template-columns:1fr}.security-grid{grid-template-columns:1fr}.top{padding:0 15px;gap:10px}.top a{font-size:12px}}
+</style>
+</head>
+<body>
+<header class="top"><h1>订单 SKU 换货</h1><a href="采购看板.html">采购看板</a><a href="交期提醒台账.html">交期台账</a><a href="合同生成.html">采购合同</a></header>
+<main>
+  <section class="panel">
+    <h2>新建换货任务</h2>
+    <p class="desc">页面只提交规则和明确订单号。ERP Worker 会先读取真实订单并生成 dry-run，不会立即换货。</p>
+    <div class="security">
+      <div class="security-grid">
+        <input id="token" type="password" autocomplete="off" placeholder="EXCHANGE_API_TOKEN">
+        <input id="operator" autocomplete="off" placeholder="操作人姓名">
+        <button id="connect">连接</button>
+      </div>
+      <div class="small" style="margin-top:7px">Token 仅保存在当前标签页 sessionStorage，不写入页面或本地文件。</div>
+    </div>
+    <div class="statusline"><span id="worker-dot" class="dot offline"></span><span id="worker-text">尚未连接</span></div>
+    <form id="form">
+      <div class="field"><label for="source">源 SKU</label><input id="source" list="products" required placeholder="订单中当前商品编码"></div>
+      <div class="field"><label for="target">目标 SKU</label><input id="target" list="products" required placeholder="要更换成的商品编码"></div>
+      <datalist id="products"></datalist>
+      <div class="field"><label for="oids">ERP 内部订单号 o_id</label><textarea id="oids" required placeholder="每行一个订单号，也支持逗号分隔&#10;10012345&#10;10012346"></textarea></div>
+      <div class="notice">真实执行是 L2 操作：必须等预演清单完整返回，再由创建任务的操作人点击确认。确认后不可自动重试。</div>
+      <button class="primary" id="submit" type="submit">创建 dry-run 任务</button>
+      <div id="message"></div>
+    </form>
+  </section>
+  <section class="panel">
+    <h2>任务与预演</h2>
+    <p class="desc">页面每 3 秒刷新。ERP 标签页离线时，任务会安全停留在队列中。</p>
+    <div id="jobs" class="jobs"><div class="empty">输入 Token 后查看任务</div></div>
+  </section>
+</main>
+<script>
+(() => {
+  const $=id=>document.getElementById(id), labels={pending:'等待 Worker',planning:'正在读取订单',awaiting_confirm:'等待人工确认',confirmed:'已确认待执行',executing:'正在换货',done:'已完成',failed:'失败',cancelled:'已取消'};
+  let timer=null, openId='';
+  $('token').value=sessionStorage.getItem('exchangeToken')||'';$('operator').value=sessionStorage.getItem('exchangeOperator')||'';
+  function headers(){return {'Authorization':'Bearer '+$('token').value.trim(),'Content-Type':'application/json','X-Exchange-Operator':$('operator').value.trim()}}
+  async function api(path,opt={}){const r=await fetch(path,{...opt,headers:{...headers(),...(opt.headers||{})}});let v={};try{v=await r.json()}catch(e){}if(!r.ok)throw new Error(v.error||`HTTP ${r.status}`);return v}
+  function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+  function parseOids(){return [...new Set($('oids').value.split(/[\s,，;；]+/).map(x=>x.trim()).filter(Boolean))]}
+  async function connect(){if(!$('token').value.trim()||!$('operator').value.trim())throw new Error('请填写 Token 和操作人姓名');sessionStorage.setItem('exchangeToken',$('token').value.trim());sessionStorage.setItem('exchangeOperator',$('operator').value.trim());await refresh();await products('')}
+  async function products(q){const v=await api('/api/exchange/products?limit=200&q='+encodeURIComponent(q||''));$('products').innerHTML=v.products.map(p=>`<option value="${esc(p.sku)}">${esc(p.name)} ${esc(p.properties)}</option>`).join('')}
+  function planRows(job){const p=job.plan;if(!p)return '<div class="small">等待 ERP Worker 返回真实订单试算结果。</div>';return `<div class="small">共 ${p.total} 单 · 可换 ${p.exchangeable} · 跳过 ${p.skipped}</div><table class="plan"><thead><tr><th>o_id / 平台单号</th><th>源 → 目标</th><th>数量</th><th>模式 / 结果</th></tr></thead><tbody>${p.plans.map(x=>`<tr><td>${esc(x.o_id)}<br><span class="small">${esc(x.so_id||'')}</span></td><td>${esc(x.src_sku_id||x.source_sku||job.rules.replacements[0].from)} → ${esc(x.new_sku_id||x.target_sku||job.rules.replacements[0].to)}</td><td>${esc(x.qty??'—')}</td><td class="${x.ok?'ok':'skip'}">${x.ok?esc(x.mode):esc(x.reason)}</td></tr>`).join('')}</tbody></table>`}
+  function progress(job){if(!job.progress.length&&!job.result)return '';const rows=job.progress.map(x=>`${esc(x.o_id)}：${x.status==='success'?'成功':'失败 '+esc(x.error||'')}`).join('<br>');const result=job.result?`<div class="small" style="margin-top:7px">完成：${(job.result.succeeded||[]).length}，失败：${(job.result.failed||[]).length}</div>`:'';return `<div class="notice">${rows||'任务已结束'}${result}</div>`}
+  function render(jobs){if(!jobs.length){$('jobs').innerHTML='<div class="empty">还没有换货任务</div>';return}$('jobs').innerHTML=jobs.map(job=>`<article class="job ${openId===job.id?'open':''}" data-id="${job.id}"><div class="job-head"><span class="pill ${job.status}">${labels[job.status]||esc(job.status)}</span><span class="job-id">${job.id}</span><span class="small">${esc(job.rules.replacements[0].from)} → ${esc(job.rules.replacements[0].to)} · ${job.targets.o_ids.length} 单</span></div><div class="job-body">${planRows(job)}${progress(job)}${job.error?`<div class="notice">${esc(job.error)}</div>`:''}<div class="actions">${['pending','planning','awaiting_confirm','confirmed'].includes(job.status)?`<button class="danger" data-action="cancel">取消</button>`:''}${job.status==='awaiting_confirm'&&job.plan.exchangeable>0?`<button class="primary" data-action="confirm">确认执行 ${job.plan.exchangeable} 单</button>`:''}</div><div class="small">创建：${esc(job.operator)} · ${esc(job.createdAt)}${job.workerId?' · Worker '+esc(job.workerId):''}</div></div></article>`).join('')}
+  async function refresh(){const [s,j]=await Promise.all([api('/api/exchange/status'),api('/api/exchange/jobs')]);const online=s.onlineWorkers>0;$('worker-dot').className='dot '+(online?'online':'offline');$('worker-text').textContent=online?`${s.onlineWorkers} 个 ERP Worker 在线`:'ERP Worker 离线，任务不会执行';render(j.jobs)}
+  $('connect').onclick=()=>connect().then(()=>{$('message').textContent=''}).catch(e=>$('message').textContent=e.message);
+  $('form').onsubmit=async e=>{e.preventDefault();try{const source=$('source').value.trim(),target=$('target').value.trim(),oids=parseOids();if(source===target)throw new Error('源 SKU 与目标 SKU 不能相同');if(!oids.length)throw new Error('必须填写明确的内部订单号 o_id');$('submit').disabled=true;await api('/api/exchange/jobs',{method:'POST',headers:{'Idempotency-Key':crypto.randomUUID()},body:JSON.stringify({rules:{strategy:'direct',replacements:[{from:source,to:target}]},targets:{o_ids:oids,limit:500},operator:$('operator').value.trim()})});$('message').textContent='';await refresh()}catch(e){$('message').textContent=e.message}finally{$('submit').disabled=false}};
+  $('jobs').onclick=async e=>{const article=e.target.closest('.job');if(!article)return;const action=e.target.dataset.action;if(!action){openId=openId===article.dataset.id?'':article.dataset.id;return refresh()}try{if(action==='confirm'&&!confirm('确认按当前 dry-run 清单执行真实换货？该操作会修改 ERP 订单，且不会自动重试。'))return;await api(`/api/exchange/jobs/${article.dataset.id}/${action}`,{method:'POST',body:JSON.stringify({operator:$('operator').value.trim()})});openId=article.dataset.id;await refresh()}catch(err){alert(err.message)}};
+  for(const id of ['source','target'])$(id).addEventListener('input',e=>{clearTimeout(e.target._t);e.target._t=setTimeout(()=>products(e.target.value).catch(()=>{}),300)});
+  if($('token').value&&$('operator').value)connect().catch(e=>$('message').textContent=e.message);timer=setInterval(()=>{if($('token').value)refresh().catch(()=>{})},3000);
+})();
+</script>
+</body>
+</html>

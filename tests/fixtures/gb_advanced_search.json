@@ -1,0 +1,49 @@
+{
+  "total": 2,
+  "pageNumber": 1,
+  "rows": [
+    {
+      "id": "52AF72FB01A5403AE06397BE0A0AD6A8",
+      "C_STD_CODE": "GB/T 9832-2026",
+      "STD_CODE2": "GB/T9832-2026",
+      "STD_CODE3": "GBT 9832-2026",
+      "C_C_NAME": "毛绒、布制玩具",
+      "C_E_NAME": "Sewed plush and cloth toys",
+      "STATE": "即将实施",
+      "STD_NATURE": "推荐性",
+      "STD_TYPE": "产品",
+      "ICS": "97.200.50",
+      "CCS": "Y57",
+      "ICS_NAME1_FULL": "97_家用和商用设备、文娱、体育/97.200_文娱活动设备/97.200.50_玩具",
+      "ISSUE_DATE": "2026-05-25",
+      "ACT_DATE": "2027-06-01",
+      "ISSUE_ANN_NO": "2026年第23号",
+      "TOTAL_REPE": "GB/T 9832-2007",
+      "TA_CODE": "TC253",
+      "TA_NAME": "全国玩具标准化技术委员会",
+      "C_PLAN_CODE": "20242626-T-607",
+      "OPEN_HASH_CODE": "3D8664AABD788F6F00C742433CEAEFBC",
+      "SYS_INPUTIME": "2026-05-26 09:31:32",
+      "STD_DOMAIN": "国家标准",
+      "TABLE_NAME": "BV_GB",
+      "DRAFT_STAFF": "不应入库"
+    },
+    {
+      "id": "71F772D7EXAMPLEOLD98322007",
+      "C_STD_CODE": "GB/T 9832-2007",
+      "STD_CODE2": "GB/T9832-2007",
+      "C_C_NAME": "<b>毛绒、布制玩具</b>",
+      "C_E_NAME": "Sewed plush and cloth toys",
+      "STATE": "现行",
+      "STD_NATURE": "推荐性",
+      "STD_TYPE": "产品",
+      "ICS": "97.200.50",
+      "CCS": "Y 57",
+      "ISSUE_DATE": "2007-12-05",
+      "ACT_DATE": "2008-09-01",
+      "TOTAL_REPE": ",",
+      "OPEN_HASH_CODE": "FEEC82DA000000000000000000000001",
+      "TABLE_NAME": "BV_GB"
+    }
+  ]
+}

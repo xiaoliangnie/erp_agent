@@ -1,0 +1,1785 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>采购看板 · 蜀黍家</title>
+<style>
+/* ───────────────────────── 令牌 ───────────────────────── */
+:root {
+  color-scheme: light;
+  --plane:          #f9f9f7;
+  --surface-1:      #fcfcfb;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --grid:           #e1e0d9;
+  --axis:           #c3c2b7;
+  --border:         rgba(11,11,11,.10);
+  --wash:           rgba(11,11,11,.04);
+
+  --series-1:       #2a78d6;   /* 分类槽 1 —— 全站唯一的强调色 */
+  --track:          #9ec5f4;   /* 同色系浅步进，仪表未完成段 */
+  --deemph:         #d8d7d1;
+
+  --good:           #0ca30c;
+  --warning:        #fab219;
+  --critical:       #d03b3b;
+  --delta-up:       #006300;
+
+  /* 到货预警档位（红→橙→黄→蓝→浅蓝→灰，越靠前越急） */
+  --tier-overdue: #d03b3b; --tier-d1: #e2622b; --tier-d10: #fab219;
+  --tier-d20:     #2a78d6; --tier-far: #9ec5f4; --tier-none: #d8d7d1;
+
+  /* 顺序色阶（蓝，浅→深）—— 热力图 */
+  --seq-0: #e8f1fd; --seq-1: #cde2fb; --seq-2: #9ec5f4; --seq-3: #6da7ec;
+  --seq-4: #3987e5; --seq-5: #256abf; --seq-6: #184f95; --seq-7: #0d366b;
+  --seq-ink-flip: 4;           /* ≥ 该级用白字 */
+
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", system-ui, "Segoe UI", sans-serif;
+}
+/* ───────────────────────── 基础 ───────────────────────── */
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }   /* 组件用了 display:flex，要压过 UA 的 [hidden] */
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--plane);
+  color: var(--text-primary);
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; border-radius: 3px; }
+button { font: inherit; color: inherit; }
+
+/* 眉标：始终写明「度量 · 单位」，不做装饰 */
+.eyebrow {
+  font-size: 10px; letter-spacing: .14em; text-transform: uppercase;
+  color: var(--text-muted); font-weight: 600; margin: 0;
+}
+.num { font-variant-numeric: tabular-nums; }
+
+/* ───────────────────────── 顶栏 ───────────────────────── */
+.topbar {
+  display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  padding: 22px 24px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.topbar h1 {
+  margin: 0; font-size: 19px; font-weight: 650; letter-spacing: .04em;
+}
+.topbar .sub { color: var(--text-secondary); font-size: 12px; }
+.topbar .sub b { font-weight: 600; color: var(--text-primary); }
+.topbar .spacer { flex: 1 1 auto; }
+.topbar a.nav-link { color: var(--text-secondary); font-size: 12px; text-decoration: none; border-bottom: 1px solid var(--border); }
+.topbar a.nav-link:hover { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+/* ───────────────────────── 筛选行 ───────────────────────── */
+.filters {
+  display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
+  padding: 12px 24px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+  position: sticky; top: 0; z-index: 30;
+}
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > label { font-size: 10px; letter-spacing: .12em; color: var(--text-muted); font-weight: 600; }
+.seg { display: flex; border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.seg button {
+  background: transparent; border: 0; padding: 6px 11px; cursor: pointer;
+  font-size: 12px; color: var(--text-secondary); white-space: nowrap;
+}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button:hover { background: var(--wash); }
+.seg button[aria-pressed="true"] { background: var(--series-1); color: #fff; font-weight: 600; }
+select, input[type="search"], input[type="date"] {
+  font: inherit; font-size: 12px; padding: 6px 9px; border-radius: 7px;
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+}
+input[type="search"] { min-width: 210px; }
+.filters .reset {
+  background: transparent; border: 0; border-bottom: 1px solid var(--border);
+  cursor: pointer; color: var(--text-secondary); padding: 6px 2px; font-size: 12px;
+}
+.filters .reset:hover { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+.slice-note { font-size: 11px; color: var(--text-muted); margin-left: auto; padding-bottom: 7px; }
+
+/* ───────────────────────── 版面 ───────────────────────── */
+.layout {
+  display: grid; grid-template-columns: 268px minmax(0, 1fr);
+  gap: 16px; padding: 16px 24px 40px; align-items: start;
+}
+.cards { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 16px; }
+
+/* 台账栏 —— 一列对齐的账目，而非一排 KPI 卡 */
+.rail {
+  position: sticky; top: 74px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 18px 6px;
+}
+.hero-label { display: flex; align-items: baseline; justify-content: space-between; }
+.hero {
+  font-size: 46px; line-height: 1.05; font-weight: 660; letter-spacing: -.02em;
+  margin: 6px 0 2px;
+}
+.hero .unit { font-size: 17px; font-weight: 500; color: var(--text-secondary); margin-left: 4px; letter-spacing: 0; }
+.hero-sub { font-size: 11px; color: var(--text-muted); }
+.spark { margin: 12px 0 2px; }
+.ledger { margin-top: 12px; border-top: 1px solid var(--border); }
+.ledger-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 11px 0; border-bottom: 1px solid var(--border);
+}
+.ledger-row .k { font-size: 12px; color: var(--text-secondary); }
+.ledger-row .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ledger-row .v small { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
+.ledger-row.stack { display: block; }
+.ledger-row.stack .head { display: flex; align-items: baseline; justify-content: space-between; }
+.meter { height: 8px; border-radius: 999px; background: var(--track); margin-top: 8px; overflow: hidden; }
+.meter > i { display: block; height: 100%; background: var(--series-1); border-radius: 999px; }
+.flag { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600; }
+.flag .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+
+/* ───────────────────────── 卡片 ───────────────────────── */
+.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px 18px 14px; min-width: 0;
+}
+.card-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.card-head h2 { margin: 3px 0 0; font-size: 14px; font-weight: 620; letter-spacing: .01em; }
+.card-head .note { font-size: 11px; color: var(--text-muted); margin-top: 2px; }
+.card-head .ctrl { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.mini-seg { display: flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.mini-seg button { background: transparent; border: 0; padding: 3px 9px; font-size: 11px; cursor: pointer; color: var(--text-secondary); }
+.mini-seg button + button { border-left: 1px solid var(--border); }
+.mini-seg button:hover { background: var(--wash); }
+.mini-seg button[aria-pressed="true"] { background: var(--text-primary); color: var(--surface-1); font-weight: 600; }
+
+.span-2 { grid-column: span 2; } .span-3 { grid-column: span 3; }
+.span-4 { grid-column: span 4; } .span-6 { grid-column: span 6; }
+
+.plot { width: 100%; }
+.plot svg { display: block; width: 100%; overflow: visible; }
+.empty { padding: 26px 0; text-align: center; color: var(--text-muted); font-size: 12px; }
+
+/* 图例 */
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 10px 0 0; font-size: 11px; color: var(--text-secondary); }
+.legend .item { display: inline-flex; align-items: center; gap: 6px; }
+.legend .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+.legend .key-line { width: 14px; height: 2px; border-radius: 2px; flex: none; }
+.scale-legend { display: flex; align-items: center; gap: 8px; margin-top: 10px; font-size: 11px; color: var(--text-muted); }
+.scale-legend .ramp { display: flex; gap: 2px; }
+.scale-legend .ramp i { width: 16px; height: 8px; border-radius: 2px; }
+
+/* 表视图（每张图的等价读法） */
+.tbl { max-height: 320px; overflow: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+th { position: sticky; top: 0; background: var(--surface-1); font-weight: 600; color: var(--text-secondary); font-size: 11px; z-index: 1; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: var(--wash); }
+.contract-action { color:var(--series-1); text-decoration:none; white-space:nowrap; font-weight:600; }
+.contract-action:hover { text-decoration:underline; }
+
+/* 采购单表 */
+.orders-table th[data-sort] { cursor: pointer; user-select: none; }
+.orders-table th[data-sort]:hover { color: var(--text-primary); }
+.orders-table th .arrow { color: var(--series-1); margin-left: 3px; }
+.orders-table tbody tr { cursor: pointer; }
+.orders-table td.no { font-variant-numeric: tabular-nums; font-weight: 600; }
+.pager { display: flex; align-items: center; gap: 10px; padding-top: 12px; font-size: 12px; color: var(--text-secondary); }
+.pager button {
+  background: transparent; border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 11px; cursor: pointer;
+}
+.pager button:disabled { opacity: .4; cursor: default; }
+.pager button:not(:disabled):hover { background: var(--wash); }
+.chip {
+  display: inline-block; padding: 1px 8px; border-radius: 999px;
+  font-size: 11px; font-weight: 600; border: 1px solid var(--border);
+}
+
+/* 到货预警档位 —— 既是读数也是筛选入口 */
+.tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(146px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.tier {
+  text-align: left; background: transparent; cursor: pointer;
+  border: 1px solid var(--border); border-left: 3px solid var(--deemph);
+  border-radius: 9px; padding: 9px 12px 10px;
+}
+.tier:hover { background: var(--wash); }
+.tier[aria-pressed="true"] { background: var(--wash); border-color: var(--text-primary); }
+.tier[aria-pressed="true"] { border-left-width: 3px; }
+.tier .t-k { font-size: 11.5px; color: var(--text-secondary); font-weight: 600; }
+.tier .t-v { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 3px 0 1px; }
+.tier .t-v small { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
+.tier .t-s { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.btn {
+  background: transparent; border: 1px solid var(--border); border-radius: 6px;
+  padding: 3px 10px; font-size: 11px; cursor: pointer; color: var(--text-secondary);
+}
+.btn:hover { background: var(--wash); color: var(--text-primary); }
+.btn:disabled { opacity: .4; cursor: default; background: transparent; color: var(--text-secondary); }
+
+/* 提示气泡 */
+.tooltip {
+  position: fixed; z-index: 90; pointer-events: none; opacity: 0;
+  transition: opacity .09s linear;
+  background: var(--surface-1); border: 1px solid var(--border);
+  box-shadow: 0 6px 22px rgba(0,0,0,.13);
+  border-radius: 8px; padding: 9px 11px; min-width: 132px; max-width: 260px;
+}
+.tooltip .tt-title { font-size: 11px; color: var(--text-muted); margin-bottom: 5px; }
+.tooltip .tt-row { display: flex; align-items: baseline; gap: 9px; justify-content: space-between; }
+.tooltip .tt-val { font-size: 14px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.tooltip .tt-name { font-size: 11px; color: var(--text-secondary); display: inline-flex; align-items: center; gap: 5px; }
+.tooltip .tt-key { width: 12px; height: 2px; border-radius: 2px; flex: none; }
+
+/* 明细抽屉 */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.34); z-index: 80; opacity: 0; pointer-events: none; transition: opacity .16s; }
+.scrim.open { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(800px, 96vw); z-index: 81;
+  background: var(--surface-1); border-left: 1px solid var(--border);
+  transform: translateX(100%); transition: transform .2s ease;
+  display: flex; flex-direction: column;
+}
+.drawer.open { transform: none; }
+.drawer-head { padding: 18px 20px 14px; border-bottom: 1px solid var(--border); }
+.drawer-head .row { display: flex; align-items: baseline; gap: 12px; }
+.drawer-head h3 { margin: 0; font-size: 17px; font-variant-numeric: tabular-nums; }
+.drawer-head .close { margin-left: auto; background: transparent; border: 1px solid var(--border); border-radius: 7px; padding: 4px 11px; cursor: pointer; }
+.meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(126px, 1fr)); gap: 10px 16px; margin-top: 14px; }
+.meta-grid .k { font-size: 10px; letter-spacing: .1em; color: var(--text-muted); font-weight: 600; }
+.meta-grid .v { font-size: 12px; }
+.drawer-body { overflow: auto; padding: 0 20px 24px; }
+.drawer-body h4 { font-size: 12px; color: var(--text-secondary); margin: 18px 0 8px; font-weight: 600; }
+#drawer-lines { overflow-x: auto; }
+
+@media (max-width: 1180px) {
+  .layout { grid-template-columns: 1fr; }
+  /* 台账栏横过来：英雄数字占左栏，账目分多列排，避免拉成一条空旷的长条 */
+  .rail { position: static; display: grid; grid-template-columns: minmax(170px, 250px) minmax(0, 1fr); gap: 0 28px; }
+  .rail > .ledger { grid-column: 2; grid-row: 1 / 5; margin-top: 0; border-top: 0;
+                    display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 0 22px; align-content: start; }
+  .rail > .spark { margin-bottom: 14px; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .span-2 { grid-column: span 1; }
+  .span-3, .span-4, .span-6 { grid-column: span 2; }
+}
+@media (max-width: 720px) {
+  .layout { padding: 12px; }
+  .rail { grid-template-columns: minmax(0, 1fr); }
+  .rail > .ledger { grid-column: 1; grid-row: auto; grid-template-columns: minmax(0, 1fr);
+                    margin-top: 12px; border-top: 1px solid var(--border); }
+  .cards { grid-template-columns: minmax(0, 1fr); }
+  .span-2, .span-3, .span-4, .span-6 { grid-column: span 1; }
+  .filters { position: static; }
+  .hero { font-size: 38px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <h1>采购看板</h1>
+  <div class="sub">数据源 <b id="data-source">正在连接…</b> · <span id="span-range"></span> · <span id="span-scale"></span></div>
+  <div class="spacer"></div>
+  <a class="nav-link" href="合同生成.html">生成采购合同</a>
+  <a class="nav-link" href="换货.html">订单换货</a>
+  <a class="nav-link" id="nav-delivery" href="交期提醒台账.html">交期提醒台账 →</a>
+</header>
+
+<div class="filters" role="group" aria-label="全局筛选">
+  <div class="field">
+    <label for="f-year">统计年度</label>
+    <select id="f-year"></select>
+  </div>
+  <div class="field">
+    <label id="lb-range">采购日期</label>
+    <div class="seg" id="range-seg" role="group" aria-labelledby="lb-range"></div>
+  </div>
+  <div class="field" id="custom-range" hidden>
+    <label for="date-from">自定义区间</label>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input type="date" id="date-from"><span style="color:var(--text-muted)">→</span><input type="date" id="date-to">
+    </div>
+  </div>
+  <div class="field">
+    <label for="f-eta">到货期限</label>
+    <select id="f-eta"></select>
+  </div>
+  <div class="field">
+    <label for="f-status">状态</label>
+    <select id="f-status"><option value="">全部</option><option value="1">已确认</option><option value="0">待审核</option></select>
+  </div>
+  <div class="field">
+    <label for="f-cat">品类</label>
+    <select id="f-cat"></select>
+  </div>
+  <div class="field">
+    <label for="f-buyer">采购员</label>
+    <select id="f-buyer"></select>
+  </div>
+  <div class="field">
+    <label for="f-q">搜索</label>
+    <input type="search" id="f-q" placeholder="单号 / 商品 / 编码">
+  </div>
+  <button class="reset" id="f-reset" type="button">清空筛选</button>
+  <div class="slice-note" id="slice-note"></div>
+</div>
+
+<main class="layout">
+  <!-- 台账栏 -->
+  <aside class="rail" aria-label="总览">
+    <div class="hero-label">
+      <p class="eyebrow">采购金额 · 元</p>
+      <span class="flag" id="hero-flag"></span>
+    </div>
+    <div class="hero" id="hero-value">—</div>
+    <div class="hero-sub" id="hero-sub"></div>
+    <div class="spark" id="spark"></div>
+    <div class="ledger">
+      <div class="ledger-row"><span class="k">采购单</span><span class="v" id="s-orders">—<small>单</small></span></div>
+      <div class="ledger-row"><span class="k">明细行</span><span class="v" id="s-lines">—<small>行</small></span></div>
+      <div class="ledger-row"><span class="k">采购数量</span><span class="v" id="s-qty">—<small>件</small></span></div>
+      <div class="ledger-row stack">
+        <div class="head"><span class="k">已入库</span><span class="v" id="s-in">—<small>件</small></span></div>
+        <div class="meter" role="img" aria-label="入库进度"><i id="s-meter" style="width:0"></i></div>
+        <div class="hero-sub" style="margin-top:6px" id="s-meter-note"></div>
+      </div>
+      <div class="ledger-row"><span class="k">待入库</span><span class="v" id="s-open">—<small>件</small></span></div>
+      <div class="ledger-row"><span class="k">待审核</span><span class="v" id="s-pending">—<small>单</small></span></div>
+      <div class="ledger-row"><span class="k">供应商</span><span class="v" id="s-sup">—<small>家</small></span></div>
+    </div>
+  </aside>
+
+  <div class="cards">
+    <!-- 趋势 -->
+    <section class="card span-6" id="card-trend">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">金额 · 元</p>
+          <h2>采购金额走势</h2>
+          <div class="note">按采购单的下单日期归集</div>
+        </div>
+        <div class="ctrl">
+          <div class="mini-seg" id="trend-gran" role="group" aria-label="时间粒度">
+            <button type="button" data-g="day">日</button>
+            <button type="button" data-g="week">周</button>
+            <button type="button" data-g="month" aria-pressed="true">月</button>
+          </div>
+          <div class="mini-seg" data-view="trend" role="group" aria-label="显示方式">
+            <button type="button" data-v="chart" aria-pressed="true">图</button>
+            <button type="button" data-v="table">表</button>
+          </div>
+        </div>
+      </div>
+      <div class="plot" id="trend-plot"></div>
+      <div class="tbl" id="trend-table" hidden></div>
+    </section>
+
+    <!-- 品类 -->
+    <section class="card span-2" id="card-cat">
+      <div class="card-head">
+        <div><p class="eyebrow">金额 · 元</p><h2>品类采购金额</h2></div>
+        <div class="ctrl">
+          <div class="mini-seg" data-view="cat" role="group" aria-label="显示方式">
+            <button type="button" data-v="chart" aria-pressed="true">图</button>
+            <button type="button" data-v="table">表</button>
+          </div>
+        </div>
+      </div>
+      <div class="plot" id="cat-plot"></div>
+      <div class="tbl" id="cat-table" hidden></div>
+    </section>
+
+    <!-- 入库进度 -->
+    <section class="card span-2" id="card-recv">
+      <div class="card-head">
+        <div><p class="eyebrow">数量 · 件</p><h2>各品类入库进度</h2></div>
+        <div class="ctrl">
+          <div class="mini-seg" data-view="recv" role="group" aria-label="显示方式">
+            <button type="button" data-v="chart" aria-pressed="true">图</button>
+            <button type="button" data-v="table">表</button>
+          </div>
+        </div>
+      </div>
+      <div class="plot" id="recv-plot"></div>
+      <div class="legend">
+        <span class="item"><i class="swatch" style="background:var(--series-1)"></i>已入库</span>
+        <span class="item"><i class="swatch" style="background:var(--track)"></i>待入库</span>
+      </div>
+      <div class="tbl" id="recv-table" hidden></div>
+    </section>
+
+    <!-- 采购员 -->
+    <section class="card span-2" id="card-buyer">
+      <div class="card-head">
+        <div><p class="eyebrow">金额 · 元</p><h2>采购员金额 Top 8</h2></div>
+        <div class="ctrl">
+          <div class="mini-seg" data-view="buyer" role="group" aria-label="显示方式">
+            <button type="button" data-v="chart" aria-pressed="true">图</button>
+            <button type="button" data-v="table">表</button>
+          </div>
+        </div>
+      </div>
+      <div class="plot" id="buyer-plot"></div>
+      <div class="tbl" id="buyer-table" hidden></div>
+    </section>
+
+    <!-- 签名件：尺码曲线 -->
+    <section class="card span-4" id="card-size">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">数量占比 · %</p>
+          <h2>尺码曲线</h2>
+          <div class="note">每行按该商品自身采购量归一，看的是码段结构而非绝对值</div>
+        </div>
+        <div class="ctrl">
+          <div class="mini-seg" id="size-mode" role="group" aria-label="尺码体系">
+            <button type="button" data-m="1" aria-pressed="true">服装号型</button>
+            <button type="button" data-m="2">鞋码</button>
+          </div>
+          <div class="mini-seg" data-view="size" role="group" aria-label="显示方式">
+            <button type="button" data-v="chart" aria-pressed="true">图</button>
+            <button type="button" data-v="table">表</button>
+          </div>
+        </div>
+      </div>
+      <div class="plot" id="size-plot"></div>
+      <div class="scale-legend" id="size-legend"></div>
+      <div class="tbl" id="size-table" hidden></div>
+    </section>
+
+    <!-- 待入库构成 -->
+    <section class="card span-2" id="card-eta">
+      <div class="card-head">
+        <div><p class="eyebrow">数量 · 件</p><h2>待入库构成</h2><div class="note">以 <span id="eta-today"></span>（数据最新日期）判定是否逾期</div></div>
+        <div class="ctrl">
+          <div class="mini-seg" data-view="eta" role="group" aria-label="显示方式">
+            <button type="button" data-v="chart" aria-pressed="true">图</button>
+            <button type="button" data-v="table">表</button>
+          </div>
+        </div>
+      </div>
+      <div class="plot" id="eta-plot"></div>
+      <div class="tbl" id="eta-table" hidden></div>
+    </section>
+
+    <!-- 到货预警 · 催办清单 -->
+    <section class="card span-6" id="card-alert">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">待入库数量 · 件</p>
+          <h2>到货预警 · 催办清单</h2>
+          <div class="note">按最早预计到货日距 <span id="alert-today"></span> 的剩余天数分档，只算还有待入库的明细行；点档位或采购员即可下钻</div>
+        </div>
+        <div class="ctrl">
+          <button class="btn" id="alert-notify" type="button">发送提醒</button>
+          <button class="btn" id="alert-export" type="button">导出催办清单</button>
+          <div class="mini-seg" data-view="alert" role="group" aria-label="显示方式">
+            <button type="button" data-v="chart" aria-pressed="true">图</button>
+            <button type="button" data-v="table">表</button>
+          </div>
+        </div>
+      </div>
+      <div class="tiers" id="alert-tiers" role="group" aria-label="到货期限档位"></div>
+      <div class="plot" id="alert-plot"></div>
+      <div class="legend" id="alert-legend"></div>
+      <div class="tbl" id="alert-table" hidden></div>
+    </section>
+
+    <!-- 采购单列表 -->
+    <section class="card span-6" id="card-orders">
+      <div class="card-head">
+        <div><p class="eyebrow">明细 · 采购单</p><h2>采购单列表</h2><div class="note">点任意一行查看该单的商品明细</div></div>
+        <div class="ctrl"><span class="note" id="orders-count"></span></div>
+      </div>
+      <div class="tbl" style="max-height:none" id="orders-wrap"></div>
+      <div class="pager">
+        <button type="button" id="pg-prev">上一页</button>
+        <span id="pg-info" class="num"></span>
+        <button type="button" id="pg-next">下一页</button>
+      </div>
+    </section>
+  </div>
+</main>
+
+<div class="tooltip" id="tip" role="status" aria-live="polite"></div>
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" tabindex="-1">
+  <div class="drawer-head">
+    <div class="row">
+      <p class="eyebrow" style="align-self:center">采购单</p>
+      <h3 id="drawer-title">—</h3>
+      <button class="close" id="drawer-close" type="button">关闭</button>
+    </div>
+    <div class="meta-grid" id="drawer-meta"></div>
+  </div>
+  <div class="drawer-body">
+    <h4>商品明细</h4>
+    <div id="drawer-lines"></div>
+  </div>
+</aside>
+
+<script src="js/integration-adapters.js"></script>
+<script src="data/dashboard-data.js"></script>
+<script>
+(async function () {
+"use strict";
+
+/* ═══════════════════ 数据接线 ═══════════════════ */
+const ADAPTERS = window.ProcurementAdapters;
+const D = await ADAPTERS.dataSource.getDashboardData({ requestedYear: new URLSearchParams(location.search).get("year") });
+if (!D) { document.body.innerHTML = "<p style='padding:40px'>找不到采购看板数据，请检查数据库适配器或先运行 python3 scripts/build_data.py</p>"; return; }
+const DICT = D.dict, ORDERS = D.orders, LINES = D.lines, META = D.meta;
+
+// 采购单字段位
+const O_NO=0, O_DATE=1, O_ST=2, O_BUYER=3, O_SUP=4, O_WH=5, O_ADDR=6, O_PAY=7, O_EXT=8, O_AUDIT=9;
+// 明细行字段位
+const L_O=0, L_SPU=1, L_STYLE=2, L_COLOR=3, L_SPEC=4, L_CAT=5, L_SEASON=6, L_BRAND=7,
+      L_CHAN=8, L_QTY=9, L_IN=10, L_AMT=11, L_PRICE=12, L_STYPE=13, L_SIZE=14, L_ETA=15, L_SKU=16;
+const TODAY = META.today || META.maxDate;
+const YEARS = (META.availableYears || Array.from(new Set(ORDERS.map(o => o[O_DATE].slice(0, 4)).filter(Boolean)))).slice().sort().reverse();
+const QUERY_YEAR = new URLSearchParams(location.search).get("year");
+const DEFAULT_YEAR = YEARS.includes(QUERY_YEAR) ? QUERY_YEAR : YEARS[0];
+function yearBounds(year) {
+  const start = year + "-01-01", naturalEnd = year + "-12-31";
+  return [start, naturalEnd < META.maxDate ? naturalEnd : META.maxDate];
+}
+
+/* ═══════════════════ 到货期限（提醒口径） ═══════════════════ */
+/* 剩余天数 = 最早预计到货日 − 今天；档位互斥，正好对上 T-20 / T-10 / T-1 / 超时四波提醒。
+   只有「还有待入库数量」的明细行才进档 —— 已入库完的行没有期限可催。 */
+const DAY_MS = 86400000;
+const T0 = Date.parse(TODAY + "T00:00:00");
+const _dayCache = new Map();
+function etaDays(iso) {                   // 无到货日 → null
+  if (!iso) return null;
+  let v = _dayCache.get(iso);
+  if (v === undefined) { v = Math.round((Date.parse(iso + "T00:00:00") - T0) / DAY_MS); _dayCache.set(iso, v); }
+  return v;
+}
+const TIERS = [
+  { k: "overdue", label: "已逾期",      short: "逾期",     v: "--tier-overdue", note: "预计到货日已过，超时未到" },
+  { k: "d1",      label: "剩 0–1 天",   short: "0–1天",    v: "--tier-d1",      note: "今明两天到期，T-1 提醒" },
+  { k: "d10",     label: "剩 2–10 天",  short: "2–10天",   v: "--tier-d10",     note: "十日内到期，T-10 提醒" },
+  { k: "d20",     label: "剩 11–20 天", short: "11–20天",  v: "--tier-d20",     note: "二十日内到期，T-20 提醒" },
+  { k: "far",     label: "剩 20 天以上", short: ">20天",   v: "--tier-far",     note: "尚未进入提醒窗口" },
+  { k: "none",    label: "未排期",      short: "未排期",   v: "--tier-none",    note: "没有填预计到货日期，催不出期限" }
+];
+const TIER_BY_K = new Map(TIERS.map((t, i) => [t.k, (t.rank = i, t)]));
+const URGENT = new Set(["overdue", "d1", "d10", "d20"]);   // 需要发提醒的四档
+const tierColor = k => css(TIER_BY_K.get(k).v);
+function tierOfDays(d) {
+  if (d === null) return "none";
+  if (d < 0) return "overdue";
+  if (d <= 1) return "d1";
+  if (d <= 10) return "d10";
+  if (d <= 20) return "d20";
+  return "far";
+}
+/** 明细行所处的提醒档；已入库完的行返回 null */
+function lineTier(l) {
+  if (l[L_QTY] - l[L_IN] <= 0) return null;
+  return tierOfDays(etaDays(l[L_ETA]));
+}
+/** 剩余天数的人话写法 */
+function daysText(d) {
+  if (d === null) return "未排期";
+  if (d < 0) return "逾期 " + (-d) + " 天";
+  if (d === 0) return "今天到期";
+  return "剩 " + d + " 天";
+}
+
+/* ═══════════════════ 工具 ═══════════════════ */
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const int = n => Math.round(n).toLocaleString("zh-CN");
+function money(v) {                       // 紧凑金额：亿 / 万 / 元
+  const a = Math.abs(v);
+  if (a >= 1e8) return (v / 1e8).toFixed(2) + " 亿";
+  if (a >= 1e4) return (v / 1e4).toFixed(a >= 1e6 ? 0 : 1) + " 万";
+  return int(v);
+}
+const pct = (a, b) => (b > 0 ? (a / b * 100).toFixed(1) + "%" : "—");
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+const SVGNS = "http://www.w3.org/2000/svg";
+function s(tag, attrs) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) if (attrs[k] != null) n.setAttribute(k, attrs[k]);
+  return n;
+}
+function svgText(x, y, str, o) {
+  o = o || {};
+  const t = s("text", {
+    x: x, y: y, fill: o.fill || css("--text-secondary"),
+    "font-size": o.size || 11, "text-anchor": o.anchor || "start",
+    "dominant-baseline": o.baseline || "middle",
+    "font-weight": o.weight || 400,
+    "font-variant-numeric": o.tabular ? "tabular-nums" : null
+  });
+  t.textContent = str;
+  return t;
+}
+/** 一端圆角、基线端平角的条形 —— 横向 */
+function barPathH(x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w, h / 2));
+  return `M${x},${y} H${x + w - r} A${r},${r} 0 0 1 ${x + w},${y + r} V${y + h - r} A${r},${r} 0 0 1 ${x + w - r},${y + h} H${x} Z`;
+}
+/** 一端圆角、基线端平角的条形 —— 纵向（自下而上） */
+function barPathV(x, yTop, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h));
+  return `M${x},${yTop + h} V${yTop + r} A${r},${r} 0 0 1 ${x + r},${yTop} H${x + w - r} A${r},${r} 0 0 1 ${x + w},${yTop + r} V${yTop + h} Z`;
+}
+function niceTicks(max, count) {
+  if (max <= 0) return [0];
+  const raw = max / (count || 4);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(v => v >= raw) || 10 * mag;
+  const out = [];
+  for (let v = 0; v <= max * 1.0001; v += step) out.push(v);
+  if (out[out.length - 1] < max) out.push(out[out.length - 1] + step);
+  return out;
+}
+function isoMonday(iso) {                 // 该日期所在周的周一
+  const d = new Date(iso + "T00:00:00");
+  const wd = (d.getDay() + 6) % 7;
+  d.setDate(d.getDate() - wd);
+  return d.toISOString().slice(0, 10);
+}
+function shiftDays(iso, n) {
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() + n);
+  return d.toISOString().slice(0, 10);
+}
+const md = iso => iso.slice(5).replace("-", "/");
+/** 掐中间而不是掐尾巴 —— 商品名的男款/女款正好在词尾 */
+function ellipsis(name, max) {
+  if (name.length <= max) return name;
+  const tail = Math.min(5, Math.max(3, max - 6));
+  return name.slice(0, max - tail - 1) + "…" + name.slice(-tail);
+}
+
+/* ═══════════════════ 提示气泡 ═══════════════════ */
+const tipEl = document.getElementById("tip");
+function showTip(evt, title, rows) {
+  tipEl.textContent = "";
+  tipEl.appendChild(el("div", "tt-title", title));
+  rows.forEach(r => {
+    const line = el("div", "tt-row");
+    const name = el("span", "tt-name");
+    if (r.color) {
+      const k = el("i", "tt-key");
+      k.style.background = r.color;
+      name.appendChild(k);
+    }
+    name.appendChild(document.createTextNode(r.name));
+    line.appendChild(name);
+    line.appendChild(el("span", "tt-val", r.value));
+    tipEl.appendChild(line);
+  });
+  tipEl.style.opacity = "1";
+  moveTip(evt);
+}
+function moveTip(evt) {
+  const pad = 14, r = tipEl.getBoundingClientRect();
+  let x = (evt.clientX != null ? evt.clientX : 0) + pad;
+  let y = (evt.clientY != null ? evt.clientY : 0) + pad;
+  if (x + r.width > innerWidth - 8) x = evt.clientX - r.width - pad;
+  if (y + r.height > innerHeight - 8) y = evt.clientY - r.height - pad;
+  tipEl.style.left = Math.max(8, x) + "px";
+  tipEl.style.top = Math.max(8, y) + "px";
+}
+function hideTip() { tipEl.style.opacity = "0"; }
+/** 给任意标记挂上 hover / 键盘焦点的同一套读数 */
+function hoverable(node, title, rows) {
+  node.setAttribute("tabindex", "0");
+  node.setAttribute("role", "img");
+  node.setAttribute("aria-label", title + "：" + rows.map(r => r.name + " " + r.value).join("，"));
+  node.addEventListener("pointerenter", e => showTip(e, title, rows));
+  node.addEventListener("pointermove", moveTip);
+  node.addEventListener("pointerleave", hideTip);
+  node.addEventListener("focus", () => {
+    const b = node.getBoundingClientRect();
+    showTip({ clientX: b.left + b.width / 2, clientY: b.top }, title, rows);
+  });
+  node.addEventListener("blur", hideTip);
+}
+
+/* ═══════════════════ 筛选状态 ═══════════════════ */
+const INITIAL_YEAR_BOUNDS = yearBounds(DEFAULT_YEAR);
+const state = { year: DEFAULT_YEAR, preset: "year", from: INITIAL_YEAR_BOUNDS[0], to: INITIAL_YEAR_BOUNDS[1], status: "", cat: "", buyer: "", q: "", eta: "" };
+// 到货期限筛选项：空 = 不限；open = 全部待入库；其余为单个提醒档
+const ETA_OPTS = [
+  { k: "", label: "不限" },
+  { k: "open", label: "全部待入库" }
+].concat(TIERS.map(t => ({ k: t.k, label: t.label })));
+const PRESETS = [
+  { k: "year", label: "全年" },
+  { k: "30", label: "近 30 天" },
+  { k: "90", label: "近 90 天" },
+  { k: "180", label: "近 180 天" },
+  { k: "custom", label: "自定义" }
+];
+let rows = [];      // 当前切片的明细行
+let baseRows = [];  // 同上，但不含到货期限这一条 —— 预警卡按它算，选中某档时其它档不会归零
+let orderIdxs = []; // 当前切片涉及的采购单下标
+
+function resolveRange() {
+  const [yearStart, yearEnd] = yearBounds(state.year);
+  if (state.preset === "year") return [yearStart, yearEnd];
+  if (state.preset === "custom") {
+    const from = state.from < yearStart ? yearStart : state.from;
+    const to = state.to > yearEnd ? yearEnd : state.to;
+    return [from, to];
+  }
+  const from = shiftDays(yearEnd, -(parseInt(state.preset, 10) - 1));
+  return [from < yearStart ? yearStart : from, yearEnd];
+}
+function lineText(l) {
+  const o = ORDERS[l[L_O]];
+  return (DICT.spus[l[L_SPU]] + " " + DICT.colors[l[L_COLOR]] + " " + l[L_SPEC] + " " +
+          l[L_SKU] + " " + DICT.styles[l[L_STYLE]] + " " + o[O_NO] + " " + o[O_EXT]).toLowerCase();
+}
+function applyFilters() {
+  const [from, to] = resolveRange();
+  const q = state.q.trim().toLowerCase();
+  const cat = state.cat === "" ? -1 : +state.cat;
+  const buyer = state.buyer === "" ? -1 : +state.buyer;
+  const st = state.status === "" ? -1 : +state.status;
+  rows = []; baseRows = [];
+  const seen = new Set();
+  for (let i = 0; i < LINES.length; i++) {
+    const l = LINES[i], o = ORDERS[l[L_O]];
+    if (o[O_DATE] < from || o[O_DATE] > to) continue;
+    if (st >= 0 && o[O_ST] !== st) continue;
+    if (cat >= 0 && l[L_CAT] !== cat) continue;
+    if (buyer >= 0 && o[O_BUYER] !== buyer) continue;
+    if (q && lineText(l).indexOf(q) < 0) continue;
+    baseRows.push(l);
+    if (state.eta) {
+      const t = lineTier(l);
+      if (t === null) continue;                              // 已入库完，无期限
+      if (state.eta !== "open" && t !== state.eta) continue;
+    }
+    rows.push(l);
+    seen.add(l[L_O]);
+  }
+  orderIdxs = Array.from(seen);
+}
+
+/* ═══════════════════ 汇总 ═══════════════════ */
+function totals() {
+  let amt = 0, qty = 0, inq = 0;
+  for (const l of rows) { amt += l[L_AMT]; qty += l[L_QTY]; inq += l[L_IN]; }
+  let pending = 0, sup = new Set();
+  for (const oi of orderIdxs) {
+    if (ORDERS[oi][O_ST] === 0) pending++;
+    sup.add(ORDERS[oi][O_SUP]);
+  }
+  return { amt, qty, inq, open: qty - inq, orders: orderIdxs.length, lines: rows.length, pending, sup: sup.size };
+}
+/** 按期间汇总金额 / 单数 / 件数 */
+function byPeriod(gran) {
+  const map = new Map();
+  for (const l of rows) {
+    const o = ORDERS[l[L_O]];
+    const d = o[O_DATE];
+    if (!d) continue;
+    const key = gran === "month" ? d.slice(0, 7) : gran === "week" ? isoMonday(d) : d;
+    let e = map.get(key);
+    if (!e) map.set(key, e = { key: key, amt: 0, qty: 0, orders: new Set() });
+    e.amt += l[L_AMT]; e.qty += l[L_QTY]; e.orders.add(l[L_O]);
+  }
+  return Array.from(map.values()).sort((a, b) => a.key < b.key ? -1 : 1);
+}
+function byDim(getKey, names) {
+  const map = new Map();
+  for (const l of rows) {
+    const k = getKey(l);
+    let e = map.get(k);
+    if (!e) map.set(k, e = { k: k, name: names[k], amt: 0, qty: 0, inq: 0, n: 0, orders: new Set() });
+    e.amt += l[L_AMT]; e.qty += l[L_QTY]; e.inq += l[L_IN]; e.n++; e.orders.add(l[L_O]);
+  }
+  return Array.from(map.values());
+}
+/** 尺码曲线矩阵：行 = 商品，列 = 尺码 */
+function sizeMatrix(mode) {
+  const perSpu = new Map();
+  for (const l of rows) {
+    if (l[L_STYPE] !== mode || !l[L_SIZE]) continue;
+    let e = perSpu.get(l[L_SPU]);
+    if (!e) perSpu.set(l[L_SPU], e = { name: DICT.spus[l[L_SPU]], total: 0, cells: new Map() });
+    e.total += l[L_QTY];
+    e.cells.set(l[L_SIZE], (e.cells.get(l[L_SIZE]) || 0) + l[L_QTY]);
+  }
+  const rowList = Array.from(perSpu.values()).sort((a, b) => b.total - a.total).slice(0, 10);
+  // 只保留展示行里真正出现过的码段，避免长尾码把横轴撑空
+  const cols = new Set();
+  rowList.forEach(r => r.cells.forEach((v, k) => { if (v > 0) cols.add(k); }));
+  const colList = Array.from(cols).sort((a, b) => parseFloat(a) - parseFloat(b));
+  return { cols: colList, rows: rowList };
+}
+/** 待入库量按到货排期分三档：已逾期 / 排期内 / 未排期 */
+function openMix() {
+  let overdue = 0, planned = 0, unplanned = 0;
+  for (const l of rows) {
+    const open = l[L_QTY] - l[L_IN];
+    if (open <= 0) continue;
+    const eta = l[L_ETA];
+    if (!eta) unplanned += open;
+    else if (eta < TODAY) overdue += open;
+    else planned += open;
+  }
+  return [
+    { name: "已逾期", value: overdue, color: css("--critical"), note: "预计到货日已过", risk: true },
+    { name: "排期内待到货", value: planned, color: css("--series-1"), note: "预计到货日在今天及以后" },
+    { name: "未排期", value: unplanned, color: css("--track"), note: "没有填预计到货日期" }
+  ];
+}
+
+/** 到货预警：待入库量按提醒档拆开，并落到人头上 */
+function alertData(src) {
+  const tiers = TIERS.map(t => ({ k: t.k, label: t.label, note: t.note, color: tierColor(t.k),
+                                  qty: 0, lines: 0, orders: new Set(), buyers: new Set(), due: "" }));
+  const tierByK = new Map(tiers.map(t => [t.k, t]));
+  const byBuyer = new Map();
+  for (const l of src) {
+    const k = lineTier(l);
+    if (!k) continue;
+    const open = l[L_QTY] - l[L_IN], o = ORDERS[l[L_O]], eta = l[L_ETA];
+    const t = tierByK.get(k);
+    t.qty += open; t.lines++; t.orders.add(l[L_O]); t.buyers.add(o[O_BUYER]);
+    if (eta && (!t.due || eta < t.due)) t.due = eta;
+
+    let b = byBuyer.get(o[O_BUYER]);
+    if (!b) byBuyer.set(o[O_BUYER], b = { k: o[O_BUYER], name: DICT.buyers[o[O_BUYER]],
+                                          cells: new Map(), qty: 0, urgent: 0, orders: new Set(), due: "" });
+    let c = b.cells.get(k);
+    if (!c) b.cells.set(k, c = { qty: 0, orders: new Set() });
+    c.qty += open; c.orders.add(l[L_O]);
+    b.qty += open; b.orders.add(l[L_O]);
+    if (URGENT.has(k)) b.urgent += open;
+    if (eta && (!b.due || eta < b.due)) b.due = eta;
+  }
+  const buyers = Array.from(byBuyer.values())
+    .sort((a, b) => b.urgent - a.urgent || b.qty - a.qty);
+  const total = tiers.reduce((a, t) => a + t.qty, 0);
+  const urgent = tiers.filter(t => URGENT.has(t.k)).reduce((a, t) => a + t.qty, 0);
+  return { tiers: tiers, buyers: buyers, total: total, urgent: urgent };
+}
+/** 采购单级的期限：取该单所有待入库行里最早的预计到货日，档位取最急的一档 */
+function orderDue(lines) {
+  let due = "", rank = 99, open = 0, noDate = false;
+  for (const l of lines) {
+    const o = l[L_QTY] - l[L_IN];
+    if (o <= 0) continue;
+    open += o;
+    const k = lineTier(l);
+    rank = Math.min(rank, TIER_BY_K.get(k).rank);
+    if (l[L_ETA]) { if (!due || l[L_ETA] < due) due = l[L_ETA]; } else noDate = true;
+  }
+  const days = due ? etaDays(due) : null;
+  // 排序键：按剩余天数升序，未排期排在有期限的之后，全部入库完的垫底
+  return { due: due, days: days, open: open, noDate: noDate,
+           tier: rank === 99 ? null : TIERS[rank].k,
+           sort: open <= 0 ? 9e15 : (days === null ? 9e14 : days) };
+}
+
+/* ═══════════════════ 图形 ═══════════════════ */
+const PLOT_INK = () => css("--text-secondary");
+const MUTED = () => css("--text-muted");
+
+/** 折线 / 面积 + 十字准星 */
+function drawTrend(host, data, gran) {
+  host.textContent = "";
+  if (!data.length) { host.appendChild(el("div", "empty", "当前筛选下没有采购记录")); return; }
+  const W = host.clientWidth || 900, H = 258;
+  const M = { t: 18, r: 16, b: 30, l: 58 };
+  const iw = Math.max(10, W - M.l - M.r), ih = H - M.t - M.b;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H, role: "img" });
+  svg.setAttribute("aria-label", "采购金额走势");
+
+  const max = Math.max.apply(null, data.map(d => d.amt));
+  const ticks = niceTicks(max, 4);
+  const top = ticks[ticks.length - 1] || 1;
+  const X = i => M.l + (data.length === 1 ? iw / 2 : iw * i / (data.length - 1));
+  const Y = v => M.t + ih - (v / top) * ih;
+
+  ticks.forEach(t => {
+    svg.appendChild(s("line", { x1: M.l, x2: M.l + iw, y1: Y(t), y2: Y(t), stroke: css("--grid"), "stroke-width": 1 }));
+    svg.appendChild(svgText(M.l - 9, Y(t), money(t), { anchor: "end", fill: MUTED(), size: 10, tabular: 1 }));
+  });
+
+  let dLine = "", dArea = `M${X(0)},${M.t + ih} `;
+  data.forEach((d, i) => {
+    dLine += (i ? "L" : "M") + X(i) + "," + Y(d.amt) + " ";
+    dArea += "L" + X(i) + "," + Y(d.amt) + " ";
+  });
+  dArea += `L${X(data.length - 1)},${M.t + ih} Z`;
+  svg.appendChild(s("path", { d: dArea, fill: css("--series-1"), "fill-opacity": .10 }));
+  svg.appendChild(s("path", { d: dLine, fill: "none", stroke: css("--series-1"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+
+  // x 轴刻度：最多 8 个
+  const step = Math.max(1, Math.ceil(data.length / 8));
+  data.forEach((d, i) => {
+    if (i % step && i !== data.length - 1) return;
+    const lb = gran === "month" ? d.key.slice(2) : md(d.key);
+    svg.appendChild(svgText(X(i), M.t + ih + 15, lb, { anchor: "middle", fill: MUTED(), size: 10, tabular: 1 }));
+  });
+  svg.appendChild(s("line", { x1: M.l, x2: M.l + iw, y1: M.t + ih, y2: M.t + ih, stroke: css("--axis"), "stroke-width": 1 }));
+
+  // 直接标注：峰值与末点，其余交给准星与表视图
+  let peak = 0;
+  data.forEach((d, i) => { if (d.amt > data[peak].amt) peak = i; });
+  const marks = new Set([peak, data.length - 1]);
+  marks.forEach(i => {
+    const d = data[i];
+    svg.appendChild(s("circle", { cx: X(i), cy: Y(d.amt), r: 4.5, fill: css("--series-1"), stroke: css("--surface-1"), "stroke-width": 2 }));
+    const anchor = X(i) > M.l + iw - 54 ? "end" : "middle";
+    // 折线从左上落下来时，标签走下方，免得压在线上
+    const falling = i > 0 && data[i - 1].amt > d.amt;
+    const dy = falling && Y(d.amt) + 20 < M.t + ih ? 16 : -13;
+    svg.appendChild(svgText(X(i), Y(d.amt) + dy, money(d.amt), { anchor: anchor, size: 11, weight: 650, fill: css("--text-primary"), tabular: 1 }));
+  });
+
+  // 准星：命中最近的 x，读者瞄的是日期不是 2px 的线
+  const cross = s("line", { x1: 0, x2: 0, y1: M.t, y2: M.t + ih, stroke: css("--axis"), "stroke-width": 1, opacity: 0 });
+  svg.appendChild(cross);
+  const hit = s("rect", { x: M.l, y: M.t, width: iw, height: ih, fill: "transparent" });
+  svg.appendChild(hit);
+  const label = { month: "月", week: "周", day: "日" }[gran];
+  function at(evt) {
+    const box = svg.getBoundingClientRect();
+    const px = (evt.clientX - box.left) * (W / box.width);
+    let i = Math.round((px - M.l) / (iw / Math.max(1, data.length - 1)));
+    i = Math.max(0, Math.min(data.length - 1, i));
+    const d = data[i];
+    cross.setAttribute("x1", X(i)); cross.setAttribute("x2", X(i)); cross.setAttribute("opacity", 1);
+    showTip(evt, (gran === "week" ? d.key + " 起" : d.key) + " · " + label, [
+      { name: "采购金额", value: money(d.amt) + " 元", color: css("--series-1") },
+      { name: "采购数量", value: int(d.qty) + " 件" },
+      { name: "采购单", value: d.orders.size + " 单" }
+    ]);
+  }
+  hit.addEventListener("pointerenter", at);
+  hit.addEventListener("pointermove", at);
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("opacity", 0); hideTip(); });
+  host.appendChild(svg);
+}
+
+/** 横向条形（单一色相；标签在轴上，数值在条端） */
+function drawHBar(host, items, opts) {
+  host.textContent = "";
+  if (!items.length) { host.appendChild(el("div", "empty", "无数据")); return; }
+  const fmt = opts.fmt || money;
+  const W = host.clientWidth || 360;
+  const labelW = Math.min(opts.labelW || 96, Math.round(W * .38));
+  const valueW = 62, band = 30, barH = Math.min(18, band - 12);
+  const H = items.length * band + 6;
+  const iw = Math.max(10, W - labelW - valueW - 8);
+  const max = Math.max.apply(null, items.map(d => d.value)) || 1;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H });
+  items.forEach((d, i) => {
+    const y = i * band + 4;
+    const w = Math.max(2, iw * d.value / max);
+    svg.appendChild(svgText(labelW - 10, y + barH / 2, d.name, { anchor: "end", size: 11.5, fill: PLOT_INK() }));
+    const g = s("g", {});
+    g.appendChild(s("path", { d: barPathH(labelW, y, w, barH, 4), fill: css("--series-1") }));
+    g.appendChild(s("rect", { x: labelW, y: y - 6, width: Math.max(w, 24), height: barH + 12, fill: "transparent" }));
+    hoverable(g, d.name, opts.tip ? opts.tip(d) : [{ name: opts.metric || "金额", value: fmt(d.value), color: css("--series-1") }]);
+    svg.appendChild(g);
+    svg.appendChild(svgText(labelW + w + 8, y + barH / 2, fmt(d.value), { size: 11, weight: 600, fill: css("--text-primary"), tabular: 1 }));
+  });
+  host.appendChild(svg);
+}
+
+/** 入库仪表：同色系深浅两段，直接标注完成率 */
+function drawRecv(host, items) {
+  host.textContent = "";
+  if (!items.length) { host.appendChild(el("div", "empty", "无数据")); return; }
+  const W = host.clientWidth || 360, labelW = Math.min(88, Math.round(W * .34)), rateW = 46;
+  const band = 40, barH = 14, H = items.length * band + 4;
+  const iw = Math.max(10, W - labelW - rateW - 10);
+  const max = Math.max.apply(null, items.map(d => d.qty)) || 1;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H });
+  items.forEach((d, i) => {
+    const y = i * band + 6;
+    const total = Math.max(2, iw * d.qty / max);
+    const done = d.qty > 0 ? total * d.inq / d.qty : 0;
+    svg.appendChild(svgText(labelW - 10, y + barH / 2, d.name, { anchor: "end", size: 11.5, fill: PLOT_INK() }));
+    const g = s("g", {});
+    g.appendChild(s("path", { d: barPathH(labelW, y, total, barH, 4), fill: css("--track") }));
+    if (done > 1) {
+      // 2px 表面色留白把两段分开，而不是描边
+      g.appendChild(s("path", { d: barPathH(labelW, y, Math.max(1, done - 2), barH, 4), fill: css("--series-1") }));
+    }
+    g.appendChild(s("rect", { x: labelW, y: y - 8, width: Math.max(total, 24), height: barH + 16, fill: "transparent" }));
+    hoverable(g, d.name, [
+      { name: "已入库", value: int(d.inq) + " 件", color: css("--series-1") },
+      { name: "待入库", value: int(d.qty - d.inq) + " 件", color: css("--track") },
+      { name: "入库率", value: pct(d.inq, d.qty) }
+    ]);
+    svg.appendChild(g);
+    svg.appendChild(svgText(W - 2, y + barH / 2, pct(d.inq, d.qty), { anchor: "end", size: 11, weight: 600, fill: css("--text-primary"), tabular: 1 }));
+    svg.appendChild(svgText(labelW, y + barH + 11, "采购 " + int(d.qty) + " 件 · 已入库 " + int(d.inq), { size: 10, fill: MUTED(), tabular: 1 }));
+  });
+  host.appendChild(svg);
+}
+
+/** 待入库构成：一条整体堆叠条 + 逐档直接标注 */
+function drawOpenMix(host, parts) {
+  host.textContent = "";
+  const total = parts.reduce((a, b) => a + b.value, 0);
+  if (total <= 0) { host.appendChild(el("div", "empty", "当前切片已全部入库")); return; }
+  const W = host.clientWidth || 340, barH = 26, gap = 2;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${barH}`, height: barH });
+  const clipId = "openmix-clip";
+  const cp = s("clipPath", { id: clipId });
+  cp.appendChild(s("rect", { x: 0, y: 0, width: W, height: barH, rx: 4 }));
+  svg.appendChild(cp);
+  const g = s("g", { "clip-path": `url(#${clipId})` });
+  let x = 0;
+  parts.forEach(p => {
+    if (p.value <= 0) return;
+    const w = W * p.value / total;
+    const seg = s("g", {});
+    seg.appendChild(s("rect", { x: x, y: 0, width: Math.max(1, w - gap), height: barH, fill: p.color }));
+    hoverable(seg, p.name, [
+      { name: "待入库", value: int(p.value) + " 件", color: p.color },
+      { name: "占待入库", value: pct(p.value, total) }
+    ]);
+    g.appendChild(seg);
+    x += w;
+  });
+  svg.appendChild(g);
+  host.appendChild(svg);
+
+  const list = el("div");
+  list.style.marginTop = "12px";
+  parts.forEach(p => {
+    const row = el("div", "ledger-row");
+    row.style.padding = "9px 0";
+    const left = el("span", "k");
+    const sw = el("i", "dot");
+    sw.style.cssText = "width:9px;height:9px;border-radius:3px;display:inline-block;margin-right:7px;background:" + p.color;
+    left.appendChild(sw);
+    left.appendChild(document.createTextNode(p.name + (p.risk && p.value > 0 ? " ⚠" : "")));
+    const right = el("span", "v", int(p.value));
+    right.appendChild(el("small", null, "件 · " + pct(p.value, total)));
+    if (p.risk && p.value > 0) right.style.color = css("--critical");
+    row.appendChild(left); row.appendChild(right);
+    list.appendChild(row);
+  });
+  const foot = el("div", "hero-sub", "合计待入库 " + int(total) + " 件");
+  foot.style.marginTop = "8px";
+  list.appendChild(foot);
+  host.appendChild(list);
+}
+
+/** 催办清单：每个采购员一条按提醒档堆叠的待入库条，右端直接标注需催量 */
+function drawAlertBars(host, buyers) {
+  host.textContent = "";
+  if (!buyers.length) { host.appendChild(el("div", "empty", "当前切片没有待入库数量")); return; }
+  const list = buyers.slice(0, 8);
+  const W = host.clientWidth || 700;
+  const labelW = Math.min(112, Math.round(W * .2)), valueW = 96;
+  const band = 30, barH = 16, H = list.length * band + 6;
+  const iw = Math.max(10, W - labelW - valueW - 10);
+  const max = Math.max.apply(null, list.map(b => b.qty)) || 1;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H });
+  list.forEach((b, i) => {
+    const y = i * band + 4;
+    const lb = svgText(labelW - 10, y + barH / 2, ellipsis(b.name, Math.floor((labelW - 14) / 12)),
+      { anchor: "end", size: 11.5, fill: PLOT_INK() });
+    const tt = s("title", {}); tt.textContent = b.name; lb.appendChild(tt);
+    svg.appendChild(lb);
+
+    const total = Math.max(2, iw * b.qty / max);
+    const clipId = "alert-clip-" + i;
+    const cp = s("clipPath", { id: clipId });
+    cp.appendChild(s("rect", { x: labelW, y: y, width: total, height: barH, rx: 4 }));
+    svg.appendChild(cp);
+    const g = s("g", { "clip-path": `url(#${clipId})` });
+    let x = labelW;
+    TIERS.forEach(t => {
+      const c = b.cells.get(t.k);
+      if (!c || c.qty <= 0) return;
+      const w = total * c.qty / b.qty;
+      const seg = s("g", {});
+      seg.appendChild(s("rect", { x: x, y: y, width: Math.max(1, w), height: barH, fill: tierColor(t.k) }));
+      hoverable(seg, b.name + " · " + t.label, [
+        { name: "待入库", value: int(c.qty) + " 件", color: tierColor(t.k) },
+        { name: "涉及采购单", value: c.orders.size + " 单" },
+        { name: "占该采购员", value: pct(c.qty, b.qty) }
+      ]);
+      g.appendChild(seg);
+      x += w;
+    });
+    svg.appendChild(g);
+    svg.appendChild(svgText(W - 2, y + barH / 2, b.urgent > 0 ? "需催 " + int(b.urgent) : "无需催",
+      { anchor: "end", size: 11, weight: 600, tabular: 1,
+        fill: b.urgent > 0 ? css("--critical") : MUTED() }));
+  });
+  host.appendChild(svg);
+}
+
+/** 签名件：尺码曲线热力图（行内归一的顺序色阶） */
+function drawSize(host, m, mode) {
+  host.textContent = "";
+  if (!m.rows.length) { host.appendChild(el("div", "empty", mode === 1 ? "当前筛选下没有号型商品" : "当前筛选下没有鞋码商品")); return; }
+  const W = host.clientWidth || 700;
+  const labelW = Math.min(206, Math.round(W * .32)), totalW = 62;
+  const cellH = 24, gap = 2, headH = 18;
+  const gridW = Math.max(40, W - labelW - totalW);
+  const cw = gridW / m.cols.length;
+  const H = headH + m.rows.length * (cellH + gap) + 4;
+  const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H });
+
+  m.cols.forEach((c, j) => {
+    svg.appendChild(svgText(labelW + cw * (j + .5), headH - 10, c, { anchor: "middle", size: 10, fill: MUTED(), tabular: 1 }));
+  });
+  svg.appendChild(svgText(W, headH - 10, "合计", { anchor: "end", size: 10, fill: MUTED() }));
+
+  m.rows.forEach((r, i) => {
+    const y = headH + i * (cellH + gap);
+    const lb = svgText(labelW - 10, y + cellH / 2, ellipsis(r.name, Math.floor((labelW - 14) / 11)),
+      { anchor: "end", size: 11, fill: PLOT_INK() });
+    const tt = s("title", {}); tt.textContent = r.name; lb.appendChild(tt);
+    svg.appendChild(lb);
+    m.cols.forEach((c, j) => {
+      const v = r.cells.get(c) || 0;
+      const share = r.total > 0 ? v / r.total : 0;
+      const lvl = v === 0 ? -1 : Math.min(7, Math.floor(share / 0.045));
+      const g = s("g", {});
+      g.appendChild(s("rect", {
+        x: labelW + cw * j + gap / 2, y: y, width: Math.max(1, cw - gap), height: cellH, rx: 3,
+        fill: lvl < 0 ? css("--wash") : css("--seq-" + lvl)
+      }));
+      // 只有量得下才写数字，写不下就交给悬浮与表视图，绝不裁字
+      if (v > 0 && cw >= 25) {
+        const flip = lvl >= parseInt(css("--seq-ink-flip"), 10);
+        g.appendChild(svgText(labelW + cw * (j + .5), y + cellH / 2, Math.round(share * 100) + "%",
+          { anchor: "middle", size: cw < 32 ? 9 : 10, tabular: 1, fill: flip ? "#fff" : css("--text-primary") }));
+      }
+      if (v > 0) {
+        hoverable(g, r.name, [
+          { name: (mode === 1 ? "号型 " : "鞋码 ") + c, value: int(v) + " 件", color: lvl < 0 ? css("--grid") : css("--seq-" + lvl) },
+          { name: "占该商品", value: (share * 100).toFixed(1) + "%" }
+        ]);
+      }
+      svg.appendChild(g);
+    });
+    svg.appendChild(svgText(W, y + cellH / 2, int(r.total), { anchor: "end", size: 11, weight: 600, fill: css("--text-primary"), tabular: 1 }));
+  });
+  host.appendChild(svg);
+}
+
+/* ═══════════════════ 表视图 ═══════════════════ */
+function buildTable(host, headers, body) {
+  host.textContent = "";
+  const t = el("table");
+  const thead = el("thead"), tr = el("tr");
+  headers.forEach(h => {
+    const th = el("th", h.n ? "n" : null, h.label);
+    tr.appendChild(th);
+  });
+  thead.appendChild(tr); t.appendChild(thead);
+  const tb = el("tbody");
+  body.forEach(r => {
+    const row = el("tr");
+    r.forEach((c, i) => row.appendChild(el("td", headers[i].n ? "n" : null, c)));
+    tb.appendChild(row);
+  });
+  t.appendChild(tb);
+  host.appendChild(t);
+}
+
+/* ═══════════════════ 渲染 ═══════════════════ */
+let gran = "month", sizeMode = 1;
+
+function renderRail() {
+  const t = totals();
+  document.getElementById("hero-value").textContent = "";
+  const [head, unit] = money(t.amt).split(" ");
+  const hv = document.getElementById("hero-value");
+  hv.appendChild(document.createTextNode(head));
+  if (unit) hv.appendChild(el("span", "unit", unit + "元")); else hv.appendChild(el("span", "unit", "元"));
+  const [from, to] = resolveRange();
+  document.getElementById("hero-sub").textContent = from + " 至 " + to;
+
+  const flag = document.getElementById("hero-flag");
+  flag.textContent = "";
+  const dot = el("i", "dot");
+  dot.style.background = t.pending ? css("--warning") : css("--good");
+  flag.appendChild(dot);
+  flag.appendChild(document.createTextNode(t.pending ? t.pending + " 单待审核" : "全部已确认"));
+  flag.style.color = t.pending ? css("--text-primary") : css("--delta-up");
+
+  const set = (id, v, unit) => {
+    const n = document.getElementById(id);
+    n.textContent = v;
+    if (unit) n.appendChild(el("small", null, unit));
+  };
+  set("s-orders", int(t.orders), "单");
+  set("s-lines", int(t.lines), "行");
+  set("s-qty", int(t.qty), "件");
+  set("s-in", int(t.inq), "件");
+  set("s-open", int(t.open), "件");
+  set("s-pending", int(t.pending), "单");
+  set("s-sup", int(t.sup), "家");
+  const rate = t.qty > 0 ? t.inq / t.qty : 0;
+  document.getElementById("s-meter").style.width = (rate * 100).toFixed(1) + "%";
+  document.getElementById("s-meter-note").textContent = "入库率 " + pct(t.inq, t.qty) + " · 待入库 " + int(t.open) + " 件";
+
+  // 迷你走势：12 个期间，当前期用强调色
+  const spark = document.getElementById("spark");
+  spark.textContent = "";
+  const series = byPeriod("month").slice(-12);
+  if (series.length > 1) {
+    const W = spark.clientWidth || 230, H = 34;
+    const max = Math.max.apply(null, series.map(d => d.amt)) || 1;
+    const X = i => i * (W - 6) / (series.length - 1) + 3;
+    const Y = v => H - 4 - (v / max) * (H - 10);
+    const svg = s("svg", { viewBox: `0 0 ${W} ${H}`, height: H, "aria-hidden": "true" });
+    let d = "";
+    series.forEach((p, i) => { d += (i ? "L" : "M") + X(i) + "," + Y(p.amt) + " "; });
+    svg.appendChild(s("path", { d: d, fill: "none", stroke: css("--deemph"), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    const last = series.length - 1;
+    svg.appendChild(s("path", { d: `M${X(last - 1)},${Y(series[last - 1].amt)} L${X(last)},${Y(series[last].amt)}`, fill: "none", stroke: css("--series-1"), "stroke-width": 2, "stroke-linecap": "round" }));
+    svg.appendChild(s("circle", { cx: X(last), cy: Y(series[last].amt), r: 4, fill: css("--series-1"), stroke: css("--surface-1"), "stroke-width": 2 }));
+    spark.appendChild(svg);
+    spark.appendChild(el("div", "hero-sub", "近 " + series.length + " 个月，末点为 " + series[last].key));
+  }
+}
+
+function renderTrend() {
+  const data = byPeriod(gran);
+  drawTrend(document.getElementById("trend-plot"), data, gran);
+  buildTable(document.getElementById("trend-table"),
+    [{ label: gran === "month" ? "月份" : gran === "week" ? "周起始" : "日期" },
+     { label: "采购金额", n: 1 }, { label: "采购数量", n: 1 }, { label: "采购单", n: 1 }],
+    data.map(d => [d.key, int(d.amt), int(d.qty), d.orders.size]));
+}
+
+function renderCat() {
+  const items = byDim(l => l[L_CAT], DICT.cats).sort((a, b) => b.amt - a.amt);
+  drawHBar(document.getElementById("cat-plot"), items.map(d => ({ name: d.name, value: d.amt, raw: d })), {
+    labelW: 92,
+    tip: d => [
+      { name: "采购金额", value: money(d.raw.amt) + " 元", color: css("--series-1") },
+      { name: "采购数量", value: int(d.raw.qty) + " 件" },
+      { name: "明细行", value: int(d.raw.n) + " 行" }
+    ]
+  });
+  buildTable(document.getElementById("cat-table"),
+    [{ label: "品类" }, { label: "采购金额", n: 1 }, { label: "采购数量", n: 1 }, { label: "占比", n: 1 }],
+    (() => {
+      const sum = items.reduce((a, b) => a + b.amt, 0);
+      return items.map(d => [d.name, int(d.amt), int(d.qty), pct(d.amt, sum)]);
+    })());
+}
+
+function renderRecv() {
+  const items = byDim(l => l[L_CAT], DICT.cats).sort((a, b) => b.qty - a.qty).slice(0, 6);
+  drawRecv(document.getElementById("recv-plot"), items);
+  buildTable(document.getElementById("recv-table"),
+    [{ label: "品类" }, { label: "采购数量", n: 1 }, { label: "已入库", n: 1 }, { label: "待入库", n: 1 }, { label: "入库率", n: 1 }],
+    items.map(d => [d.name, int(d.qty), int(d.inq), int(d.qty - d.inq), pct(d.inq, d.qty)]));
+}
+
+function renderBuyer() {
+  const all = byDim(l => ORDERS[l[L_O]][O_BUYER], DICT.buyers).sort((a, b) => b.amt - a.amt);
+  const items = all.slice(0, 8);
+  drawHBar(document.getElementById("buyer-plot"), items.map(d => ({ name: d.name, value: d.amt, raw: d })), {
+    labelW: 104,
+    tip: d => [
+      { name: "采购金额", value: money(d.raw.amt) + " 元", color: css("--series-1") },
+      { name: "采购单", value: d.raw.orders.size + " 单" },
+      { name: "采购数量", value: int(d.raw.qty) + " 件" }
+    ]
+  });
+  buildTable(document.getElementById("buyer-table"),
+    [{ label: "采购员" }, { label: "采购金额", n: 1 }, { label: "采购单", n: 1 }, { label: "采购数量", n: 1 }],
+    all.map(d => [d.name, int(d.amt), d.orders.size, int(d.qty)]));
+}
+
+function renderSize() {
+  const m = sizeMatrix(sizeMode);
+  drawSize(document.getElementById("size-plot"), m, sizeMode);
+  const lg = document.getElementById("size-legend");
+  lg.textContent = "";
+  lg.appendChild(el("span", null, "占该商品比例"));
+  const ramp = el("span", "ramp");
+  for (let i = 0; i <= 7; i++) {
+    const b = el("i");
+    b.style.background = css("--seq-" + i);
+    ramp.appendChild(b);
+  }
+  lg.appendChild(document.createTextNode("低"));
+  lg.appendChild(ramp);
+  lg.appendChild(document.createTextNode("高（≥32%）"));
+  buildTable(document.getElementById("size-table"),
+    [{ label: sizeMode === 1 ? "商品（号型）" : "商品（鞋码）" }].concat(m.cols.map(c => ({ label: c, n: 1 })), [{ label: "合计", n: 1 }]),
+    m.rows.map(r => [r.name].concat(m.cols.map(c => { const v = r.cells.get(c) || 0; return v ? int(v) : "—"; }), [int(r.total)])));
+}
+
+function renderEta() {
+  const parts = openMix();
+  const total = parts.reduce((a, b) => a + b.value, 0);
+  drawOpenMix(document.getElementById("eta-plot"), parts);
+  buildTable(document.getElementById("eta-table"),
+    [{ label: "到货排期" }, { label: "待入库数量", n: 1 }, { label: "占比", n: 1 }, { label: "口径" }],
+    parts.map(p => [p.name, int(p.value), pct(p.value, total), p.note]));
+}
+
+/* ─── 到货预警 · 催办清单 ─── */
+function setEta(k) {                       // 档位卡与顶部下拉共用一个入口
+  state.eta = state.eta === k ? "" : k;
+  document.getElementById("f-eta").value = state.eta;
+  if (state.eta) { sortKey = "due"; sortDir = 1; }   // 选了档位就按最急的排在前
+  renderAll();
+}
+function renderAlert() {
+  const data = alertData(baseRows);
+
+  const tilesHost = document.getElementById("alert-tiers");
+  tilesHost.textContent = "";
+  data.tiers.forEach(t => {
+    const b = el("button", "tier");
+    b.type = "button";
+    b.setAttribute("aria-pressed", String(state.eta === t.k));
+    b.style.borderLeftColor = t.color;
+    b.title = t.note;
+    b.appendChild(el("div", "t-k", t.label));
+    const v = el("div", "t-v", int(t.qty));
+    v.appendChild(el("small", null, "件"));
+    if (URGENT.has(t.k) && t.qty > 0) v.style.color = t.color;
+    b.appendChild(v);
+    b.appendChild(el("div", "t-s", t.orders.size + " 单 · " + t.buyers.size + " 人" +
+      (t.due && t.k !== "far" ? " · 最早 " + md(t.due) : "")));
+    b.addEventListener("click", () => setEta(t.k));
+    tilesHost.appendChild(b);
+  });
+
+  drawAlertBars(document.getElementById("alert-plot"), data.buyers);
+
+  const lg = document.getElementById("alert-legend");
+  lg.textContent = "";
+  TIERS.forEach(t => {
+    const item = el("span", "item");
+    const sw = el("i", "swatch");
+    sw.style.background = tierColor(t.k);
+    item.appendChild(sw);
+    item.appendChild(document.createTextNode(t.short));
+    lg.appendChild(item);
+  });
+  lg.appendChild(el("span", "item", "条长 = 待入库件数，右端为需催量（逾期 + 20 天内）"));
+
+  buildTable(document.getElementById("alert-table"),
+    [{ label: "采购员" }].concat(TIERS.map(t => ({ label: t.short, n: 1 })),
+      [{ label: "待入库合计", n: 1 }, { label: "需催", n: 1 }, { label: "涉及采购单", n: 1 }, { label: "最早到货日" }]),
+    data.buyers.map(b => [b.name].concat(
+      TIERS.map(t => { const c = b.cells.get(t.k); return c && c.qty ? int(c.qty) : "—"; }),
+      [int(b.qty), b.urgent ? int(b.urgent) : "—", b.orders.size, b.due || "未排期"])));
+
+  // 导出的是当前切片，切片里没有待入库行就没得催
+  document.getElementById("alert-export").disabled = !rows.some(l => l[L_QTY] - l[L_IN] > 0);
+  document.getElementById("alert-notify").disabled = !rows.some(l => URGENT.has(lineTier(l)));
+}
+
+/** 催办清单导出：一行一个采购单，给到人、给到期限 */
+function exportAlerts() {
+  const map = new Map();
+  for (const l of rows) {
+    if (l[L_QTY] - l[L_IN] <= 0) continue;
+    let e = map.get(l[L_O]);
+    if (!e) map.set(l[L_O], e = { oi: l[L_O], lines: [], amt: 0 });
+    e.lines.push(l);
+    e.amt += (l[L_QTY] - l[L_IN]) * l[L_PRICE];
+  }
+  const list = Array.from(map.values());
+  list.forEach(e => { e.d = orderDue(e.lines); });
+  list.sort((a, b) => a.d.sort - b.d.sort);
+  const head = ["采购员", "提醒档位", "剩余天数", "到货期限", "采购单号", "状态",
+                "供应商ID", "仓储方", "待入库件数", "待入库金额", "明细行数"];
+  const body = list.map(e => {
+    const o = ORDERS[e.oi], d = e.d;
+    return [DICT.buyers[o[O_BUYER]], TIER_BY_K.get(d.tier).label,
+            d.days === null ? "未排期" : d.days, d.due || "",
+            o[O_NO], o[O_ST] ? "已确认" : "待审核",
+            DICT.suppliers[o[O_SUP]], DICT.warehouses[o[O_WH]],
+            Math.round(d.open), e.amt.toFixed(2), e.lines.length];
+  });
+  const esc = v => { v = String(v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  const csv = "﻿" + [head].concat(body).map(r => r.map(esc).join(",")).join("\r\n");
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const a = el("a");
+  a.href = url;
+  a.download = "催办清单_" + TODAY + ".csv";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/** 给 Agent / 邮件 / 群聊适配器的结构化催办请求。 */
+function buildReminderBatch() {
+  const map = new Map();
+  for (const l of rows) {
+    if (l[L_QTY] - l[L_IN] <= 0) continue;
+    let e = map.get(l[L_O]);
+    if (!e) map.set(l[L_O], e = { oi: l[L_O], lines: [], amount: 0 });
+    e.lines.push(l);
+    e.amount += (l[L_QTY] - l[L_IN]) * l[L_PRICE];
+  }
+  const items = Array.from(map.values()).map(e => {
+    const o = ORDERS[e.oi], due = orderDue(e.lines);
+    return {
+      orderNo: o[O_NO], purchaseDate: o[O_DATE], buyer: DICT.buyers[o[O_BUYER]],
+      supplierId: DICT.suppliers[o[O_SUP]], tier: due.tier,
+      tierLabel: TIER_BY_K.get(due.tier).label, dueDate: due.due || null,
+      daysLeft: due.days, pendingQty: Math.round(due.open), pendingAmount: +e.amount.toFixed(2)
+    };
+  }).filter(item => URGENT.has(item.tier));
+  return {
+    type: "procurement_due_reminder", source: "dashboard", year: state.year,
+    baselineDate: TODAY, preferredChannels: ["email", "group_chat"],
+    filters: { status: state.status, category: state.cat, buyer: state.buyer, eta: state.eta, query: state.q },
+    items: items
+  };
+}
+
+async function sendReminders() {
+  const batch = buildReminderBatch();
+  if (!batch.items.length) { alert("当前切片没有进入提醒窗口的采购单。"); return; }
+  if (!ADAPTERS.reminder.configured) {
+    const result = await ADAPTERS.reminder.send(batch);
+    alert(result.message);
+    return;
+  }
+  if (!confirm("确认将 " + batch.items.length + " 张采购单交给提醒服务发送？")) return;
+  const button = document.getElementById("alert-notify");
+  button.disabled = true; button.textContent = "发送中…";
+  try {
+    const result = await ADAPTERS.reminder.send(batch);
+    alert(result.message || (result.ok ? "提醒已提交。" : "提醒提交失败。"));
+  } catch (error) {
+    console.error(error); alert("提醒提交失败：" + error.message);
+  } finally {
+    button.textContent = "发送提醒"; renderAlert();
+  }
+}
+
+/* ─── 采购单表 ─── */
+let sortKey = "amt", sortDir = -1, page = 0;
+const PAGE = 20;
+function orderRows() {
+  const map = new Map();
+  for (const l of rows) {
+    let e = map.get(l[L_O]);
+    if (!e) map.set(l[L_O], e = { oi: l[L_O], n: 0, qty: 0, inq: 0, amt: 0, cats: new Set(), lines: [] });
+    e.n++; e.qty += l[L_QTY]; e.inq += l[L_IN]; e.amt += l[L_AMT]; e.cats.add(l[L_CAT]); e.lines.push(l);
+  }
+  const out = Array.from(map.values());
+  out.forEach(e => { e.d = orderDue(e.lines); });
+  const get = {
+    no: e => ORDERS[e.oi][O_NO], date: e => ORDERS[e.oi][O_DATE], st: e => ORDERS[e.oi][O_ST],
+    buyer: e => DICT.buyers[ORDERS[e.oi][O_BUYER]], cat: e => DICT.cats[Array.from(e.cats)[0]],
+    n: e => e.n, qty: e => e.qty, inq: e => e.inq,
+    due: e => e.d.sort, left: e => e.d.sort, open: e => e.d.open,
+    rate: e => (e.qty ? e.inq / e.qty : 0), amt: e => e.amt,
+    wh: e => DICT.warehouses[ORDERS[e.oi][O_WH]]
+  }[sortKey];
+  out.sort((a, b) => {
+    const x = get(a), y = get(b);
+    if (x === y) return 0;
+    return (x > y ? 1 : -1) * sortDir;
+  });
+  return out;
+}
+const ORDER_COLS = [
+  { key: "no", label: "采购单号" }, { key: "date", label: "采购日期" },
+  { key: "due", label: "到货期限" }, { key: "left", label: "剩余" },
+  { key: "st", label: "状态" }, { key: "buyer", label: "采购员" },
+  { key: "cat", label: "主品类" }, { key: "n", label: "行数", n: 1 },
+  { key: "qty", label: "采购数量", n: 1 }, { key: "inq", label: "已入库", n: 1 },
+  { key: "open", label: "待入库", n: 1 },
+  { key: "rate", label: "入库率", n: 1 }, { key: "amt", label: "采购金额", n: 1 },
+  { key: "wh", label: "仓储方" }, { key: "contract", label: "合同", sort: false }
+];
+function renderOrders() {
+  const data = orderRows();
+  const pages = Math.max(1, Math.ceil(data.length / PAGE));
+  if (page >= pages) page = pages - 1;
+  const slice = data.slice(page * PAGE, page * PAGE + PAGE);
+  const wrap = document.getElementById("orders-wrap");
+  wrap.textContent = "";
+  const t = el("table", "orders-table");
+  const tr = el("tr");
+  ORDER_COLS.forEach(c => {
+    const th = el("th", c.n ? "n" : null);
+    th.dataset.sort = c.key;
+    if (c.sort !== false) th.setAttribute("tabindex", "0");
+    th.appendChild(document.createTextNode(c.label));
+    if (sortKey === c.key) th.appendChild(el("span", "arrow", sortDir < 0 ? "↓" : "↑"));
+    const go = () => {
+      if (sortKey === c.key) sortDir = -sortDir; else { sortKey = c.key; sortDir = -1; }
+      page = 0; renderOrders();
+    };
+    if (c.sort !== false) {
+      th.addEventListener("click", go);
+      th.addEventListener("keydown", e => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+    }
+    tr.appendChild(th);
+  });
+  const thead = el("thead"); thead.appendChild(tr); t.appendChild(thead);
+  const tb = el("tbody");
+  slice.forEach(e => {
+    const o = ORDERS[e.oi], row = el("tr");
+    row.setAttribute("tabindex", "0");
+    const d = e.d;
+    const cells = [
+      { v: o[O_NO], cls: "no" }, { v: o[O_DATE] },
+      { v: d.open > 0 ? (d.due || "未排期") : "—", muted: d.open > 0 && !d.due },
+      { v: d.open > 0 ? daysText(d.days) + (d.due && d.noDate ? " ＋未排期" : "") : "已入库",
+        color: d.open > 0 && URGENT.has(d.tier) ? tierColor(d.tier) : null,
+        weight: d.open > 0 && URGENT.has(d.tier) },
+      { chip: 1 }, { v: DICT.buyers[o[O_BUYER]] },
+      { v: DICT.cats[Array.from(e.cats)[0]] + (e.cats.size > 1 ? " +" + (e.cats.size - 1) : "") },
+      { v: int(e.n), cls: "n" }, { v: int(e.qty), cls: "n" }, { v: int(e.inq), cls: "n" },
+      { v: int(d.open), cls: "n" },
+      { v: pct(e.inq, e.qty), cls: "n" }, { v: money(e.amt), cls: "n" },
+      { v: DICT.warehouses[o[O_WH]] }, { contract: true }
+    ];
+    cells.forEach(c => {
+      const td = el("td", c.cls || null);
+      if (c.contract) {
+        const link = el("a", "contract-action", "生成合同");
+        link.href = "合同生成.html?po_id=" + encodeURIComponent(o[O_NO]);
+        link.addEventListener("click", ev => ev.stopPropagation());
+        td.appendChild(link);
+      } else if (c.chip) {
+        const chip = el("span", "chip", o[O_ST] ? "已确认" : "待审核");
+        if (!o[O_ST]) { chip.style.color = css("--text-primary"); chip.style.borderColor = css("--warning"); }
+        else { chip.style.color = css("--text-secondary"); }
+        td.appendChild(chip);
+      } else {
+        td.textContent = c.v;
+        if (c.color) td.style.color = c.color;
+        if (c.weight) td.style.fontWeight = "600";
+        if (c.muted) td.style.color = css("--text-muted");
+      }
+      row.appendChild(td);
+    });
+    const open = () => openDrawer(e.oi);
+    row.addEventListener("click", open);
+    row.addEventListener("keydown", ev => { if (ev.key === "Enter") open(); });
+    tb.appendChild(row);
+  });
+  t.appendChild(tb);
+  wrap.appendChild(t);
+  document.getElementById("orders-count").textContent = int(data.length) + " 单";
+  document.getElementById("pg-info").textContent = (page + 1) + " / " + pages + " 页";
+  document.getElementById("pg-prev").disabled = page === 0;
+  document.getElementById("pg-next").disabled = page >= pages - 1;
+}
+
+/* ─── 明细抽屉 ─── */
+let lastFocus = null;
+function openDrawer(oi) {
+  const o = ORDERS[oi];
+  lastFocus = document.activeElement;
+  document.getElementById("drawer-title").textContent = o[O_NO];
+  const meta = document.getElementById("drawer-meta");
+  meta.textContent = "";
+  const items = rows.filter(l => l[L_O] === oi);
+  const amt = items.reduce((a, b) => a + b[L_AMT], 0);
+  const qty = items.reduce((a, b) => a + b[L_QTY], 0);
+  const inq = items.reduce((a, b) => a + b[L_IN], 0);
+  const due = orderDue(items);
+  [["状态", o[O_ST] ? "已确认" : "待审核"], ["采购日期", o[O_DATE]], ["审核日期", o[O_AUDIT] || "—"],
+   ["到货期限", due.open > 0 ? (due.due || "未排期") : "—"],
+   ["剩余", due.open > 0 ? daysText(due.days) : "已入库"],
+   ["采购员", DICT.buyers[o[O_BUYER]]], ["供应商 ID", DICT.suppliers[o[O_SUP]]],
+   ["仓储方", DICT.warehouses[o[O_WH]]], ["收货", DICT.addrs[o[O_ADDR]]],
+   ["付款方式", DICT.pays[o[O_PAY]]], ["外部单号", o[O_EXT] || "—"],
+   ["采购金额", money(amt) + " 元"], ["采购 / 入库", int(qty) + " / " + int(inq) + " 件"],
+   ["待入库", int(due.open) + " 件"], ["入库率", pct(inq, qty)]
+  ].forEach(([k, v], i) => {
+    const box = el("div");
+    box.appendChild(el("div", "k", k));
+    const val = el("div", "v", v);
+    if (i === 4 && due.open > 0 && URGENT.has(due.tier)) {
+      val.style.color = tierColor(due.tier);
+      val.style.fontWeight = "600";
+    }
+    box.appendChild(val);
+    meta.appendChild(box);
+  });
+  buildTable(document.getElementById("drawer-lines"),
+    [{ label: "商品" }, { label: "颜色 / 规格" }, { label: "商品编码" },
+     { label: "数量", n: 1 }, { label: "已入库", n: 1 }, { label: "待入库", n: 1 },
+     { label: "到货期限" }, { label: "剩余" },
+     { label: "单价", n: 1 }, { label: "金额", n: 1 }],
+    items.map(l => {
+      const open = l[L_QTY] - l[L_IN];
+      return [DICT.spus[l[L_SPU]], DICT.colors[l[L_COLOR]] + (l[L_SPEC] ? " / " + l[L_SPEC] : ""),
+              l[L_SKU], int(l[L_QTY]), int(l[L_IN]), int(open),
+              open > 0 ? (l[L_ETA] || "未排期") : (l[L_ETA] || "—"),
+              open > 0 ? daysText(etaDays(l[L_ETA])) : "已入库",
+              l[L_PRICE].toFixed(2), int(l[L_AMT])];
+    }));
+  document.getElementById("scrim").classList.add("open");
+  document.getElementById("drawer").classList.add("open");
+  document.getElementById("drawer").focus();
+}
+function closeDrawer() {
+  document.getElementById("scrim").classList.remove("open");
+  document.getElementById("drawer").classList.remove("open");
+  if (lastFocus) lastFocus.focus();
+}
+
+/* ═══════════════════ 总装 ═══════════════════ */
+function renderAll() {
+  applyFilters();
+  const [from, to] = resolveRange();
+  const etaOpt = ETA_OPTS.find(o => o.k === state.eta);
+  document.getElementById("slice-note").textContent =
+    "当前切片 " + int(orderIdxs.length) + " 单 / " + int(rows.length) + " 行 · " + from + " → " + to +
+    (state.eta ? " · 到货期限 " + etaOpt.label : "");
+  renderRail(); renderTrend(); renderCat(); renderRecv(); renderBuyer(); renderSize(); renderEta();
+  renderAlert();
+  page = 0; renderOrders();
+}
+
+/* 筛选控件 */
+const yearSel = document.getElementById("f-year");
+YEARS.forEach(y => yearSel.appendChild(new Option(y + " 年", y)));
+yearSel.value = state.year;
+function syncYearControls() {
+  const [start, end] = yearBounds(state.year);
+  fFrom.min = fTo.min = start;
+  fFrom.max = fTo.max = end;
+  fFrom.value = state.from;
+  fTo.value = state.to;
+  document.getElementById("nav-delivery").href = "交期提醒台账.html?year=" + encodeURIComponent(state.year);
+}
+
+const rangeSeg = document.getElementById("range-seg");
+PRESETS.forEach(p => {
+  const b = el("button", null, p.label);
+  b.type = "button";
+  b.dataset.k = p.k;
+  b.setAttribute("aria-pressed", String(p.k === state.preset));
+  b.addEventListener("click", () => {
+    state.preset = p.k;
+    Array.from(rangeSeg.children).forEach(c => c.setAttribute("aria-pressed", String(c.dataset.k === p.k)));
+    document.getElementById("custom-range").hidden = p.k !== "custom";
+    renderAll();
+  });
+  rangeSeg.appendChild(b);
+});
+const fFrom = document.getElementById("date-from"), fTo = document.getElementById("date-to");
+fFrom.value = state.from; fTo.value = state.to;
+syncYearControls();
+yearSel.addEventListener("change", () => {
+  location.search = "?year=" + encodeURIComponent(yearSel.value);
+});
+fFrom.addEventListener("change", () => { state.from = fFrom.value || yearBounds(state.year)[0]; renderAll(); });
+fTo.addEventListener("change", () => { state.to = fTo.value || yearBounds(state.year)[1]; renderAll(); });
+
+function fillSelect(id, list, label) {
+  const sel = document.getElementById(id);
+  sel.appendChild(new Option("全部" + label, ""));
+  list.map((n, i) => [n, i]).sort((a, b) => a[0].localeCompare(b[0], "zh")).forEach(([n, i]) => sel.appendChild(new Option(n, i)));
+}
+fillSelect("f-cat", DICT.cats, "品类");
+fillSelect("f-buyer", DICT.buyers, "采购员");
+const etaSel = document.getElementById("f-eta");
+ETA_OPTS.forEach(o => etaSel.appendChild(new Option(o.label, o.k)));
+etaSel.addEventListener("change", e => {
+  state.eta = e.target.value;
+  if (state.eta) { sortKey = "due"; sortDir = 1; }
+  renderAll();
+});
+document.getElementById("alert-export").addEventListener("click", exportAlerts);
+document.getElementById("alert-notify").addEventListener("click", sendReminders);
+document.getElementById("f-cat").addEventListener("change", e => { state.cat = e.target.value; renderAll(); });
+document.getElementById("f-buyer").addEventListener("change", e => { state.buyer = e.target.value; renderAll(); });
+document.getElementById("f-status").addEventListener("change", e => { state.status = e.target.value; renderAll(); });
+let qTimer;
+document.getElementById("f-q").addEventListener("input", e => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(() => { state.q = e.target.value; renderAll(); }, 180);
+});
+document.getElementById("f-reset").addEventListener("click", () => {
+  state.preset = "year"; state.status = ""; state.cat = ""; state.buyer = ""; state.q = ""; state.eta = "";
+  [state.from, state.to] = yearBounds(state.year);
+  Array.from(rangeSeg.children).forEach(c => c.setAttribute("aria-pressed", String(c.dataset.k === "year")));
+  document.getElementById("custom-range").hidden = true;
+  ["f-status", "f-cat", "f-buyer", "f-eta"].forEach(id => document.getElementById(id).value = "");
+  document.getElementById("f-q").value = "";
+  syncYearControls();
+  renderAll();
+});
+
+/* 卡内视图开关 */
+document.querySelectorAll(".mini-seg[data-view]").forEach(seg => {
+  const name = seg.dataset.view;
+  seg.addEventListener("click", e => {
+    const b = e.target.closest("button");
+    if (!b) return;
+    Array.from(seg.children).forEach(c => c.setAttribute("aria-pressed", String(c === b)));
+    const chart = b.dataset.v === "chart";
+    document.getElementById(name + "-plot").hidden = !chart;
+    document.getElementById(name + "-table").hidden = chart;
+    const lg = seg.closest(".card").querySelector(".legend, .scale-legend");
+    if (lg) lg.hidden = !chart;
+  });
+});
+document.getElementById("trend-gran").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  gran = b.dataset.g;
+  Array.from(e.currentTarget.children).forEach(c => c.setAttribute("aria-pressed", String(c === b)));
+  renderTrend();
+});
+document.getElementById("size-mode").addEventListener("click", e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  sizeMode = +b.dataset.m;
+  Array.from(e.currentTarget.children).forEach(c => c.setAttribute("aria-pressed", String(c === b)));
+  renderSize();
+});
+document.getElementById("pg-prev").addEventListener("click", () => { page--; renderOrders(); });
+document.getElementById("pg-next").addEventListener("click", () => { page++; renderOrders(); });
+document.getElementById("scrim").addEventListener("click", closeDrawer);
+document.getElementById("drawer-close").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", e => { if (e.key === "Escape") { closeDrawer(); hideTip(); } });
+
+/* 尺寸变化时重画（图形按容器实际宽度排版） */
+let rzTimer;
+addEventListener("resize", () => {
+  clearTimeout(rzTimer);
+  rzTimer = setTimeout(() => { renderRail(); renderTrend(); renderCat(); renderRecv(); renderBuyer(); renderSize(); renderEta(); renderAlert(); }, 140);
+});
+
+document.getElementById("eta-today").textContent = TODAY;
+document.getElementById("alert-today").textContent = TODAY;
+const sourceLabel = document.getElementById("data-source");
+sourceLabel.textContent = META.source || "本地数据快照";
+if (META.warning) sourceLabel.title = META.warning;
+document.getElementById("span-range").textContent = META.minDate + " ~ " + META.maxDate;
+document.getElementById("span-scale").textContent = int(META.orders) + " 单 / " + int(META.rows) + " 行明细";
+renderAll();
+})();
+</script>
+</body>
+</html>

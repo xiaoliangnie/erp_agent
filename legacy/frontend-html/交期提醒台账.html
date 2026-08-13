@@ -1,0 +1,1008 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>交期提醒台账 · 蜀黍家</title>
+<style>
+/* ───────────────────────── 令牌（与 采购看板.html 同一套） ───────────────────────── */
+:root {
+  color-scheme: light;
+  --plane:          #f9f9f7;
+  --surface-1:      #fcfcfb;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #898781;
+  --grid:           #e1e0d9;
+  --border:         rgba(11,11,11,.10);
+  --wash:           rgba(11,11,11,.04);
+
+  --series-1:       #2a78d6;
+  --track:          #9ec5f4;
+  --deemph:         #d8d7d1;
+  --good:           #0ca30c;
+
+  /* 四波提醒（红→橙→黄→蓝），越靠前越急 */
+  --tier-overdue: #d03b3b; --tier-d1: #e2622b; --tier-d10: #fab219;
+  --tier-d20:     #2a78d6; --tier-far: #9ec5f4; --tier-none: #d8d7d1;
+  --tier-done:    #0ca30c;
+
+  --font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", system-ui, "Segoe UI", sans-serif;
+}
+/* ───────────────────────── 基础 ───────────────────────── */
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--plane); color: var(--text-primary);
+  font-family: var(--font); font-size: 13px; line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+:focus-visible { outline: 2px solid var(--series-1); outline-offset: 2px; border-radius: 3px; }
+button { font: inherit; color: inherit; }
+.num { font-variant-numeric: tabular-nums; }
+
+.topbar {
+  display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap;
+  padding: 22px 24px 14px; border-bottom: 1px solid var(--border);
+}
+.topbar h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: .04em; }
+.topbar .sub { color: var(--text-secondary); font-size: 12px; }
+.topbar .sub b { font-weight: 600; color: var(--text-primary); }
+.topbar .spacer { flex: 1 1 auto; }
+.topbar a.back { color: var(--text-secondary); font-size: 12px; text-decoration: none; border-bottom: 1px solid var(--border); }
+.topbar a.back:hover { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+/* ───────────────────────── 筛选行 ───────────────────────── */
+.filters {
+  display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
+  padding: 12px 24px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1); position: sticky; top: 0; z-index: 30;
+}
+.field { display: flex; flex-direction: column; gap: 4px; }
+.field > label { font-size: 10px; letter-spacing: .12em; color: var(--text-muted); font-weight: 600; }
+select, input[type="search"], input[type="date"] {
+  font: inherit; font-size: 12px; padding: 6px 9px; border-radius: 7px;
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-primary);
+}
+input[type="search"] { min-width: 220px; }
+.check { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); padding-bottom: 6px; cursor: pointer; }
+.filters .reset {
+  background: transparent; border: 0; border-bottom: 1px solid var(--border);
+  cursor: pointer; color: var(--text-secondary); padding: 6px 2px; font-size: 12px;
+}
+.filters .reset:hover { color: var(--text-primary); border-bottom-color: var(--text-primary); }
+.slice-note { font-size: 11px; color: var(--text-muted); margin-left: auto; padding-bottom: 7px; font-variant-numeric: tabular-nums; }
+
+.wrap { padding: 16px 24px 44px; display: flex; flex-direction: column; gap: 16px; }
+.card {
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 16px 18px 14px; min-width: 0;
+}
+.card-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
+.card-head h2 { margin: 3px 0 0; font-size: 14px; font-weight: 620; letter-spacing: .01em; }
+.card-head .note { font-size: 11px; color: var(--text-muted); margin-top: 2px; max-width: 78ch; }
+.card-head .ctrl { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.eyebrow { font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: var(--text-muted); font-weight: 600; margin: 0; }
+.btn {
+  background: transparent; border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 11px; font-size: 11px; cursor: pointer; color: var(--text-secondary);
+}
+.btn:hover { background: var(--wash); color: var(--text-primary); }
+.btn:disabled { opacity: .4; cursor: default; background: transparent; }
+
+/* ───────────────────────── 四波提醒档位卡 ───────────────────────── */
+.tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 10px; }
+.tier {
+  text-align: left; background: transparent; cursor: pointer;
+  border: 1px solid var(--border); border-left: 3px solid var(--deemph);
+  border-radius: 9px; padding: 9px 12px 10px;
+}
+.tier:hover { background: var(--wash); }
+.tier[aria-pressed="true"] { background: var(--wash); border-color: var(--text-primary); }
+.tier .t-k { font-size: 11.5px; color: var(--text-secondary); font-weight: 600; display: flex; align-items: baseline; gap: 6px; }
+.tier .t-k .seq { font-size: 10px; color: var(--text-muted); font-weight: 700; letter-spacing: .06em; }
+.tier .t-v { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 3px 0 1px; }
+.tier .t-v small { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
+.tier .t-s { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tier .t-n { font-size: 10.5px; color: var(--text-muted); margin-top: 5px; line-height: 1.35; }
+
+/* ───────────────────────── 采购员催办条 ───────────────────────── */
+.buyer-rows { display: flex; flex-direction: column; gap: 7px; }
+.buyer-row { display: grid; grid-template-columns: 116px minmax(0,1fr) 92px; align-items: center; gap: 12px; }
+.buyer-row .bn { font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.buyer-row .bar { display: flex; height: 13px; border-radius: 3px; overflow: hidden; background: var(--wash); min-width: 5px; }
+.buyer-row .bar i { display: block; height: 100%; }
+.buyer-row .bv { font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.buyer-row .bv small { font-weight: 500; color: var(--text-muted); margin-left: 3px; font-size: 10.5px; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 12px 0 0; font-size: 11px; color: var(--text-secondary); }
+.legend .item { display: inline-flex; align-items: center; gap: 6px; }
+.legend .swatch { width: 11px; height: 11px; border-radius: 3px; flex: none; }
+
+/* ───────────────────────── 台账表 ───────────────────────── */
+.tbl-scroll { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; font-size: 12px; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; vertical-align: middle; }
+th { position: sticky; top: 0; background: var(--surface-1); font-weight: 600; color: var(--text-secondary); font-size: 11px; z-index: 1; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr { cursor: pointer; }
+tbody tr:hover { background: var(--wash); }
+th[data-sort] { cursor: pointer; user-select: none; }
+th[data-sort]:hover { color: var(--text-primary); }
+th .arrow { color: var(--series-1); margin-left: 3px; }
+td.no { font-variant-numeric: tabular-nums; font-weight: 600; }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); }
+
+/* 产品信息 */
+.prod { max-width: 260px; }
+.prod .pn { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prod .ps { font-size: 10.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.more { color: var(--text-muted); font-weight: 500; margin-left: 4px; font-size: 11px; }
+
+/* 入库进度 */
+.recv { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.recv .meter { width: 46px; height: 6px; border-radius: 999px; background: var(--track); overflow: hidden; flex: none; }
+.recv .meter > i { display: block; height: 100%; background: var(--series-1); }
+
+/* 交期 · 剩余 */
+.eta-cell .d { font-variant-numeric: tabular-nums; }
+.eta-cell .alt { font-size: 10.5px; color: var(--text-muted); }
+.left { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* 四波提醒时间轴 */
+.waves { display: inline-flex; align-items: center; gap: 3px; vertical-align: middle; }
+.waves i {
+  width: 15px; height: 15px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 9px; font-weight: 700; font-style: normal;
+  border: 1.5px solid var(--deemph); color: var(--text-muted); background: transparent;
+}
+.waves i.hit { border-color: transparent; color: #fff; }
+.waves i.cur { box-shadow: 0 0 0 2px var(--surface-1), 0 0 0 3.5px var(--ring); }
+.wave-cell { display: flex; align-items: center; gap: 9px; }
+
+.pager { display: flex; align-items: center; gap: 10px; padding-top: 12px; font-size: 12px; color: var(--text-secondary); }
+.pager button { background: transparent; border: 1px solid var(--border); border-radius: 6px; padding: 4px 11px; cursor: pointer; }
+.pager button:disabled { opacity: .4; cursor: default; }
+.pager button:not(:disabled):hover { background: var(--wash); }
+.pager .sp { flex: 1 1 auto; }
+.empty { padding: 34px 0; text-align: center; color: var(--text-muted); font-size: 12px; }
+
+/* ───────────────────────── 抽屉 ───────────────────────── */
+.scrim { position: fixed; inset: 0; background: rgba(0,0,0,.34); z-index: 80; opacity: 0; pointer-events: none; transition: opacity .16s; }
+.scrim.open { opacity: 1; pointer-events: auto; }
+.drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(860px, 96vw); z-index: 81;
+  background: var(--surface-1); border-left: 1px solid var(--border);
+  transform: translateX(100%); transition: transform .2s ease;
+  display: flex; flex-direction: column;
+}
+.drawer.open { transform: none; }
+.drawer-head { padding: 18px 20px 14px; border-bottom: 1px solid var(--border); }
+.drawer-head .row { display: flex; align-items: baseline; gap: 12px; }
+.drawer-head h3 { margin: 0; font-size: 17px; font-variant-numeric: tabular-nums; }
+.drawer-head .close { margin-left: auto; background: transparent; border: 1px solid var(--border); border-radius: 7px; padding: 4px 11px; cursor: pointer; }
+.meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(122px, 1fr)); gap: 10px 16px; margin-top: 14px; }
+.meta-grid .k { font-size: 10px; letter-spacing: .1em; color: var(--text-muted); font-weight: 600; }
+.meta-grid .v { font-size: 12px; }
+.drawer-body { overflow: auto; padding: 0 20px 24px; }
+.drawer-body h4 { font-size: 12px; color: var(--text-secondary); margin: 18px 0 8px; font-weight: 600; }
+.drawer-body tbody tr { cursor: default; }
+/* 抽屉里的四波排期表 */
+.plan { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 4px; }
+.plan .step { border: 1px solid var(--border); border-left: 3px solid var(--deemph); border-radius: 9px; padding: 8px 11px 9px; }
+.plan .step .s-k { font-size: 11px; font-weight: 600; color: var(--text-secondary); }
+.plan .step .s-d { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 2px 0 1px; }
+.plan .step .s-s { font-size: 10.5px; color: var(--text-muted); }
+
+@media (max-width: 900px) {
+  .wrap { padding: 12px; }
+  .filters { position: static; }
+  .buyer-row { grid-template-columns: 92px minmax(0,1fr) 80px; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <h1>交期提醒台账</h1>
+  <div class="sub">数据源 <b id="data-source">正在连接…</b> · <span id="span-scale"></span> · 交期 <span id="span-eta"></span></div>
+  <div class="spacer"></div>
+  <a class="back" href="合同生成.html">生成采购合同</a>
+  <a class="back" href="换货.html">订单换货</a>
+  <a class="back" id="nav-dashboard" href="采购看板.html">← 采购看板</a>
+</header>
+
+<div class="filters" role="group" aria-label="筛选">
+  <div class="field">
+    <label for="f-year">统计年度</label>
+    <select id="f-year"></select>
+  </div>
+  <div class="field">
+    <label for="f-today">今天 · 提醒基准日</label>
+    <input type="date" id="f-today">
+  </div>
+  <div class="field">
+    <label for="f-buyer">采购员</label>
+    <select id="f-buyer"></select>
+  </div>
+  <div class="field">
+    <label for="f-sup">供应商</label>
+    <select id="f-sup"></select>
+  </div>
+  <div class="field">
+    <label for="f-st">状态</label>
+    <select id="f-st">
+      <option value="">全部</option><option value="1">已确认</option><option value="0">待审核</option>
+    </select>
+  </div>
+  <div class="field">
+    <label for="f-from">交期区间</label>
+    <div style="display:flex;gap:6px;align-items:center">
+      <input type="date" id="f-from"><span style="color:var(--text-muted)">→</span><input type="date" id="f-to">
+    </div>
+  </div>
+  <div class="field">
+    <label for="f-q">搜索</label>
+    <input type="search" id="f-q" placeholder="单号 / 商品 / 编码 / 供应商 / 采购员">
+  </div>
+  <label class="check"><input type="checkbox" id="f-pend" checked> 只看还有待入库的单</label>
+  <button class="reset" id="f-reset" type="button">清空筛选</button>
+  <div class="slice-note" id="slice-note"></div>
+</div>
+
+<div class="wrap">
+
+  <!-- 四波提醒 -->
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">采购单 · 按最急的一波归档</p>
+        <h2>交期提醒 · 四波</h2>
+        <div class="note" id="wave-note"></div>
+      </div>
+      <div class="ctrl">
+        <button class="btn" id="btn-notify" type="button">发送提醒</button>
+        <button class="btn" id="btn-export" type="button">导出催办清单</button>
+      </div>
+    </div>
+    <div class="tiers" id="tiers"></div>
+  </section>
+
+  <!-- 采购员催办分工 -->
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">待入库数量 · 件</p>
+        <h2>按采购员的催办量</h2>
+        <div class="note">每人一条，按提醒波次堆叠。右端是需催量（前四波合计，即 20 天内 + 已逾期）。</div>
+      </div>
+    </div>
+    <div class="buyer-rows" id="buyer-rows"></div>
+    <div class="legend" id="buyer-legend"></div>
+  </section>
+
+  <!-- 台账 -->
+  <section class="card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">明细 · 采购单</p>
+        <h2>交期台账</h2>
+        <div class="note">点任意一行查看该单的商品明细与四波排期。</div>
+      </div>
+      <div class="ctrl"><span class="note" id="tbl-count"></span></div>
+    </div>
+    <div class="tbl-scroll">
+      <table id="tbl">
+        <thead><tr>
+          <th data-sort="no">单号</th>
+          <th data-sort="date">采购日期</th>
+          <th data-sort="sup">供应商</th>
+          <th>产品信息</th>
+          <th data-sort="eta">交期</th>
+          <th class="n" data-sort="left">剩余</th>
+          <th class="n" data-sort="qty">采购数量</th>
+          <th class="n" data-sort="in">入库数量</th>
+          <th class="n" data-sort="pend">待入库</th>
+          <th data-sort="buyer">采购员</th>
+          <th data-sort="wave">交期提醒</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="empty" id="empty" hidden>当前筛选下没有采购单。</div>
+    <div class="pager">
+      <button id="pg-prev" type="button">上一页</button>
+      <span id="pg-label" class="num"></span>
+      <button id="pg-next" type="button">下一页</button>
+      <span class="sp"></span>
+      <span class="note" id="pg-note"></span>
+    </div>
+  </section>
+</div>
+
+<div class="scrim" id="scrim"></div>
+<aside class="drawer" id="drawer" aria-hidden="true" aria-label="采购单明细">
+  <div class="drawer-head">
+    <div class="row">
+      <h3 id="dr-no"></h3>
+      <span id="dr-chip"></span>
+      <button class="close" id="dr-close" type="button">关闭</button>
+    </div>
+    <div class="meta-grid" id="dr-meta"></div>
+  </div>
+  <div class="drawer-body">
+    <h4>四波提醒排期</h4>
+    <div class="plan" id="dr-plan"></div>
+    <h4>商品明细</h4>
+    <div id="dr-lines"></div>
+  </div>
+</aside>
+
+<script src="js/integration-adapters.js"></script>
+<script src="data/delivery-data.js"></script>
+<script>
+(async function () {
+"use strict";
+
+/* ═══════════════════ 数据接线 ═══════════════════ */
+const ADAPTERS = window.ProcurementAdapters;
+const D = await ADAPTERS.dataSource.getDeliveryData({ requestedYear: new URLSearchParams(location.search).get("year") });
+if (!D) {
+  document.body.innerHTML = "<p style='padding:40px;font:14px system-ui'>找不到交期数据，请检查数据库适配器或先运行 <code>python3 scripts/build_delivery_data.py</code></p>";
+  return;
+}
+const DICT = D.dict, META = D.meta;
+
+// 采购单字段位
+const O_NO=0, O_DATE=1, O_ST=2, O_BUYER=3, O_SUP=4, O_WH=5, O_EXT=6, O_AUDIT=7;
+// 明细行字段位
+const L_O=0, L_SPU=1, L_SKU=2, L_COLOR=3, L_SPEC=4, L_CAT=5, L_QTY=6, L_IN=7,
+      L_ETA=8, L_ARR=9, L_AMT=10;
+
+/* ═══════════════════ 提醒口径 ═══════════════════ */
+/* 交期取 item_delivery_date（与供应商约定的交期）；该行没填就退到 最早预计到货日期。
+   只有「还有待入库数量」的行才进档 —— 已入库完的行没有期限可催。
+   一张单的交期 = 所有待入库行里最早的那个，波次取最急的一档。 */
+const DAY_MS = 86400000;
+const dnum = iso => Date.UTC(+iso.slice(0,4), +iso.slice(5,7) - 1, +iso.slice(8,10)) / DAY_MS;
+const diso = n => new Date(n * DAY_MS).toISOString().slice(0, 10);
+
+const WAVES = [
+  { k:"w4", seq:"第 4 次", label:"逾期催办", short:"逾期",  off:-1, v:"--tier-overdue", note:"交期已过仍未入库完，逐日追" },
+  { k:"w3", seq:"第 3 次", label:"T-1",     short:"T-1",   off:1,  v:"--tier-d1",      note:"交期前 1 天，核对物流单号" },
+  { k:"w2", seq:"第 2 次", label:"T-10",    short:"T-10",  off:10, v:"--tier-d10",     note:"交期前 10 天，确认发货计划" },
+  { k:"w1", seq:"第 1 次", label:"T-20",    short:"T-20",  off:20, v:"--tier-d20",     note:"交期前 20 天，确认排产进度" },
+  { k:"far",seq:"",        label:"暂不提醒", short:">20天", off:null, v:"--tier-far",   note:"距交期 20 天以上，还没进提醒窗" },
+  { k:"none",seq:"",       label:"未排期",   short:"未排期",off:null, v:"--tier-none",  note:"没有交期，先补日期才催得动" }
+];
+const W_BY_K = new Map(WAVES.map((w, i) => [w.k, (w.rank = i, w)]));
+const URGENT = ["w4", "w3", "w2", "w1"];                  // 需要发提醒的四波
+const URGENT_SET = new Set(URGENT);
+// 时间轴按第 1→4 次排（卡片是最急优先，时间轴是时间顺序）
+const TIMELINE = ["w1", "w2", "w3", "w4"].map(k => W_BY_K.get(k));
+
+function waveOfDays(d) {
+  if (d === null) return "none";
+  if (d < 0)  return "w4";
+  if (d <= 1) return "w3";
+  if (d <= 10) return "w2";
+  if (d <= 20) return "w1";
+  return "far";
+}
+function daysText(d) {
+  if (d === null) return "未排期";
+  if (d < 0) return "逾期 " + (-d) + " 天";
+  if (d === 0) return "今天到期";
+  if (d === 1) return "明天到期";
+  return "剩 " + d + " 天";
+}
+
+/* ═══════════════════ 工具 ═══════════════════ */
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const waveColor = k => css(W_BY_K.get(k).v);
+const int = n => Math.round(n).toLocaleString("zh-CN");
+const pct = (a, b) => (b > 0 ? (a / b * 100).toFixed(1) + "%" : "—");
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+function money(v) {
+  const a = Math.abs(v);
+  if (a >= 1e8) return (v / 1e8).toFixed(2) + " 亿";
+  if (a >= 1e4) return (v / 1e4).toFixed(a >= 1e6 ? 0 : 1) + " 万";
+  return int(v);
+}
+
+/* ═══════════════════ 建单级视图 ═══════════════════ */
+/* 单级的数量/金额是死的，先算一次；交期波次跟着「今天」走，另算。 */
+const ORDERS = D.orders.map((o, i) => ({
+  i, no: o[O_NO], date: o[O_DATE], st: o[O_ST], buyer: o[O_BUYER], sup: o[O_SUP],
+  wh: o[O_WH], ext: o[O_EXT], audit: o[O_AUDIT],
+  lines: [], qty: 0, inQty: 0, pend: 0, amt: 0,
+  eta: "", etaSrc: "", etaSpread: 0, spu: "", spuN: 0, cat: ""
+}));
+
+for (const l of D.lines) {
+  const o = ORDERS[l[L_O]];
+  o.lines.push(l);
+  o.qty += l[L_QTY];
+  o.inQty += l[L_IN];
+  o.pend += Math.max(0, l[L_QTY] - l[L_IN]);
+  o.amt += l[L_AMT];
+}
+
+for (const o of ORDERS) {
+  // 交期：待入库行优先；整单已入库完的，退一步用全部行，好歹显示个日期
+  const pend = o.lines.filter(l => l[L_QTY] - l[L_IN] > 0);
+  const pool = pend.length ? pend : o.lines;
+  const dl = pool.map(l => l[L_ETA]).filter(Boolean);
+  const ar = pool.map(l => l[L_ARR]).filter(Boolean);
+  if (dl.length) { o.eta = dl.reduce((a, b) => a < b ? a : b); o.etaSrc = "交期"; o.etaSpread = new Set(dl).size; }
+  else if (ar.length) { o.eta = ar.reduce((a, b) => a < b ? a : b); o.etaSrc = "预计到货"; o.etaSpread = new Set(ar).size; }
+  o.etaN = o.eta ? dnum(o.eta) : null;
+
+  // 产品信息：按数量最大的商品做代表
+  const byS = new Map();
+  for (const l of o.lines) byS.set(l[L_SPU], (byS.get(l[L_SPU]) || 0) + l[L_QTY]);
+  let best = -1;
+  for (const [s, q] of byS) if (q > best) { best = q; o.spu = DICT.spus[s]; }
+  o.spuN = byS.size;
+  const cats = new Set(o.lines.map(l => l[L_CAT]));
+  o.cat = DICT.cats[o.lines[0][L_CAT]] + (cats.size > 1 ? " +" + (cats.size - 1) : "");
+
+  // 搜索用的一行 haystack
+  o.hay = (o.no + " " + o.ext + " " + DICT.suppliers[o.sup] + " " + DICT.buyers[o.buyer] + " " +
+           [...byS.keys()].map(s => DICT.spus[s]).join(" ") + " " +
+           o.lines.map(l => l[L_SKU]).join(" ")).toLowerCase();
+}
+
+/* ═══════════════════ 状态 ═══════════════════ */
+const YEARS = (META.availableYears || Array.from(new Set(ORDERS.map(o => o.date.slice(0, 4)).filter(Boolean)))).slice().sort().reverse();
+const QUERY_YEAR = new URLSearchParams(location.search).get("year");
+const DEFAULT_YEAR = YEARS.includes(QUERY_YEAR) ? QUERY_YEAR : YEARS[0];
+const F = { year: DEFAULT_YEAR, today: META.today, wave: "", buyer: "", sup: "", st: "", from: "", to: "", q: "", pendOnly: true };
+let sortKey = "urgent", sortDir = 1, page = 0;
+const PAGE = 25;
+let T0 = dnum(F.today);
+
+/** 按当前基准日给每张单算剩余天数与波次 */
+function stamp() {
+  T0 = dnum(F.today);
+  for (const o of ORDERS) {
+    o.done = o.pend <= 0;
+    o.left = o.etaN === null ? null : o.etaN - T0;
+    o.wave = o.done ? "done" : waveOfDays(o.left);
+  }
+}
+
+function match(o) {
+  if (!o.date.startsWith(F.year + "-")) return false;
+  if (F.pendOnly && o.done) return false;
+  if (F.wave && o.wave !== F.wave) return false;
+  if (F.buyer !== "" && o.buyer !== +F.buyer) return false;
+  if (F.sup !== "" && o.sup !== +F.sup) return false;
+  if (F.st !== "" && o.st !== +F.st) return false;
+  if (F.from && (!o.eta || o.eta < F.from)) return false;
+  if (F.to && (!o.eta || o.eta > F.to)) return false;
+  if (F.q && !o.hay.includes(F.q)) return false;
+  return true;
+}
+/** 档位卡自己不受档位筛选约束，否则选中一档，别的档全归零 */
+function matchNoWave(o) {
+  const keep = F.wave; F.wave = "";
+  const r = match(o); F.wave = keep;
+  return r;
+}
+
+const SORTS = {
+  urgent: o => [W_BY_K.has(o.wave) ? W_BY_K.get(o.wave).rank : 9, o.left === null ? 1e9 : o.left, -o.pend],
+  no:    o => o.no,
+  date:  o => o.date,
+  sup:   o => DICT.suppliers[o.sup],
+  eta:   o => o.eta || "￿",
+  left:  o => o.left === null ? 1e9 : o.left,
+  qty:   o => o.qty,
+  in:    o => o.inQty,
+  pend:  o => o.pend,
+  buyer: o => DICT.buyers[o.buyer],
+  wave:  o => (W_BY_K.has(o.wave) ? W_BY_K.get(o.wave).rank : 9)
+};
+function cmp(a, b) {
+  const ka = SORTS[sortKey](a), kb = SORTS[sortKey](b);
+  if (Array.isArray(ka)) {
+    for (let i = 0; i < ka.length; i++) if (ka[i] !== kb[i]) return (ka[i] < kb[i] ? -1 : 1) * sortDir;
+    return a.no < b.no ? -1 : 1;
+  }
+  if (ka === kb) return a.no < b.no ? -1 : 1;
+  return (ka < kb ? -1 : 1) * sortDir;
+}
+
+let slice = [];
+function recompute() {
+  stamp();
+  slice = ORDERS.filter(match).sort(cmp);
+}
+
+/* ═══════════════════ 四波提醒档位卡 ═══════════════════ */
+function renderTiers() {
+  const box = document.getElementById("tiers");
+  box.textContent = "";
+  const pool = ORDERS.filter(matchNoWave);
+  const agg = new Map();
+  for (const w of WAVES) agg.set(w.k, { n: 0, qty: 0, buyers: new Set(), first: "" });
+  agg.set("done", { n: 0, qty: 0, buyers: new Set(), first: "" });
+  for (const o of pool) {
+    const a = agg.get(o.wave);
+    if (!a) continue;
+    a.n++; a.qty += o.pend; a.buyers.add(o.buyer);
+    if (o.eta && (!a.first || o.eta < a.first)) a.first = o.eta;
+  }
+
+  const cards = WAVES.slice();
+  if (!F.pendOnly) cards.push({ k:"done", seq:"", label:"已入库完", short:"完成", v:"--tier-done", note:"没有待入库量，不进提醒" });
+
+  for (const w of cards) {
+    const a = agg.get(w.k);
+    const b = el("button", "tier");
+    b.type = "button";
+    b.setAttribute("aria-pressed", F.wave === w.k);
+    b.style.borderLeftColor = w.k === "done" ? css("--tier-done") : waveColor(w.k);
+
+    const k = el("div", "t-k");
+    if (w.seq) k.append(el("span", "seq", w.seq));
+    k.append(el("span", null, w.label));
+    const v = el("div", "t-v", int(a.n));
+    v.append(el("small", null, "单"));
+    const s = el("div", "t-s", int(a.qty) + " 件待入库 · " + a.buyers.size + " 个采购员");
+    const n = el("div", "t-n", a.first && URGENT_SET.has(w.k) ? w.note + "｜最早交期 " + a.first : w.note);
+    b.append(k, v, s, n);
+    b.addEventListener("click", () => { F.wave = F.wave === w.k ? "" : w.k; page = 0; renderAll(); });
+    box.append(b);
+  }
+
+  const need = URGENT.reduce((s, k) => s + agg.get(k).n, 0);
+  const needQty = URGENT.reduce((s, k) => s + agg.get(k).qty, 0);
+  document.getElementById("wave-note").textContent =
+    "以 " + F.today + " 为今天。交期取 item_delivery_date，该行没填就退到最早预计到货日期；" +
+    "一张单按所有待入库行里最早的交期归档，波次取最急的一档。" +
+    "当前需催 " + int(need) + " 单 / " + int(needQty) + " 件。";
+}
+
+/* ═══════════════════ 采购员催办条 ═══════════════════ */
+function renderBuyers() {
+  const box = document.getElementById("buyer-rows");
+  box.textContent = "";
+  const by = new Map();
+  for (const o of slice) {
+    if (o.done) continue;
+    let r = by.get(o.buyer);
+    if (!r) by.set(o.buyer, r = { qty: 0, need: 0, w: Object.create(null) });
+    r.qty += o.pend;
+    r.w[o.wave] = (r.w[o.wave] || 0) + o.pend;
+    if (URGENT_SET.has(o.wave)) r.need += o.pend;
+  }
+  const rows = [...by.entries()].sort((a, b) => b[1].need - a[1].need || b[1].qty - a[1].qty).slice(0, 12);
+  if (!rows.length) { box.append(el("div", "empty", "当前筛选下没有待入库的单。")); return; }
+  const max = Math.max(...rows.map(r => r[1].qty));
+
+  for (const [bi, r] of rows) {
+    const row = el("div", "buyer-row");
+    row.append(el("div", "bn", DICT.buyers[bi]));
+    const bar = el("div", "bar");
+    bar.style.width = (r.qty / max * 100).toFixed(2) + "%";
+    for (const w of WAVES) {
+      const q = r.w[w.k] || 0;
+      if (!q) continue;
+      const seg = el("i");
+      seg.style.width = (q / r.qty * 100).toFixed(3) + "%";
+      seg.style.background = waveColor(w.k);
+      seg.title = DICT.buyers[bi] + " · " + w.label + "：" + int(q) + " 件";
+      bar.append(seg);
+    }
+    row.append(bar);
+    const v = el("div", "bv", int(r.need));
+    v.append(el("small", null, "需催"));
+    v.title = "待入库合计 " + int(r.qty) + " 件，其中 20 天内到期或已逾期 " + int(r.need) + " 件";
+    row.append(v);
+    box.append(row);
+  }
+
+  const lg = document.getElementById("buyer-legend");
+  lg.textContent = "";
+  for (const w of WAVES) {
+    const it = el("span", "item");
+    const sw = el("span", "swatch");
+    sw.style.background = waveColor(w.k);
+    it.append(sw, el("span", null, (w.seq ? w.seq + " · " : "") + w.label));
+    lg.append(it);
+  }
+}
+
+/* ═══════════════════ 四波时间轴 ═══════════════════ */
+/* 第 n 波的触发日 = 交期 − off（逾期波是交期 + 1）。今天走到哪一波，前面的就都是「已发」。 */
+function waveDates(o) {
+  if (o.etaN === null) return null;
+  return TIMELINE.map(w => ({ w, day: o.etaN + (w.off === -1 ? 1 : -w.off) }));
+}
+function buildWaves(o) {
+  const box = el("span", "waves");
+  const plan = waveDates(o);
+  for (let i = 0; i < TIMELINE.length; i++) {
+    const w = TIMELINE[i];
+    const dot = el("i", null, String(i + 1));
+    if (!plan) { dot.title = "未排期，四波都发不出去"; box.append(dot); continue; }
+    const day = plan[i].day;
+    const hit = T0 >= day;
+    if (hit) { dot.classList.add("hit"); dot.style.background = waveColor(w.k); }
+    if (o.wave === w.k) { dot.classList.add("cur"); dot.style.setProperty("--ring", waveColor(w.k)); }
+    dot.title = w.seq + " · " + w.label + "：" + diso(day) + (hit ? "（已到点）" : "（还有 " + (day - T0) + " 天）");
+    box.append(dot);
+  }
+  return box;
+}
+
+/* ═══════════════════ 台账表 ═══════════════════ */
+function renderTable() {
+  const tb = document.getElementById("tbody");
+  tb.textContent = "";
+  const total = slice.length;
+  const pages = Math.max(1, Math.ceil(total / PAGE));
+  page = Math.min(page, pages - 1);
+  const rows = slice.slice(page * PAGE, page * PAGE + PAGE);
+
+  document.getElementById("empty").hidden = total > 0;
+  document.getElementById("tbl-count").textContent = int(total) + " 单";
+  document.getElementById("pg-label").textContent = (page + 1) + " / " + pages;
+  document.getElementById("pg-prev").disabled = page === 0;
+  document.getElementById("pg-next").disabled = page >= pages - 1;
+  document.getElementById("pg-note").textContent =
+    total ? "第 " + int(page * PAGE + 1) + "–" + int(Math.min(total, (page + 1) * PAGE)) + " 单" : "";
+
+  for (const o of rows) {
+    const tr = el("tr");
+    tr.append(el("td", "no", o.no));
+    tr.append(el("td", null, o.date || "—"));
+
+    const sup = el("td", null, DICT.suppliers[o.sup]);
+    sup.title = "供应商 ID " + DICT.suppliers[o.sup] + "（数据里没有供应商名称）";
+    tr.append(sup);
+
+    // 产品信息
+    const tdP = el("td");
+    const p = el("div", "prod");
+    const pn = el("span", "pn", o.spu);
+    if (o.spuN > 1) pn.append(el("span", "more", "+" + (o.spuN - 1) + " 款"));
+    pn.title = o.spu + (o.spuN > 1 ? "（共 " + o.spuN + " 款商品）" : "");
+    p.append(pn, el("span", "ps", o.cat + " · " + o.lines.length + " 行 · " + int(o.qty) + " 件 · " + money(o.amt) + " 元"));
+    tdP.append(p);
+    tr.append(tdP);
+
+    // 交期
+    const tdE = el("td", "eta-cell");
+    tdE.append(el("span", "d", o.eta || "—"));
+    if (o.eta && (o.etaSrc !== "交期" || o.etaSpread > 1)) {
+      const tag = [];
+      if (o.etaSrc !== "交期") tag.push("预计到货");
+      if (o.etaSpread > 1) tag.push(o.etaSpread + " 个交期取最早");
+      const alt = el("div", "alt", tag.join(" · "));
+      tdE.append(alt);
+    }
+    tr.append(tdE);
+
+    // 剩余
+    const tdL = el("td", "n");
+    const sp = el("span", "left", daysText(o.left));
+    if (URGENT_SET.has(o.wave)) sp.style.color = waveColor(o.wave);
+    else if (o.done) sp.style.color = css("--text-muted");
+    tdL.append(sp);
+    tr.append(tdL);
+
+    tr.append(el("td", "n", int(o.qty)));
+
+    // 入库数量（带进度条）
+    const tdI = el("td", "n");
+    const rc = el("div", "recv");
+    rc.append(el("span", null, int(o.inQty)));
+    const m = el("div", "meter");
+    const fill = el("i");
+    fill.style.width = (o.qty > 0 ? Math.min(100, o.inQty / o.qty * 100) : 0).toFixed(1) + "%";
+    if (o.done) fill.style.background = css("--tier-done");
+    m.append(fill);
+    m.title = "入库率 " + pct(o.inQty, o.qty);
+    rc.append(m);
+    tdI.append(rc);
+    tr.append(tdI);
+
+    tr.append(el("td", "n", int(o.pend)));
+    tr.append(el("td", null, DICT.buyers[o.buyer]));
+
+    // 交期提醒
+    const tdW = el("td");
+    const cell = el("div", "wave-cell");
+    const chip = el("span", "chip", o.done ? "已入库完" : (W_BY_K.get(o.wave).seq ? W_BY_K.get(o.wave).seq + " · " + W_BY_K.get(o.wave).label : W_BY_K.get(o.wave).label));
+    const c = o.done ? css("--tier-done") : waveColor(o.wave);
+    chip.style.color = c; chip.style.borderColor = c;
+    cell.append(chip, buildWaves(o));
+    tdW.append(cell);
+    tr.append(tdW);
+
+    tr.addEventListener("click", () => openDrawer(o));
+    tb.append(tr);
+  }
+}
+
+/* ═══════════════════ 抽屉 ═══════════════════ */
+function openDrawer(o) {
+  document.getElementById("dr-no").textContent = o.no;
+  const chip = el("span", "chip", o.done ? "已入库完" : (W_BY_K.get(o.wave).seq ? W_BY_K.get(o.wave).seq + " · " + W_BY_K.get(o.wave).label : W_BY_K.get(o.wave).label));
+  const c = o.done ? css("--tier-done") : waveColor(o.wave);
+  chip.style.color = c; chip.style.borderColor = c;
+  const holder = document.getElementById("dr-chip");
+  holder.textContent = ""; holder.append(chip);
+
+  const meta = [
+    ["采购日期", o.date || "—"], ["状态", o.st ? "已确认" : "待审核"],
+    ["采购员", DICT.buyers[o.buyer]], ["供应商 ID", DICT.suppliers[o.sup]],
+    ["交期", (o.eta || "—") + (o.etaSrc && o.etaSrc !== "交期" ? "（预计到货日）" : "")],
+    ["剩余", daysText(o.left)],
+    ["采购数量", int(o.qty) + " 件"], ["入库数量", int(o.inQty) + " 件（" + pct(o.inQty, o.qty) + "）"],
+    ["待入库", int(o.pend) + " 件"], ["采购金额", money(o.amt) + " 元"],
+    ["仓储方", DICT.warehouses[o.wh]], ["外部单号", o.ext || "—"]
+  ];
+  const mg = document.getElementById("dr-meta");
+  mg.textContent = "";
+  for (const [k, v] of meta) {
+    const w = el("div");
+    w.append(el("div", "k", k), el("div", "v", v));
+    mg.append(w);
+  }
+
+  // 四波排期
+  const pl = document.getElementById("dr-plan");
+  pl.textContent = "";
+  const plan = waveDates(o);
+  if (!plan) {
+    pl.append(el("div", "empty", "这张单没有交期，四波提醒都排不出来 —— 先让供应商补交期。"));
+  } else {
+    for (let i = 0; i < plan.length; i++) {
+      const { w, day } = plan[i];
+      const hit = T0 >= day;
+      const st = el("div", "step");
+      st.style.borderLeftColor = hit ? waveColor(w.k) : css("--deemph");
+      st.append(el("div", "s-k", w.seq + " · " + w.label));
+      st.append(el("div", "s-d", diso(day)));
+      st.append(el("div", "s-s", o.done ? "已入库完，不用发"
+        : hit ? (o.wave === w.k ? "当前这一波" : "已到点")
+        : "还有 " + (day - T0) + " 天"));
+      pl.append(st);
+    }
+  }
+
+  // 商品明细
+  const host = document.getElementById("dr-lines");
+  host.textContent = "";
+  const t = el("table");
+  const thead = el("thead");
+  const htr = el("tr");
+  for (const [h, cls] of [["商品",""],["编码",""],["颜色",""],["规格",""],["品类",""],
+                          ["数量","n"],["入库数量","n"],["待入库","n"],["交期",""],["剩余","n"],["金额","n"]]) {
+    htr.append(el("th", cls, h));
+  }
+  thead.append(htr);
+  const tbody = el("tbody");
+  const ls = o.lines.slice().sort((a, b) => {
+    const pa = a[L_QTY] - a[L_IN], pb = b[L_QTY] - b[L_IN];
+    const ea = a[L_ETA] || a[L_ARR] || "￿", eb = b[L_ETA] || b[L_ARR] || "￿";
+    return (pb > 0) - (pa > 0) || (ea < eb ? -1 : ea > eb ? 1 : 0) || pb - pa;
+  });
+  for (const l of ls) {
+    const pend = Math.max(0, l[L_QTY] - l[L_IN]);
+    const eta = l[L_ETA] || l[L_ARR] || "";
+    const left = eta ? dnum(eta) - T0 : null;
+    const tr = el("tr");
+    tr.append(el("td", null, DICT.spus[l[L_SPU]]));
+    tr.append(el("td", null, l[L_SKU] || "—"));
+    tr.append(el("td", null, DICT.colors[l[L_COLOR]]));
+    tr.append(el("td", null, l[L_SPEC] || "—"));
+    tr.append(el("td", null, DICT.cats[l[L_CAT]]));
+    tr.append(el("td", "n", int(l[L_QTY])));
+    tr.append(el("td", "n", int(l[L_IN])));
+    tr.append(el("td", "n", int(pend)));
+    const te = el("td", null, eta || "—");
+    if (eta && !l[L_ETA]) te.title = "这行没填交期，用的是最早预计到货日期";
+    tr.append(te);
+    const tl = el("td", "n", pend > 0 ? daysText(left) : "已入库完");
+    if (pend > 0 && left !== null) {
+      const k = waveOfDays(left);
+      if (URGENT_SET.has(k)) tl.style.color = waveColor(k);
+    } else tl.style.color = css("--text-muted");
+    tr.append(tl);
+    tr.append(el("td", "n", money(l[L_AMT])));
+    tbody.append(tr);
+  }
+  t.append(thead, tbody);
+  host.append(t);
+
+  document.getElementById("drawer").classList.add("open");
+  document.getElementById("drawer").setAttribute("aria-hidden", "false");
+  document.getElementById("scrim").classList.add("open");
+}
+function closeDrawer() {
+  document.getElementById("drawer").classList.remove("open");
+  document.getElementById("drawer").setAttribute("aria-hidden", "true");
+  document.getElementById("scrim").classList.remove("open");
+}
+
+/* ═══════════════════ 导出催办清单 ═══════════════════ */
+/* 一行一个采购单，给到人、给到期限、给到下一次该什么时候催 */
+function buildReminderBatch() {
+  const items = slice.filter(o => URGENT_SET.has(o.wave)).map(o => {
+    const w = W_BY_K.get(o.wave), plan = waveDates(o);
+    const next = plan ? (plan.find(p => T0 < p.day) || null) : null;
+    return {
+      orderNo: o.no, purchaseDate: o.date, buyer: DICT.buyers[o.buyer],
+      supplierId: DICT.suppliers[o.sup], wave: o.wave,
+      waveLabel: (w.seq ? w.seq + " · " : "") + w.label,
+      dueDate: o.eta || null, dueDateSource: o.etaSrc || null, daysLeft: o.left,
+      nextReminderDate: next ? diso(next.day) : null,
+      pendingQty: o.pend, product: o.spu, category: o.cat
+    };
+  });
+  return {
+    type: "procurement_due_reminder", source: "delivery_ledger", year: F.year,
+    baselineDate: F.today, preferredChannels: ["email", "group_chat"],
+    filters: { wave: F.wave, buyer: F.buyer, supplier: F.sup, status: F.st, dueFrom: F.from, dueTo: F.to, query: F.q },
+    items: items
+  };
+}
+
+async function sendReminders() {
+  const batch = buildReminderBatch();
+  if (!batch.items.length) { alert("当前切片没有需要发送的催办单。"); return; }
+  if (!ADAPTERS.reminder.configured) {
+    const result = await ADAPTERS.reminder.send(batch);
+    alert(result.message);
+    return;
+  }
+  if (!confirm("确认将 " + batch.items.length + " 张采购单交给提醒服务发送？")) return;
+  const button = document.getElementById("btn-notify");
+  button.disabled = true; button.textContent = "发送中…";
+  try {
+    const result = await ADAPTERS.reminder.send(batch);
+    alert(result.message || (result.ok ? "提醒已提交。" : "提醒提交失败。"));
+  } catch (error) {
+    console.error(error); alert("提醒提交失败：" + error.message);
+  } finally {
+    button.textContent = "发送提醒"; renderAll();
+  }
+}
+
+function exportCsv() {
+  const head = ["采购员","提醒波次","剩余天数","交期","交期来源","下次提醒日","采购单号","采购日期",
+                "供应商ID","主要商品","款数","品类","采购数量","入库数量","待入库","入库率","状态","仓储方","外部单号"];
+  const q = v => {
+    const s = String(v == null ? "" : v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const lines = [head.join(",")];
+  for (const o of slice) {
+    const w = o.done ? { seq: "", label: "已入库完" } : W_BY_K.get(o.wave);
+    const plan = waveDates(o);
+    const next = plan ? (plan.find(p => T0 < p.day) || null) : null;
+    lines.push([
+      DICT.buyers[o.buyer],
+      (w.seq ? w.seq + " · " : "") + w.label,
+      o.left === null ? "" : o.left,
+      o.eta || "", o.etaSrc || "",
+      next ? diso(next.day) : (o.done || !plan ? "" : "已到最后一波，逐日追"),
+      o.no, o.date, DICT.suppliers[o.sup], o.spu, o.spuN, o.cat,
+      o.qty, o.inQty, o.pend, pct(o.inQty, o.qty),
+      o.st ? "已确认" : "待审核", DICT.warehouses[o.wh], o.ext || ""
+    ].map(q).join(","));
+  }
+  const blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "催办清单_" + F.today + ".csv";
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+
+/* ═══════════════════ 渲染总入口 ═══════════════════ */
+function renderAll() {
+  recompute();
+  renderTiers();
+  renderBuyers();
+  renderTable();
+  const need = slice.filter(o => URGENT_SET.has(o.wave)).length;
+  document.getElementById("btn-notify").disabled = need === 0;
+  document.getElementById("slice-note").textContent =
+    F.year + " 年（1 月 1 日起） · 当前切片 " + int(slice.length) + " 单 · 待入库 " + int(slice.reduce((s, o) => s + o.pend, 0)) +
+    " 件 · 需催 " + int(need) + " 单";
+  for (const th of document.querySelectorAll("th[data-sort]")) {
+    const on = th.dataset.sort === sortKey;
+    th.textContent = th.textContent.replace(/\s*[↑↓]$/, "");
+    if (on) { const a = el("span", "arrow", sortDir > 0 ? "↑" : "↓"); th.append(a); }
+  }
+}
+
+/* ═══════════════════ 接线 ═══════════════════ */
+function fillSelect(id, items, label) {
+  const s = document.getElementById(id);
+  s.append(new Option(label, ""));
+  items.map((v, i) => [v, i]).sort((a, b) => a[0].localeCompare(b[0], "zh-CN"))
+       .forEach(([v, i]) => s.append(new Option(v, i)));
+}
+const yearSelect = document.getElementById("f-year");
+YEARS.forEach(y => yearSelect.append(new Option(y + " 年", y)));
+yearSelect.value = F.year;
+fillSelect("f-buyer", DICT.buyers, "全部采购员");
+fillSelect("f-sup", DICT.suppliers, "全部供应商");
+
+const $ = id => document.getElementById(id);
+function syncNavigation() {
+  $("nav-dashboard").href = "采购看板.html?year=" + encodeURIComponent(F.year);
+}
+syncNavigation();
+$("f-year").addEventListener("change", e => {
+  location.search = "?year=" + encodeURIComponent(e.target.value);
+});
+$("f-today").value = F.today;
+$("f-today").addEventListener("change", e => {
+  if (!e.target.value) { e.target.value = F.today; return; }
+  F.today = e.target.value; page = 0; renderAll();
+});
+$("f-buyer").addEventListener("change", e => { F.buyer = e.target.value; page = 0; renderAll(); });
+$("f-sup").addEventListener("change", e => { F.sup = e.target.value; page = 0; renderAll(); });
+$("f-st").addEventListener("change", e => { F.st = e.target.value; page = 0; renderAll(); });
+$("f-from").addEventListener("change", e => { F.from = e.target.value; page = 0; renderAll(); });
+$("f-to").addEventListener("change", e => { F.to = e.target.value; page = 0; renderAll(); });
+$("f-pend").addEventListener("change", e => {
+  F.pendOnly = e.target.checked;
+  if (F.pendOnly && F.wave === "done") F.wave = "";
+  page = 0; renderAll();
+});
+let qTimer;
+$("f-q").addEventListener("input", e => {
+  clearTimeout(qTimer);
+  qTimer = setTimeout(() => { F.q = e.target.value.trim().toLowerCase(); page = 0; renderAll(); }, 160);
+});
+$("f-reset").addEventListener("click", () => {
+  Object.assign(F, { today: META.today, wave: "", buyer: "", sup: "", st: "", from: "", to: "", q: "", pendOnly: true });
+  $("f-today").value = F.today; $("f-buyer").value = ""; $("f-sup").value = ""; $("f-st").value = "";
+  $("f-from").value = ""; $("f-to").value = ""; $("f-q").value = ""; $("f-pend").checked = true;
+  sortKey = "urgent"; sortDir = 1; page = 0;
+  renderAll();
+});
+$("btn-export").addEventListener("click", exportCsv);
+$("btn-notify").addEventListener("click", sendReminders);
+
+for (const th of document.querySelectorAll("th[data-sort]")) {
+  th.addEventListener("click", () => {
+    const k = th.dataset.sort;
+    if (sortKey === k) sortDir = -sortDir;
+    else { sortKey = k; sortDir = (k === "qty" || k === "in" || k === "pend") ? -1 : 1; }
+    page = 0; renderAll();
+  });
+}
+$("pg-prev").addEventListener("click", () => { page--; renderTable(); });
+$("pg-next").addEventListener("click", () => { page++; renderTable(); });
+$("scrim").addEventListener("click", closeDrawer);
+$("dr-close").addEventListener("click", closeDrawer);
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrawer(); });
+
+const sourceLabel = $("data-source");
+sourceLabel.textContent = META.source || "本地数据快照";
+if (META.warning) sourceLabel.title = META.warning;
+$("span-scale").textContent = int(META.orders) + " 单 / " + int(META.rows) + " 行明细";
+$("span-eta").textContent = META.etaMin + " ~ " + META.etaMax +
+  "（" + (META.etaCoverage * 100).toFixed(0) + "% 的行有交期）";
+
+renderAll();
+})();
+</script>
+</body>
+</html>

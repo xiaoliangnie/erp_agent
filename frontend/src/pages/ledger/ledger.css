@@ -1,0 +1,89 @@
+.filters {
+  display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
+  padding: 12px 24px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1); position: sticky; top: 0; z-index: 30;
+}
+.filters .check {
+  display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  color: var(--text-secondary); padding-bottom: 6px; cursor: pointer;
+}
+.filters .slice-note {
+  font-size: 11px; color: var(--text-muted); margin-left: auto;
+  padding-bottom: 7px; font-variant-numeric: tabular-nums;
+}
+
+.ledger-wrap { padding: 16px 24px 44px; display: flex; flex-direction: column; gap: 16px; }
+.ledger-wrap .card-head .note { max-width: 78ch; }
+
+/* ── 四波提醒档位卡 ───────────────────────────────────────── */
+.tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 10px; }
+.tier {
+  text-align: left; background: transparent; cursor: pointer;
+  border: 1px solid var(--border); border-left: 3px solid var(--deemph);
+  border-radius: 9px; padding: 9px 12px 10px;
+}
+.tier:hover { background: var(--wash); }
+.tier[aria-pressed="true"] { background: var(--wash); border-color: var(--text-primary); }
+.tier .t-k { font-size: 11.5px; color: var(--text-secondary); font-weight: 600; display: flex; align-items: baseline; gap: 6px; }
+.tier .t-k .seq { font-size: 10px; color: var(--text-muted); font-weight: 700; letter-spacing: .06em; }
+.tier .t-v { font-size: 21px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 3px 0 1px; }
+.tier .t-v small { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
+.tier .t-s { font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tier .t-n { font-size: 10.5px; color: var(--text-muted); margin-top: 5px; line-height: 1.35; }
+
+/* ── 采购员催办条 ─────────────────────────────────────────── */
+.buyer-rows { display: flex; flex-direction: column; gap: 7px; }
+.buyer-row { display: grid; grid-template-columns: 116px minmax(0, 1fr) 92px; align-items: center; gap: 12px; }
+.buyer-row .bn { font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.buyer-row .bar { display: flex; height: 13px; border-radius: 3px; overflow: hidden; background: var(--wash); min-width: 5px; }
+.buyer-row .bar i { display: block; height: 100%; }
+.buyer-row .bv { font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; font-weight: 600; }
+.buyer-row .bv small { font-weight: 500; color: var(--text-muted); margin-left: 3px; font-size: 10.5px; }
+
+/* ── 台账表 ───────────────────────────────────────────────── */
+.tbl-scroll { overflow-x: auto; }
+.tbl-scroll th, .tbl-scroll td { padding: 8px 10px; vertical-align: middle; }
+.tbl-scroll tbody tr { cursor: pointer; }
+.tbl-scroll th[data-sort] { cursor: pointer; user-select: none; }
+.tbl-scroll th[data-sort]:hover { color: var(--text-primary); }
+.tbl-scroll th .arrow { color: var(--series-1); margin-left: 3px; }
+.tbl-scroll td.no { font-variant-numeric: tabular-nums; font-weight: 600; }
+
+.prod { max-width: 260px; }
+.prod .pn { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prod .ps { font-size: 10.5px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.prod .more { color: var(--text-muted); font-weight: 500; margin-left: 4px; font-size: 11px; }
+
+.recv { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+.recv .meter { width: 46px; height: 6px; margin: 0; flex: none; }
+
+.eta-cell .d { font-variant-numeric: tabular-nums; }
+.eta-cell .alt { font-size: 10.5px; color: var(--text-muted); }
+.left { font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* 四波提醒时间轴 */
+.waves { display: inline-flex; align-items: center; gap: 3px; vertical-align: middle; }
+.waves i {
+  width: 15px; height: 15px; border-radius: 50%; display: grid; place-items: center;
+  font-size: 9px; font-weight: 700; font-style: normal;
+  border: 1.5px solid var(--deemph); color: var(--text-muted); background: transparent;
+}
+.waves i.hit { border-color: transparent; color: #fff; }
+.waves i.cur { box-shadow: 0 0 0 2px var(--surface-1), 0 0 0 3.5px var(--ring); }
+.wave-cell { display: flex; align-items: center; gap: 9px; }
+
+.pager .sp { flex: 1 1 auto; }
+
+/* 抽屉里的四波排期 */
+.plan { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 4px; }
+.plan .step { border: 1px solid var(--border); border-left: 3px solid var(--deemph); border-radius: 9px; padding: 8px 11px 9px; }
+.plan .step .s-k { font-size: 11px; font-weight: 600; color: var(--text-secondary); }
+.plan .step .s-d { font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; margin: 2px 0 1px; }
+.plan .step .s-s { font-size: 10.5px; color: var(--text-muted); }
+.drawer-body tbody tr { cursor: default; }
+
+@media (max-width: 900px) {
+  .ledger-wrap { padding: 12px; }
+  .filters { position: static; }
+  .buyer-row { grid-template-columns: 92px minmax(0, 1fr) 80px; }
+}

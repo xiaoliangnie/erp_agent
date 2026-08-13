@@ -1,0 +1,14 @@
+{
+  "佰特": {
+    "legal_name": "连云港佰特玩具有限公司",
+    "address": "江苏省扬州市邗江区司徒庙路299号（通达工贸大院）",
+    "contact_name": "汪炎",
+    "contact_phone": "13912133467",
+    "erp_price_mode": "special_invoice",
+    "invoice_rates": {
+      "no_invoice": 0,
+      "normal_invoice": null,
+      "special_invoice": 13
+    }
+  }
+}

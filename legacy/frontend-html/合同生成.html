@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>采购合同生成 · 蜀黍家</title>
+<style>
+:root {
+  color-scheme:light;
+  --plane:#f9f9f7; --surface:#fff; --text:#0b0b0b; --sub:#52514e;
+  --muted:#898781; --border:rgba(11,11,11,.12); --wash:rgba(11,11,11,.04);
+  --blue:#2a78d6; --red:#d03b3b; --green:#0a7a0a;
+  --font:-apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--plane); color:var(--text); font:13px/1.5 var(--font); }
+.topbar { display:flex; align-items:baseline; gap:18px; padding:22px 24px 14px; border-bottom:1px solid var(--border); }
+.topbar h1 { margin:0; font-size:19px; }
+.topbar .sub { color:var(--sub); }
+.spacer { flex:1; }
+.topbar a { color:var(--sub); text-decoration:none; border-bottom:1px solid var(--border); }
+main { max-width:1180px; margin:28px auto; padding:0 24px 48px; }
+.panel { background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px; margin-bottom:16px; }
+.form { display:flex; gap:14px; align-items:flex-end; flex-wrap:wrap; }
+.field { display:flex; flex-direction:column; gap:5px; }
+label { color:var(--muted); font-size:11px; font-weight:600; }
+input,select,button { font:inherit; border:1px solid var(--border); border-radius:7px; padding:8px 10px; background:#fff; color:var(--text); }
+#po-id { min-width:380px; max-width:540px; }
+button { cursor:pointer; }
+button.primary { background:var(--blue); border-color:var(--blue); color:#fff; font-weight:600; }
+button:disabled { opacity:.5; cursor:not-allowed; }
+.meta { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; margin-top:18px; }
+.meta div { padding:12px; background:var(--wash); border-radius:7px; min-width:0; }
+.meta span { display:block; color:var(--muted); font-size:11px; }
+.meta b { display:block; margin-top:3px; font-size:14px; overflow-wrap:anywhere; }
+.status { margin-top:14px; min-height:20px; color:var(--sub); }
+.status.error { color:var(--red); }
+.status.ok { color:var(--green); }
+.panel-head { display:flex; justify-content:space-between; align-items:baseline; gap:12px; }
+.panel-head small { color:var(--muted); }
+table { width:100%; border-collapse:collapse; margin-top:16px; }
+th,td { padding:9px 8px; border-bottom:1px solid var(--border); text-align:left; }
+th { color:var(--muted); font-size:11px; white-space:nowrap; }
+td.num,th.num { text-align:right; }
+td input { width:110px; text-align:right; }
+.empty { color:var(--muted); padding:26px 0; text-align:center; }
+.preview-frame { margin-top:16px; max-height:780px; overflow:auto; border:1px solid var(--border); border-radius:8px; background:#ececea; padding:16px; text-align:center; }
+.preview-frame img { display:block; max-width:100%; height:auto; margin:auto; box-shadow:0 2px 16px rgba(0,0,0,.14); }
+@media (max-width:760px) {
+  .meta { grid-template-columns:1fr 1fr; }
+  main { padding:0 14px; }
+  .table-wrap { overflow:auto; }
+  #po-id { min-width:280px; width:100%; }
+}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <h1>采购合同生成</h1>
+  <div class="sub">选择实时采购单，预览确认后下载 Excel</div>
+  <div class="spacer"></div>
+  <a href="采购看板.html">采购看板</a>
+  <a href="交期提醒台账.html">交期提醒台账</a>
+  <a href="换货.html">订单换货</a>
+</header>
+<main>
+  <section class="panel">
+    <div class="form">
+      <div class="field">
+        <label for="po-id">采购单号</label>
+        <input id="po-id" type="search" list="po-list" autocomplete="off" placeholder="搜索采购单号、供应商或采购员" disabled>
+        <datalist id="po-list"></datalist>
+      </div>
+      <div class="field">
+        <label for="invoice-type">价格 / 票种</label>
+        <select id="invoice-type">
+          <option value="no_invoice">不开票（默认 0%）</option>
+          <option value="normal_invoice">普票（默认 0%）</option>
+          <option value="special_invoice" selected>专票（默认 13%）</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="tax-rate">税率（%，可修改）</label>
+        <input id="tax-rate" type="number" min="0" max="100" step="0.01" value="13">
+      </div>
+      <button class="primary" id="preview" type="button" disabled>预览合同</button>
+      <button id="generate" type="button" disabled>下载 Excel</button>
+    </div>
+    <div class="status" id="status" role="status"></div>
+    <div class="meta" id="meta" hidden></div>
+  </section>
+  <section class="panel">
+    <div class="panel-head"><strong>商品与合同单价</strong><small>单价和税率均可人工调整</small></div>
+    <div class="table-wrap" id="items"><div class="empty">先选择采购单</div></div>
+  </section>
+  <section class="panel" id="preview-panel" hidden>
+    <div class="panel-head"><strong>合同预览</strong><small>预览确认后才能下载</small></div>
+    <div class="preview-frame"><img id="preview-image" alt="采购合同预览"></div>
+  </section>
+</main>
+<script>
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const invoiceLabels = { no_invoice:"不开票", normal_invoice:"普票", special_invoice:"专票" };
+  const defaultRates = { no_invoice:0, normal_invoice:0, special_invoice:13 };
+  let order = null;
+  let previewUrl = null;
+  let searchTimer = null;
+
+  function setStatus(message, kind="") {
+    $("status").textContent = message;
+    $("status").className = "status " + kind;
+  }
+
+  function invalidatePreview() {
+    const hadPreview = Boolean(previewUrl);
+    $("generate").disabled = true;
+    $("preview-panel").hidden = true;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
+    previewUrl = null;
+    if (hadPreview) setStatus("合同参数已修改，请重新生成预览。", "");
+  }
+
+  function selectedPrice(item, mode) {
+    const configured = item.prices && item.prices[mode];
+    if (configured != null) return configured;
+    return order.erpPriceMode === mode ? item.erpPrice : "";
+  }
+
+  function applyMode() {
+    $("tax-rate").value = defaultRates[$("invoice-type").value];
+    if (order) {
+      const mode = $("invoice-type").value;
+      document.querySelectorAll("[data-price]").forEach((input,index) => {
+        input.value = selectedPrice(order.items[index],mode);
+      });
+    }
+    invalidatePreview();
+  }
+
+  function renderOrder() {
+    $("meta").hidden = false;
+    $("meta").replaceChildren();
+    const fields = [
+      ["采购单号",order.purchaseOrderNo],["下单日期",order.orderDate],
+      ["交货日期",order.deliveryDate],["采购员",order.purchaser],
+      ["供应商简称",order.supplierShortName],
+      ["供方完整名称",order.supplierMapped ? order.supplierLegalName : "未维护"],
+      ["采购数量",order.totalQuantity],["仓库 / 收货信息",order.warehouse || order.receiveAddress],
+    ];
+    fields.forEach(([label,value]) => {
+      const box=document.createElement("div"), span=document.createElement("span"), bold=document.createElement("b");
+      span.textContent=label; bold.textContent=value || "—"; box.append(span,bold); $("meta").append(box);
+    });
+    const table=document.createElement("table");
+    table.innerHTML="<thead><tr><th>SKU / 款号</th><th>商品 / 规格</th><th>交期</th><th class='num'>采购数</th><th class='num'>已入库</th><th>图片</th><th class='num'>合同单价</th></tr></thead>";
+    const body=document.createElement("tbody");
+    order.items.forEach(item => {
+      const row=document.createElement("tr");
+      const values=[
+        item.sku+(item.styleCode?" / "+item.styleCode:""),
+        item.name+(item.specification?" / "+item.specification:""),
+        item.deliveryDate,item.quantity,item.inQuantity,item.hasImage?"已维护":"未维护",
+      ];
+      values.forEach((value,index) => {
+        const td=document.createElement("td"); td.textContent=value || "—";
+        if(index===3||index===4) td.className="num"; row.append(td);
+      });
+      const td=document.createElement("td"); td.className="num";
+      const input=document.createElement("input"); input.type="number"; input.step="0.01"; input.min="0";
+      input.dataset.price=item.sku; input.addEventListener("input",invalidatePreview);
+      td.append(input); row.append(td); body.append(row);
+    });
+    table.append(body); $("items").replaceChildren(table);
+    applyMode();
+    $("preview").disabled = !order.supplierMapped;
+    setStatus(
+      order.supplierMapped ? "采购信息已读取，请确认票种、税率和各商品单价，然后预览。" : "供应商简称尚未维护完整映射，不能生成合同。",
+      order.supplierMapped ? "ok" : "error"
+    );
+  }
+
+  async function loadOrder(poId) {
+    invalidatePreview();
+    if (!poId) {
+      order=null; $("meta").hidden=true; $("items").innerHTML='<div class="empty">先选择采购单</div>';
+      $("preview").disabled=true; return;
+    }
+    setStatus("正在读取实时采购信息…"); $("preview").disabled=true;
+    try {
+      const response=await fetch("/api/contracts/options?po_id="+encodeURIComponent(poId));
+      const data=await response.json();
+      if(!response.ok) throw new Error(data.error || "读取失败");
+      order=data; renderOrder();
+    } catch(error) { order=null; setStatus(error.message,"error"); }
+  }
+
+  async function loadOrders(query="") {
+    try {
+      const response=await fetch("/api/contracts/orders?q="+encodeURIComponent(query));
+      const data=await response.json();
+      if(!response.ok) throw new Error(data.error || "采购单列表读取失败");
+      $("po-list").replaceChildren();
+      data.orders.forEach(item => {
+        const option=document.createElement("option"); option.value=item.purchaseOrderNo;
+        option.label=`${item.orderDate} · ${item.supplier || "未知供应商"}${item.purchaser?" · "+item.purchaser:""}`;
+        $("po-list").append(option);
+      });
+      $("po-id").disabled=false;
+      const exact=data.orders.find(item=>item.purchaseOrderNo===query);
+      if(exact && (!order || order.purchaseOrderNo!==query)) loadOrder(query);
+      if(!query) setStatus("可直接选择最近采购单，也可输入单号、供应商或采购员搜索。");
+    } catch(error) {
+      $("po-id").placeholder="采购单读取失败";
+      setStatus(error.message,"error");
+    }
+  }
+
+  function requestBody() {
+    if(!order) throw new Error("请先选择采购单。");
+    const priceOverrides={};
+    for(const input of document.querySelectorAll("[data-price]")) {
+      if(input.value==="") throw new Error("请填写所有商品的合同单价。");
+      priceOverrides[input.dataset.price]=Number(input.value);
+    }
+    if($("tax-rate").value==="") throw new Error("请填写所选票种的税率。");
+    return {
+      poId:order.purchaseOrderNo, invoiceType:$("invoice-type").value,
+      taxRate:Number($("tax-rate").value), priceOverrides,
+    };
+  }
+
+  $("po-id").addEventListener("input",event => {
+    clearTimeout(searchTimer);
+    const query=event.target.value.trim();
+    searchTimer=setTimeout(()=>loadOrders(query),220);
+    if(!/^\d+$/.test(query)) {
+      order=null; $("preview").disabled=true; invalidatePreview();
+    }
+  });
+  $("po-id").addEventListener("change",event => {
+    const poId=event.target.value.trim();
+    if(/^\d+$/.test(poId)) loadOrder(poId);
+  });
+  $("invoice-type").addEventListener("change",applyMode);
+  $("tax-rate").addEventListener("input",invalidatePreview);
+
+  $("preview").addEventListener("click",async () => {
+    let body;
+    try { body=requestBody(); } catch(error) { setStatus(error.message,"error"); return; }
+    $("preview").disabled=true; setStatus("正在生成真实合同预览…");
+    try {
+      const response=await fetch("/api/contracts/preview",{
+        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),
+      });
+      if(!response.ok) { const data=await response.json(); throw new Error(data.error || "预览失败"); }
+      if(previewUrl) URL.revokeObjectURL(previewUrl);
+      previewUrl=URL.createObjectURL(await response.blob()); $("preview-image").src=previewUrl;
+      $("preview-panel").hidden=false; $("generate").disabled=false;
+      setStatus("预览已生成，请核对后下载 Excel。","ok");
+      $("preview-panel").scrollIntoView({behavior:"smooth",block:"start"});
+    } catch(error) { setStatus(error.message,"error"); }
+    finally { $("preview").disabled=!order||!order.supplierMapped; }
+  });
+
+  $("generate").addEventListener("click",async () => {
+    let body;
+    try { body=requestBody(); } catch(error) { setStatus(error.message,"error"); return; }
+    $("generate").disabled=true; setStatus("正在生成采购合同 Excel…");
+    try {
+      const response=await fetch("/api/contracts/generate",{
+        method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body),
+      });
+      if(!response.ok) { const data=await response.json(); throw new Error(data.error || "生成失败"); }
+      const blob=await response.blob(), url=URL.createObjectURL(blob), link=document.createElement("a");
+      link.href=url; link.download=`采购合同-${order.purchaseOrderNo}-${invoiceLabels[$("invoice-type").value]}.xlsx`;
+      link.click(); URL.revokeObjectURL(url); setStatus("采购合同已生成并开始下载。","ok");
+    } catch(error) { setStatus(error.message,"error"); }
+    finally { $("generate").disabled=!previewUrl; }
+  });
+
+  const initialPoId=new URLSearchParams(location.search).get("po_id") || "";
+  if(/^\d+$/.test(initialPoId)) {
+    $("po-id").value=initialPoId;
+    loadOrders(initialPoId);
+  } else {
+    loadOrders();
+  }
+})();
+</script>
+</body>
+</html>

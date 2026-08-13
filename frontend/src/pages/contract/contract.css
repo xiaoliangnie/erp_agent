@@ -1,0 +1,30 @@
+.contract-layout { max-width: 1320px; margin: 28px auto; padding: 0 24px 48px; }
+.contract-layout .panel { padding: 20px; margin-bottom: 16px; }
+
+.contract-form { display: flex; gap: 14px; align-items: flex-end; flex-wrap: wrap; }
+.contract-form #po-id { min-width: 380px; max-width: 540px; }
+.contract-form .btn { padding: 7px 13px; font-size: 12px; }
+
+.contract-meta { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-top: 18px; }
+.contract-meta > div { padding: 12px; background: var(--wash); border-radius: 7px; min-width: 0; }
+.contract-meta span { display: block; color: var(--text-muted); font-size: 11px; }
+.contract-meta b { display: block; margin-top: 3px; font-size: 14px; overflow-wrap: anywhere; }
+
+.table-wrap { overflow: auto; margin-top: 16px; }
+.price-input { width: 110px; text-align: right; }
+.notice-actions { margin-top: 8px; }
+.gb-select { width: 100%; min-width: 220px; max-width: 320px; font-size: 12px; }
+.gb-empty { color: var(--text-muted); font-size: 12px; }
+
+.preview-frame {
+  margin-top: 16px; max-height: 780px; overflow: auto;
+  border: 1px solid var(--border); border-radius: 8px;
+  background: #ececea; padding: 16px; text-align: center;
+}
+.preview-frame img { display: block; max-width: 100%; height: auto; margin: auto; box-shadow: 0 2px 16px rgba(0, 0, 0, .14); }
+
+@media (max-width: 760px) {
+  .contract-layout { padding: 0 14px 32px; }
+  .contract-meta { grid-template-columns: 1fr 1fr; }
+  .contract-form #po-id { min-width: 240px; width: 100%; }
+}

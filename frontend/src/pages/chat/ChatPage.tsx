@@ -1,0 +1,288 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { TopBar } from "../../components/TopBar";
+import { agentApi, errorText } from "../../api/client";
+import { useCredentials } from "../../hooks/useCredentials";
+import { ExecutedCard, PendingCard } from "./ActionCard";
+import type { AgentStatus, ChatReply, ExecutedAction, Message } from "./types";
+import "./chat.css";
+
+const SAMPLES = [
+  { label: "今年采购概况", ask: "今年的采购金额、待入库和入库率各是多少？" },
+  { label: "逾期催办清单", ask: "现在逾期的采购单有多少张，按采购员分别列出待入库件数。" },
+  { label: "T-10 这一波", ask: "T-10 这一波有哪些单需要催？" },
+  { label: "订单换货", ask: "把订单 11530151 里的 XZ25401308-101 换成 XZ25401308-09906" },
+];
+
+const GREETING =
+  "填好 Token 和姓名后连接。助手只能通过固定工具查库和生成产物；生成合同、登记换货、发钉钉催办这类动作会先给出要点，等你点确认才执行。";
+
+const newId = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
+
+function readSessionKey(): string {
+  const stored = sessionStorage.getItem("agentSessionKey");
+  if (stored) return stored;
+  const created = newId();
+  sessionStorage.setItem("agentSessionKey", created);
+  return created;
+}
+
+export default function ChatPage() {
+  const { credentials, update, remember, filled } = useCredentials("agent");
+  const [status, setStatus] = useState<AgentStatus | null>(null);
+  const [messages, setMessages] = useState<Message[]>([
+    { id: "greeting", role: "system", text: GREETING },
+  ]);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+  const [message, setMessage] = useState("");
+  const sessionKey = useRef(readSessionKey());
+  const sessionId = useRef("");
+  const logRef = useRef<HTMLDivElement>(null);
+
+  const credentialsRef = useRef(credentials);
+  credentialsRef.current = credentials;
+
+  useEffect(() => {
+    const log = logRef.current;
+    if (log) log.scrollTop = log.scrollHeight;
+  }, [messages]);
+
+  const connect = useCallback(async () => {
+    if (!filled) throw new Error("请填写 Token 和姓名");
+    remember(credentials);
+    setStatus(await agentApi.get<AgentStatus>("/api/agent/status", credentials));
+    setMessage("");
+  }, [credentials, filled, remember]);
+
+  const bootstrapped = useRef(false);
+  useEffect(() => {
+    if (bootstrapped.current || !filled) return;
+    bootstrapped.current = true;
+    connect().catch((error: unknown) => setMessage(errorText(error)));
+  }, [connect, filled]);
+
+  const send = useCallback(
+    async (text: string) => {
+      const question = text.trim();
+      if (!question || sending) return;
+      const auth = credentialsRef.current;
+      const replyId = newId();
+      setDraft("");
+      setSending(true);
+      setMessages((current) => [
+        ...current,
+        { id: newId(), role: "user", text: question },
+        { id: replyId, role: "assistant", text: "正在查数据…", pending: true },
+      ]);
+      try {
+        const answer = await agentApi.post<ChatReply>(
+          "/api/agent/chat",
+          { message: question, sessionKey: sessionKey.current, operator: auth.operator.trim() },
+          auth,
+        );
+        sessionId.current = answer.sessionId;
+        setMessages((current) =>
+          current.map((item) =>
+            item.id === replyId
+              ? {
+                  ...item,
+                  pending: false,
+                  text: answer.reply,
+                  steps: answer.steps ?? [],
+                  actions: answer.pendingActions ?? [],
+                }
+              : item,
+          ),
+        );
+      } catch (error) {
+        const text = errorText(error);
+        setMessages((current) =>
+          current.map((item) => (item.id === replyId ? { ...item, pending: false, error: true, text } : item)),
+        );
+      } finally {
+        setSending(false);
+      }
+    },
+    [sending],
+  );
+
+  const decide = useCallback(async (messageId: string, actionId: string, decision: "confirm" | "cancel") => {
+    const done = await agentApi.post<ExecutedAction>(
+      `/api/agent/actions/${actionId}/${decision}`,
+      { operator: credentialsRef.current.operator.trim() },
+      credentialsRef.current,
+    );
+    setMessages((current) =>
+      current.map((item) =>
+        item.id === messageId
+          ? {
+              ...item,
+              actions: (item.actions ?? []).filter((action) => action.id !== actionId),
+              executed: { ...(item.executed ?? {}), [actionId]: done },
+            }
+          : item,
+      ),
+    );
+  }, []);
+
+  async function resetSession() {
+    if (sessionId.current) {
+      await agentApi
+        .post(`/api/agent/sessions/${sessionId.current}/reset`, {}, credentialsRef.current)
+        .catch(() => undefined);
+    }
+    sessionKey.current = newId();
+    sessionStorage.setItem("agentSessionKey", sessionKey.current);
+    sessionId.current = "";
+    setMessages([{ id: newId(), role: "system", text: "会话已清空，上下文重新开始。" }]);
+  }
+
+  const agent = status?.agent;
+  const stateText = !status
+    ? "尚未连接"
+    : agent?.available
+      ? `${agent.llm.model} · ${agent.tools.length} 个工具 · 最多 ${agent.maxToolSteps} 步`
+      : "Agent 未启用：需在 .env 设置 AGENT_ENABLED=true 和模型密钥";
+
+  return (
+    <>
+      <TopBar title="采购助手" sub="模型只选工具和组织话术，数字全部来自确定性代码" />
+      <main className="chat-layout">
+        <section className="panel chat">
+          <div className="log" ref={logRef}>
+            {messages.map((item) => (
+              <div key={item.id} className={`msg ${item.role}`}>
+                <span className="who">
+                  {item.role === "user"
+                    ? credentials.operator.trim() || "我"
+                    : item.role === "assistant"
+                      ? "助手"
+                      : "提示"}
+                </span>
+                <div className="bubble">
+                  <span className={item.error ? "bubble-error" : item.pending ? "small" : undefined}>{item.text}</span>
+                  {item.steps?.length ? (
+                    <div className="steps">
+                      {item.steps.map((step, index) => (
+                        <span
+                          key={`${step.tool}-${index}`}
+                          className={`step-chip${step.status === "error" ? " error" : step.actionId ? " wait" : ""}`}
+                        >
+                          {step.tool}
+                        </span>
+                      ))}
+                    </div>
+                  ) : null}
+                  {item.actions?.map((action) => (
+                    <PendingCard
+                      key={action.id}
+                      action={action}
+                      onDecide={(actionId, decision) => decide(item.id, actionId, decision)}
+                    />
+                  ))}
+                  {Object.entries(item.executed ?? {}).map(([actionId, executed]) => (
+                    <ExecutedCard key={actionId} executed={executed} auth={credentials} />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="composer">
+            <textarea
+              placeholder={"例如：查一下 604264 这张采购单\n或：把订单 11530151 里的 XZ25401308-101 换成 XZ25401308-09906"}
+              value={draft}
+              rows={2}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void send(draft);
+                }
+              }}
+            />
+            <button type="button" className="btn primary" disabled={sending} onClick={() => void send(draft)}>
+              发送
+            </button>
+          </div>
+        </section>
+
+        <section className="chat-side">
+          <div className="panel">
+            <div className="panel-head">
+              <strong>连接</strong>
+            </div>
+            <div className="credentials-grid" style={{ marginTop: 12 }}>
+              <input
+                type="password"
+                autoComplete="off"
+                placeholder="AGENT_API_TOKEN"
+                value={credentials.token}
+                onChange={(event) => update({ token: event.target.value })}
+              />
+              <input
+                autoComplete="off"
+                placeholder="你的姓名"
+                value={credentials.operator}
+                onChange={(event) => update({ operator: event.target.value })}
+              />
+              <button
+                type="button"
+                className="btn"
+                onClick={() => connect().catch((error: unknown) => setMessage(errorText(error)))}
+              >
+                连接
+              </button>
+            </div>
+            <div className="small" style={{ marginTop: 7 }}>
+              Token 只存在当前标签页 sessionStorage。
+            </div>
+            <div className="statusline" style={{ marginTop: 12 }}>
+              <span className={`dot ${agent?.available ? "online" : "offline"}`} />
+              <span className="small">{stateText}</span>
+            </div>
+            {message ? <div className="status error">{message}</div> : null}
+            <div className="samples">
+              {SAMPLES.map((sample) => (
+                <button key={sample.label} type="button" className="btn" onClick={() => void send(sample.ask)}>
+                  {sample.label}
+                </button>
+              ))}
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <button type="button" className="btn" onClick={() => void resetSession()}>
+                清空当前会话
+              </button>
+            </div>
+          </div>
+
+          <div className="panel" style={{ marginTop: 16 }}>
+            <div className="panel-head">
+              <strong>可用工具</strong>
+              <small>L0 直接执行，L1/L2 必须人工确认</small>
+            </div>
+            <div className="tools">
+              {!agent ? (
+                <div className="small">连接后加载</div>
+              ) : (
+                <>
+                  {status && !status.forecast.ready ? (
+                    <div className="small">预测模型工件尚未就绪，预测与订货建议会提示先训练模型。</div>
+                  ) : null}
+                  {agent.tools.map((tool) => (
+                    <div key={tool.name} className="tool">
+                      <b className="mono">{tool.name}</b>
+                      <span className={`risk ${tool.risk}`}>
+                        {tool.risk} {tool.riskLabel}
+                      </span>
+                      <p>{tool.description}</p>
+                    </div>
+                  ))}
+                </>
+              )}
+            </div>
+          </div>
+        </section>
+      </main>
+    </>
+  );
+}

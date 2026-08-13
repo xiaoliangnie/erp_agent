@@ -1,0 +1,64 @@
+/* 采购看板专属版面：粘顶筛选条 + 左台账栏 + 六列卡片网格。 */
+
+.filters {
+  display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap;
+  padding: 12px 24px; border-bottom: 1px solid var(--border);
+  background: var(--surface-1);
+  position: sticky; top: 0; z-index: 30;
+}
+.slice-note { font-size: 11px; color: var(--text-muted); margin-left: auto; padding-bottom: 7px; }
+
+.layout {
+  display: grid; grid-template-columns: 268px minmax(0, 1fr);
+  gap: 16px; padding: 16px 24px 40px; align-items: start;
+}
+.cards { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 16px; }
+.span-2 { grid-column: span 2; } .span-3 { grid-column: span 3; }
+.span-4 { grid-column: span 4; } .span-6 { grid-column: span 6; }
+
+/* 台账栏 */
+.rail {
+  position: sticky; top: 74px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 18px 18px 6px;
+}
+.hero-label { display: flex; align-items: baseline; justify-content: space-between; }
+.hero {
+  font-size: 46px; line-height: 1.05; font-weight: 660; letter-spacing: -.02em;
+  margin: 6px 0 2px; font-variant-numeric: tabular-nums;
+}
+.hero .unit { font-size: 17px; font-weight: 500; color: var(--text-secondary); margin-left: 4px; letter-spacing: 0; }
+.hero-sub { font-size: 11px; color: var(--text-muted); }
+.spark { margin: 12px 0 2px; }
+.ledger { margin-top: 12px; border-top: 1px solid var(--border); }
+.ledger-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 10px;
+  padding: 11px 0; border-bottom: 1px solid var(--border);
+}
+.ledger-row .k { font-size: 12px; color: var(--text-secondary); }
+.ledger-row .v { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.ledger-row .v small { font-size: 11px; font-weight: 500; color: var(--text-muted); margin-left: 3px; }
+.ledger-row.stack { display: block; }
+.ledger-row.stack .head { display: flex; align-items: baseline; justify-content: space-between; }
+
+/* 最近采购单 */
+.orders-table th[data-sort] { cursor: pointer; user-select: none; }
+.orders-table th[data-sort]:hover { color: var(--text-primary); }
+.orders-table th .arrow { color: var(--series-1); margin-left: 3px; }
+.orders-table tbody tr { cursor: pointer; }
+.orders-table td.no { font-variant-numeric: tabular-nums; font-weight: 600; }
+.contract-action { color: var(--series-1); text-decoration: none; white-space: nowrap; font-weight: 600; }
+.contract-action:hover { text-decoration: underline; }
+.recent-orders-table td.created-at { white-space: nowrap; font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+.ledger-link { display: inline-flex; align-items: center; text-decoration: none; }
+
+@media (max-width: 1180px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  .rail { position: static; }
+  .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .span-3, .span-4, .span-6 { grid-column: span 2; }
+}
+@media (max-width: 720px) {
+  .cards { grid-template-columns: minmax(0, 1fr); }
+  .span-2, .span-3, .span-4, .span-6 { grid-column: span 1; }
+}

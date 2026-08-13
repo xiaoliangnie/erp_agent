@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>采购助手 · 蜀黍家</title>
+<style>
+:root{--bg:#f4f6f8;--panel:#fff;--ink:#17202a;--muted:#68737d;--line:#dfe4e8;--accent:#245c43;--accent2:#eaf3ee;--warn:#8a5700;--danger:#a53333;--radius:12px}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}.top{height:58px;padding:0 28px;display:flex;align-items:center;gap:20px;background:#fff;border-bottom:1px solid var(--line)}h1{font-size:18px;margin:0 auto 0 0}.top a{color:var(--muted);text-decoration:none}.top a:hover{color:var(--ink)}main{max-width:1180px;margin:20px auto;padding:0 22px;display:grid;grid-template-columns:1fr minmax(280px,340px);gap:18px;align-items:start}.panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px;box-shadow:0 3px 14px #24312a0a}.panel h2{font-size:15px;margin:0 0 12px}.desc{color:var(--muted);font-size:13px;margin:0 0 14px}
+.chat{display:flex;flex-direction:column;height:calc(100vh - 150px);min-height:460px;padding:0}.log{flex:1;overflow-y:auto;padding:18px 18px 4px}.composer{border-top:1px solid var(--line);padding:12px 14px;display:flex;gap:9px;align-items:flex-end}textarea,input{font:inherit;width:100%;border:1px solid #cfd6db;border-radius:8px;padding:10px 11px;background:#fff;color:var(--ink)}textarea{min-height:46px;max-height:170px;resize:none}input:focus,textarea:focus{outline:2px solid #bdd7c9;border-color:var(--accent)}button{font:inherit;border:0;border-radius:8px;padding:10px 15px;cursor:pointer;background:#edf0f2;color:var(--ink);white-space:nowrap}button.primary{background:var(--accent);color:#fff}button.danger{color:var(--danger);background:#fff0f0}button:disabled{opacity:.45;cursor:not-allowed}
+.msg{margin-bottom:16px;display:flex;flex-direction:column;gap:5px}.msg .who{font-size:12px;color:var(--muted)}.bubble{padding:11px 13px;border-radius:10px;background:#f7f8f9;border:1px solid var(--line);white-space:pre-wrap;word-break:break-word}.msg.user{align-items:flex-end}.msg.user .bubble{background:var(--accent2);border-color:#cfe2d7;max-width:78%}.msg.assistant .bubble{max-width:88%}.msg.system .bubble{background:#fff9ea;border-color:#f0dcae;color:#704900;font-size:13px}
+.steps{display:flex;flex-wrap:wrap;gap:6px}.chip{font-size:12px;padding:2px 8px;border-radius:999px;background:#eef1f3;color:#4a5660;font-family:ui-monospace,monospace}.chip.error{background:#fde7e7;color:#963434}.chip.wait{background:#fff1cf;color:#805200}
+.action{border:1px solid #e2cf9a;background:#fffdf6;border-radius:10px;padding:12px;margin-top:8px}.action h3{margin:0 0 4px;font-size:14px}.action .risk{font-size:12px;color:var(--warn)}.action pre{margin:9px 0 0;padding:9px;background:#fff;border:1px solid var(--line);border-radius:7px;font-size:12px;max-height:210px;overflow:auto;white-space:pre-wrap}.action .row{display:flex;gap:8px;margin-top:10px}
+.security-grid{display:grid;grid-template-columns:1fr 1fr auto;gap:8px}.small{font-size:12px;color:var(--muted)}.statusline{display:flex;align-items:center;gap:8px;margin:12px 0 0}.dot{width:9px;height:9px;border-radius:50%;background:#aaa}.dot.online{background:#2c9463;box-shadow:0 0 0 4px #dff3e8}.dot.offline{background:#c8913b}
+.tools{display:grid;gap:7px;max-height:290px;overflow:auto}.tool{border:1px solid var(--line);border-radius:8px;padding:8px 10px}.tool b{font-family:ui-monospace,monospace;font-size:12px}.tool .risk{font-size:11px;padding:1px 6px;border-radius:999px;background:#eef1f3;color:#4a5660;margin-left:6px}.tool .risk.L1{background:#fff1cf;color:#805200}.tool .risk.L2{background:#fde7e7;color:#963434}.tool p{margin:3px 0 0;font-size:12px;color:var(--muted)}
+.samples{display:grid;gap:6px;margin-top:6px}.samples button{text-align:left;font-size:13px;padding:8px 10px}#message{min-height:18px;margin-top:9px;color:var(--danger);font-size:13px}
+@media(max-width:900px){main{grid-template-columns:1fr}.chat{height:auto}.log{max-height:60vh}}
+</style>
+</head>
+<body>
+<header class="top"><h1>采购助手</h1><a href="采购看板.html">采购看板</a><a href="交期提醒台账.html">交期台账</a><a href="合同生成.html">采购合同</a><a href="换货.html">订单换货</a></header>
+<main>
+  <section class="panel chat">
+    <div class="log" id="log"><div class="msg system"><div class="bubble">填好 Token 和姓名后连接。助手只能通过固定工具查库和生成产物；生成合同、登记换货、发钉钉催办这类动作会先给出要点，等你点确认才执行。</div></div></div>
+    <div class="composer">
+      <textarea id="input" placeholder="例如：查一下 604264 这张采购单&#10;或：现在逾期的单有多少，按采购员列出来"></textarea>
+      <button class="primary" id="send">发送</button>
+    </div>
+  </section>
+  <section>
+    <div class="panel">
+      <h2>连接</h2>
+      <div class="security-grid">
+        <input id="token" type="password" autocomplete="off" placeholder="AGENT_API_TOKEN">
+        <input id="operator" autocomplete="off" placeholder="你的姓名">
+        <button id="connect">连接</button>
+      </div>
+      <div class="small" style="margin-top:7px">Token 只存在当前标签页 sessionStorage。</div>
+      <div class="statusline"><span id="dot" class="dot offline"></span><span id="state" class="small">尚未连接</span></div>
+      <div id="message"></div>
+      <div class="samples">
+        <button data-ask="今年的采购金额、待入库和入库率各是多少？">今年采购概况</button>
+        <button data-ask="现在逾期的采购单有多少张，按采购员分别列出待入库件数。">逾期催办清单</button>
+        <button data-ask="T-10 这一波有哪些单需要催？">T-10 这一波</button>
+      </div>
+      <div class="row" style="display:flex;gap:8px;margin-top:10px"><button id="reset">清空当前会话</button></div>
+    </div>
+    <div class="panel" style="margin-top:16px">
+      <h2>可用工具</h2>
+      <p class="desc">L0 直接执行，L1/L2 必须人工确认。</p>
+      <div class="tools" id="tools"><div class="small">连接后加载</div></div>
+    </div>
+  </section>
+</main>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let sessionKey = sessionStorage.getItem('agentSessionKey') || '';
+  let sessionId = '';
+  if (!sessionKey) { sessionKey = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now())); sessionStorage.setItem('agentSessionKey', sessionKey); }
+  $('token').value = sessionStorage.getItem('agentToken') || '';
+  $('operator').value = sessionStorage.getItem('agentOperator') || '';
+
+  const esc = v => String(v ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const headers = () => ({'Authorization': 'Bearer ' + $('token').value.trim(), 'Content-Type': 'application/json', 'X-Agent-Operator': $('operator').value.trim()});
+  async function api(path, opt = {}) {
+    const response = await fetch(path, {...opt, headers: {...headers(), ...(opt.headers || {})}});
+    let value = {};
+    try { value = await response.json(); } catch (error) { /* 非 JSON 响应按 HTTP 状态报错 */ }
+    if (!response.ok) throw new Error(value.error || `HTTP ${response.status}`);
+    return value;
+  }
+  function bubble(role, html) {
+    const node = document.createElement('div');
+    node.className = 'msg ' + role;
+    node.innerHTML = `<span class="who">${role === 'user' ? esc($('operator').value.trim() || '我') : role === 'assistant' ? '助手' : '提示'}</span><div class="bubble">${html}</div>`;
+    $('log').appendChild(node);
+    $('log').scrollTop = $('log').scrollHeight;
+    return node;
+  }
+  function stepChips(steps) {
+    if (!steps || !steps.length) return '';
+    return `<div class="steps" style="margin-top:9px">${steps.map(step => `<span class="chip ${step.status === 'error' ? 'error' : step.actionId ? 'wait' : ''}">${esc(step.tool)}</span>`).join('')}</div>`;
+  }
+  function actionCard(action) {
+    return `<div class="action" data-action="${esc(action.id)}">
+      <h3>${esc(action.title)}</h3>
+      <div class="risk">${esc(action.risk)} · 需要你确认后才执行 · ${esc(action.expiresAt)} 前有效</div>
+      <pre>${esc(JSON.stringify(action.preview, null, 2))}</pre>
+      <div class="row"><button class="primary" data-do="confirm">确认执行</button><button class="danger" data-do="cancel">取消</button></div>
+    </div>`;
+  }
+  async function loadStatus() {
+    const status = await api('/api/agent/status');
+    const agent = status.agent;
+    $('dot').className = 'dot ' + (agent.available ? 'online' : 'offline');
+    $('state').textContent = agent.available
+      ? `${agent.llm.model} · ${agent.tools.length} 个工具 · 最多 ${agent.maxToolSteps} 步`
+      : 'Agent 未启用：需在 .env 设置 AGENT_ENABLED=true 和模型密钥';
+    $('tools').innerHTML = agent.tools.map(tool => `<div class="tool"><b>${esc(tool.name)}</b><span class="risk ${tool.risk}">${esc(tool.risk)} ${esc(tool.riskLabel)}</span><p>${esc(tool.description)}</p></div>`).join('');
+    if (!status.forecast.ready) $('tools').insertAdjacentHTML('afterbegin', '<div class="small">预测模型工件尚未就绪，预测与订货建议会提示先训练模型。</div>');
+  }
+  async function connect() {
+    if (!$('token').value.trim() || !$('operator').value.trim()) throw new Error('请填写 Token 和姓名');
+    sessionStorage.setItem('agentToken', $('token').value.trim());
+    sessionStorage.setItem('agentOperator', $('operator').value.trim());
+    await loadStatus();
+    $('message').textContent = '';
+  }
+  async function send(text) {
+    text = (text ?? $('input').value).trim();
+    if (!text) return;
+    $('input').value = '';
+    $('send').disabled = true;
+    bubble('user', esc(text));
+    const waiting = bubble('assistant', '<span class="small">正在查数据…</span>');
+    try {
+      const answer = await api('/api/agent/chat', {method: 'POST', body: JSON.stringify({message: text, sessionKey, operator: $('operator').value.trim()})});
+      sessionId = answer.sessionId;
+      waiting.querySelector('.bubble').innerHTML = esc(answer.reply) + stepChips(answer.steps) + (answer.pendingActions || []).map(actionCard).join('');
+    } catch (error) {
+      waiting.querySelector('.bubble').innerHTML = `<span style="color:#a53333">${esc(error.message)}</span>`;
+    } finally {
+      $('send').disabled = false;
+      $('log').scrollTop = $('log').scrollHeight;
+    }
+  }
+  $('connect').onclick = () => connect().catch(error => { $('message').textContent = error.message; });
+  $('send').onclick = () => send();
+  $('input').addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); send(); } });
+  $('reset').onclick = async () => {
+    if (sessionId) await api(`/api/agent/sessions/${sessionId}/reset`, {method: 'POST', body: '{}'}).catch(() => {});
+    sessionKey = crypto.randomUUID ? crypto.randomUUID() : String(Date.now());
+    sessionStorage.setItem('agentSessionKey', sessionKey);
+    sessionId = '';
+    $('log').innerHTML = '';
+    bubble('system', '会话已清空，上下文重新开始。');
+  };
+  document.querySelectorAll('[data-ask]').forEach(button => { button.onclick = () => send(button.dataset.ask); });
+  async function openFile(path, name) {
+    const response = await fetch(path, {headers: headers()});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const url = URL.createObjectURL(await response.blob());
+    if (name) {
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = name;
+      link.click();
+    } else {
+      window.open(url, '_blank');
+    }
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+  $('log').onclick = async event => {
+    const file = event.target.dataset.file;
+    if (file) return openFile(file, event.target.dataset.name).catch(error => alert(error.message));
+    const card = event.target.closest('.action');
+    const action = event.target.dataset.do;
+    if (!card || !action) return;
+    if (action === 'confirm' && !confirm('确认执行该动作？它会真正生成产物或对外发送。')) return;
+    card.querySelectorAll('button').forEach(button => { button.disabled = true; });
+    try {
+      const done = await api(`/api/agent/actions/${card.dataset.action}/${action}`, {method: 'POST', body: JSON.stringify({operator: $('operator').value.trim()})});
+      const result = done.result || {};
+      const links = [
+        result.downloadUrl && `<button data-file="${esc(result.downloadUrl)}" data-name="${esc(result.fileName || 'contract.xlsx')}">下载 Excel</button>`,
+        result.previewUrl && `<button data-file="${esc(result.previewUrl)}">查看预览</button>`,
+      ].filter(Boolean).join('');
+      card.outerHTML = `<div class="action"><h3>${esc(done.title)}</h3><div class="risk">${done.status === 'executed' ? '已执行' : '已' + esc(done.status)}</div><pre>${esc(JSON.stringify(result, null, 2))}</pre>${links ? `<div class="row">${links}</div>` : ''}</div>`;
+    } catch (error) {
+      alert(error.message);
+      card.querySelectorAll('button').forEach(button => { button.disabled = false; });
+    }
+  };
+  if ($('token').value && $('operator').value) connect().catch(error => { $('message').textContent = error.message; });
+})();
+</script>
+</body>
+</html>
