@@ -1,0 +1,60 @@
+{
+  "today": "2026-08-13",
+  "waveThresholds": [
+    {"days": null, "bucket": "unscheduled", "wave": "none"},
+    {"days": -1, "bucket": "overdue", "wave": "w4"},
+    {"days": 0, "bucket": "t1", "wave": "w3"},
+    {"days": 1, "bucket": "t1", "wave": "w3"},
+    {"days": 2, "bucket": "t10", "wave": "w2"},
+    {"days": 10, "bucket": "t10", "wave": "w2"},
+    {"days": 11, "bucket": "t20", "wave": "w1"},
+    {"days": 20, "bucket": "t20", "wave": "w1"},
+    {"days": 21, "bucket": "later", "wave": "far"}
+  ],
+  "mixedOrder": {
+    "purchaseOrderNo": "MIX-1",
+    "rows": [
+      {
+        "采购单号": "MIX-1",
+        "采购日期": "2026-07-01",
+        "状态": "已确认",
+        "采购员": "张三",
+        "item_supplier_id": "佰特",
+        "仓储方": "主仓",
+        "商品编码": "SKU-A",
+        "数量": 10,
+        "item_in_qty": 0,
+        "item_delivery_date": "2026-09-01",
+        "最早预计到货日期": "2026-08-20",
+        "基本售价": 1,
+        "基本金额": 10
+      },
+      {
+        "采购单号": "MIX-1",
+        "采购日期": "2026-07-01",
+        "状态": "已确认",
+        "采购员": "张三",
+        "item_supplier_id": "佰特",
+        "仓储方": "主仓",
+        "商品编码": "SKU-B",
+        "数量": 5,
+        "item_in_qty": 0,
+        "item_delivery_date": "",
+        "最早预计到货日期": "2026-08-20",
+        "基本售价": 1,
+        "基本金额": 5
+      }
+    ],
+    "frontendLines": [
+      {"qty": 10, "inQty": 0, "deliveryDate": "2026-09-01", "eta": "2026-08-20"},
+      {"qty": 5, "inQty": 0, "deliveryDate": "", "eta": "2026-08-20"}
+    ],
+    "expected": {
+      "deliveryDate": "2026-08-20",
+      "dateSource": "预计到货",
+      "etaSpread": 2,
+      "bucket": "t10",
+      "wave": "w2"
+    }
+  }
+}

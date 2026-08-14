@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { TopBar } from "../../components/TopBar";
 import { LoadFailed, Loading } from "../../components/PageState";
+import { agentApi, errorText } from "../../api/client";
+import { useCredentials } from "../../hooks/useCredentials";
 import { usePayload } from "../../hooks/usePayload";
 import { decodeDelivery } from "../../data/payload";
 import type { DeliveryData } from "../../data/payload";
@@ -16,7 +18,8 @@ import type { LedgerOrder } from "./model";
 import { DESC_FIRST, sortOrders } from "./sorting";
 import type { SortKey } from "./sorting";
 import { exportReminderCsv } from "./csv";
-import { isUrgent } from "./waves";
+import { isUrgent, WAVE_TO_BUCKET } from "./waves";
+import type { WaveKey } from "./waves";
 import "./ledger.css";
 
 const PAGE_SIZE = 25;
@@ -57,8 +60,8 @@ export default function LedgerPage() {
   const year = params.get("year");
   const { data, error, loading, reload } = usePayload<DeliveryData>("/api/delivery", year, decodeDelivery);
 
-  if (loading && !data) return <Loading label="正在读取交期数据…" />;
-  if (error && !data) return <LoadFailed message={error} onRetry={reload} />;
+  if (loading) return <Loading label="正在读取交期数据…" />;
+  if (error) return <LoadFailed message={error} onRetry={reload} />;
   if (!data) return <LoadFailed message="接口没有返回数据。" onRetry={reload} />;
   return <Ledger data={data} year={year} onYear={(next) => setParams({ year: next })} />;
 }
@@ -83,6 +86,8 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
   const [page, setPage] = useState(0);
   const [opened, setOpened] = useState<LedgerOrder | null>(null);
   const [pushNote, setPushNote] = useState("");
+  const [pushing, setPushing] = useState(false);
+  const { credentials, update, remember, filled } = useCredentials("agent");
 
   // 换年度是整页重取，筛选跟着回到初始值。
   useEffect(() => {
@@ -150,6 +155,64 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
     }
     return { count, qty };
   }, [withoutWave, stamps]);
+
+  const buyerName = filters.buyer === "" ? "" : (dict.buyers[Number(filters.buyer)] ?? "");
+  const waveBucket = WAVE_TO_BUCKET[filters.wave as WaveKey];
+
+  async function sendReminders() {
+    if (needCount === 0 || pushing) return;
+    if (!filled) {
+      setPushNote("请先填写 AGENT_API_TOKEN 和与钉钉/采购员一致的姓名，再发送提醒。");
+      return;
+    }
+    const who = buyerName ? `（仅 ${buyerName}）` : "";
+    const wave = waveBucket ? `、档位 ${filters.wave}` : "";
+    const extra =
+      filters.supplier || filters.query || filters.from || filters.to || filters.status
+        ? "推送按采购员和档位走后台催办口径，供应商/搜索等其它筛选不会带上。"
+        : "";
+    if (!window.confirm(`将把当前需催 ${needCount} 单发到钉钉采购群${who}${wave}。${extra}确定发送？`)) {
+      return;
+    }
+    remember(credentials);
+    setPushing(true);
+    setPushNote("");
+    try {
+      const result = await agentApi.post<{
+        sent?: boolean;
+        skipped?: boolean;
+        reason?: string;
+        today?: string;
+        orderCount?: number;
+        buyers?: string[];
+      }>(
+        "/api/agent/reminders/push",
+        {
+          operator: credentials.operator.trim(),
+          today: filters.today,
+          buyer: buyerName,
+          buckets: waveBucket ? [waveBucket] : undefined,
+        },
+        credentials,
+      );
+      if (result.skipped) {
+        const already = (result.reason || "").includes("已经推送过");
+        setPushNote(
+          already
+            ? `当日已推（${result.today || filters.today}）。同一批催办成功后不会重复刷群。`
+            : result.reason || "今天没有需要催办的采购单。",
+        );
+        return;
+      }
+      const count = result.orderCount ?? needCount;
+      const people = (result.buyers || []).join("、");
+      setPushNote(`已发到钉钉群：${count} 单${people ? ` · ${people}` : ""}。`);
+    } catch (error: unknown) {
+      setPushNote(errorText(error));
+    } finally {
+      setPushing(false);
+    }
+  }
 
   function sortBy(key: SortKey) {
     if (sortKey === key) {
@@ -282,32 +345,47 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
                 {int(waveTotals.qty)} 件。
               </div>
             </div>
-            <div className="ctrl">
-              <button
-                type="button"
-                className="btn"
-                disabled={needCount === 0}
-                onClick={() =>
-                  setPushNote(
-                    `当前切片有 ${needCount} 单需催。推送走 Agent 的钉钉通道（POST /api/agent/reminders/push），` +
-                      "需要 AGENT_API_TOKEN，请到采购助手页面发起；本页可先导出 CSV 自行分发。",
-                  )
-                }
-              >
-                发送提醒
-              </button>
-              <button
-                type="button"
-                className="btn"
-                onClick={() => exportReminderCsv(slice, stamps, dict, today, filters.today)}
-              >
-                导出催办清单
-              </button>
+            <div className="ledger-push">
+              <div className="credentials-grid">
+                <input
+                  type="password"
+                  autoComplete="off"
+                  placeholder="AGENT_API_TOKEN"
+                  value={credentials.token}
+                  onChange={(event) => update({ token: event.target.value })}
+                />
+                <input
+                  autoComplete="off"
+                  placeholder="钉钉/采购员姓名"
+                  value={credentials.operator}
+                  onChange={(event) => update({ operator: event.target.value })}
+                />
+              </div>
+              <div className="push-actions">
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={needCount === 0 || pushing}
+                  onClick={() => void sendReminders()}
+                >
+                  {pushing ? "发送中…" : "发送提醒"}
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => exportReminderCsv(slice, stamps, dict, today, filters.today)}
+                >
+                  导出催办清单
+                </button>
+              </div>
             </div>
           </div>
           {pushNote ? (
             <div className="notice">
-              {pushNote} <a href={ROUTES.chat}>打开采购助手 →</a>
+              {pushNote}{" "}
+              {pushNote.includes("姓名") || pushNote.includes("Token") || pushNote.includes("未在员工绑定") ? (
+                <a href={ROUTES.chat}>打开采购助手 →</a>
+              ) : null}
             </div>
           ) : null}
           <TierCards

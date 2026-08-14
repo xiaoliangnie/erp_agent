@@ -14,6 +14,15 @@
 
 .ledger-wrap { padding: 16px 24px 44px; display: flex; flex-direction: column; gap: 16px; }
 .ledger-wrap .card-head .note { max-width: 78ch; }
+.ledger-push {
+  margin-left: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+}
+.ledger-push .credentials-grid { min-width: min(100%, 360px); }
+.ledger-push .push-actions { display: flex; gap: 8px; align-items: center; }
 
 /* ── 四波提醒档位卡 ───────────────────────────────────────── */
 .tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 10px; }

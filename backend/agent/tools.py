@@ -9,30 +9,30 @@ pending_action，人工确认后才真正执行（见 `actions.py`）。
 """
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from dataclasses import dataclass, replace
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from ..business_time import business_today
 from ..contracts import INVOICE_LABELS, generate_contract, get_contract_options
 from ..database import fetch_contract_order_choices, fetch_exchange_products
 from ..delivery_reminders import BUCKET_ORDER, URGENT_BUCKETS, build_reminders, filter_orders, reminder_markdown
-from ..gb_standards import catalog_status, lookup_product_standards
+from ..gb_standards import catalog_status, family_ids_for, lookup_product_standards
 from ..order_source import fetch_exchange_order_items, fetch_exchange_orders
 from ..procurement_data import day, integer, number, text
+from ..product_images import resolve_product_image
 
 
 RISK_LEVELS = {"L0": "只读", "L1": "生成产物", "L2": "对外动作", "L3": "改主数据"}
 
 # 架构方案 §14 预留的工具位：只占位，不提前写实现。上线任何一项都是在这里加一条
-# `registry.register(...)`，Agent Core 不动。
+# `registry.register(...)`，Agent Core 不动。价格盯盘 / 库存预警 / 采购草稿已取消。
 RESERVED_TOOLS = {
     "supplier_scorecard": "供应商绩效评价（交期达成率 / 逾期率 / 入库速度），口径待在 README 定义",
-    "price_watch": "价格异常监控（同 SKU 历史价、跨供应商比价），阈值配置化、不做模型",
-    "inventory_watch": "库存预警与滞销分析，依赖库存表（与预测同一数据前提）",
-    "create_purchase_draft": "由订货建议单生成采购单草稿，L2/L3 写操作",
-    "master_data_gaps": "主数据缺口汇总（供应商未维护 / 近期采购 SKU 无图 / 合同不可生成原因），只读",
 }
 
 
@@ -52,6 +52,7 @@ class ToolContext:
     notifier: Any = None
     audit: Any = None
     setting: Any = None
+    quality: Any = None
     operator: str = ""
     channel: str = "web"
     session_id: str | None = None
@@ -79,7 +80,7 @@ class Tool:
 
     @property
     def needs_confirm(self) -> bool:
-        return self.risk in ("L1", "L2")
+        return self.risk != "L0"
 
     def schema(self) -> dict:
         note = "" if not self.needs_confirm else "（该动作需要员工确认后才会真正执行）"
@@ -93,6 +94,19 @@ class Tool:
         }
 
 
+def declared_arguments(tool: Tool, arguments: dict) -> dict:
+    """只保留 schema.properties 声明过的入参，未声明字段直接丢弃。
+
+    properties 为空时无法白名单，原样返回（测试桩或尚未声明 schema 的工具）。
+    """
+    if not isinstance(arguments, dict):
+        return {}
+    properties = (tool.parameters or {}).get("properties") or {}
+    if not properties:
+        return dict(arguments)
+    return {key: arguments[key] for key in properties if key in arguments}
+
+
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, Tool] = {}
@@ -100,6 +114,8 @@ class ToolRegistry:
     def register(self, tool: Tool) -> None:
         if tool.risk not in RISK_LEVELS:
             raise ValueError(f"未知风险级 {tool.risk}")
+        if tool.risk != "L0" and tool.preview is None:
+            raise ValueError(f"工具 {tool.name} 是 {tool.risk}，必须提供 preview")
         if tool.name in self._tools:
             raise ValueError(f"工具 {tool.name} 已注册")
         self._tools[tool.name] = tool
@@ -303,6 +319,210 @@ def _lookup_gb_standards(arguments, ctx):
     )
 
 
+GAP_LIST_CAP = 20
+
+
+def _load_config_object(root: Path, name: str) -> dict:
+    path = Path(root) / "config" / name
+    if not path.is_file():
+        raise ToolError(f"找不到配置 {name}")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ToolError(f"{name} 不是合法 JSON") from exc
+    if not isinstance(data, dict):
+        raise ToolError(f"{name} 必须是对象")
+    return data
+
+
+def _tool_today(arguments) -> date:
+    raw = str(arguments.get("today") or "").strip()
+    if not raw:
+        return business_today()
+    try:
+        return date.fromisoformat(raw[:10])
+    except ValueError as exc:
+        raise ToolError("today 必须是 YYYY-MM-DD") from exc
+
+
+def _gaps_markdown(payload: dict) -> str:
+    """钉钉可直接粘贴的主数据缺口清单，结构对齐催办 markdown。"""
+    counts = payload["counts"]
+    days = payload["days"]
+    lines = [f"### 主数据缺口（近 {days} 天 · {payload['today']}）"]
+    lines.append(
+        f"> 采购行 **{payload['rowCount']}** · "
+        f"供应商未维护 **{counts['missingSuppliers']}** · "
+        f"SKU 无图 **{counts['missingImages']}** · "
+        f"缺价 **{counts['missingPrices']}** · "
+        f"分类未映射国标 **{counts['unmappedCategories']}**"
+    )
+    invoice_note = payload.get("invoiceType") or "全部票种"
+    lines.append(f"> 票种口径：{invoice_note}")
+
+    def section(title: str, key: str, items: list, render) -> None:
+        total = counts[key]
+        lines.append(f"\n**{title}**（{total}）")
+        if not items:
+            lines.append("- 无")
+            return
+        for item in items:
+            lines.append(f"- {render(item)}")
+        extra = total - len(items)
+        if extra > 0:
+            lines.append(f"- …另有 {extra} 条")
+
+    section(
+        "供应商未维护", "missingSuppliers", payload["missingSuppliers"],
+        lambda item: f"{item['name']} · {item['poCount']} 单 · {item['buyer'] or '—'}",
+    )
+    section(
+        "近期采购 SKU 无图", "missingImages", payload["missingImages"],
+        lambda item: f"{item['sku']} · {item['name'] or item['style'] or '—'} · {item['poCount']} 单",
+    )
+    section(
+        "票种缺价", "missingPrices", payload["missingPrices"],
+        lambda item: f"{item['sku']} · {item['name'] or '—'} · 缺 { '、'.join(item['missingLabels']) }",
+    )
+    section(
+        "分类未映射国标目录族", "unmappedCategories", payload["unmappedCategories"],
+        lambda item: f"{item['category']} · {item['skuCount']} 个 SKU",
+    )
+    return "\n".join(lines)
+
+
+def _master_data_gaps(arguments, ctx):
+    """近 N 天采购涉及的供应商 / 图片 / 票种价格 / 国标分类映射缺口。只读。"""
+    days = _limit(arguments.get("days"), 30, 365)
+    today = _tool_today(arguments)
+    invoice_type = str(arguments.get("invoice_type") or "").strip()
+    if invoice_type and invoice_type not in INVOICE_LABELS:
+        raise ToolError("票种只能是：" + "、".join(INVOICE_LABELS))
+    wanted_types = [invoice_type] if invoice_type else list(INVOICE_LABELS)
+    year_arg = str(arguments.get("year") or "").strip()
+    if year_arg and not re.fullmatch(r"\d{4}", year_arg):
+        raise ToolError("统计年度必须是四位数字")
+    years = [int(year_arg)] if year_arg else [today.year]
+    if not year_arg:
+        start = today - timedelta(days=days)
+        if start.year < today.year:
+            years.append(start.year)
+
+    rows = []
+    for year in years:
+        chunk, _ = ctx.rows(str(year))
+        rows.extend(chunk or [])
+    cutoff = (today - timedelta(days=days)).isoformat()
+    window = [row for row in rows if (day(row.get("采购日期")) or "") >= cutoff]
+
+    suppliers = _load_config_object(ctx.root, "suppliers.json")
+    products = _load_config_object(ctx.root, "products.json")
+    mapping = _load_config_object(ctx.root, "gb_category_map.json")
+    ignored = {str(item).strip() for item in (mapping.get("ignore") or [])}
+
+    missing_suppliers: dict[str, dict] = {}
+    images: dict[str, dict] = {}
+    prices: dict[str, dict] = {}
+    categories: dict[str, dict] = {}
+
+    for row in window:
+        supplier = text(row.get("item_supplier_id") or row.get("seller"))
+        sku = text(row.get("商品编码"))
+        style = text(row.get("款式编码"))
+        name = text(row.get("商品名称"))
+        category = text(row.get("item_sku_other_3")) or "未分类"
+        buyer = text(row.get("采购员"))
+        po_id = text(row.get("采购单号"))
+        if supplier and supplier not in suppliers:
+            item = missing_suppliers.setdefault(
+                supplier, {"name": supplier, "poIds": set(), "buyers": set()},
+            )
+            if po_id:
+                item["poIds"].add(po_id)
+            if buyer:
+                item["buyers"].add(buyer)
+        if not sku:
+            continue
+        product = products.get(sku) or products.get(style) or {}
+        image = resolve_product_image(product, sku=sku, style=style, root=ctx.root)
+        if image.get("status") != "ready":
+            item = images.setdefault(
+                sku, {"sku": sku, "style": style, "name": name, "poIds": set()},
+            )
+            if po_id:
+                item["poIds"].add(po_id)
+            if name and not item["name"]:
+                item["name"] = name
+        missing_types = [
+            key for key in wanted_types
+            if (product.get("prices") or {}).get(key) is None
+        ]
+        if missing_types:
+            item = prices.setdefault(
+                sku, {"sku": sku, "name": name, "missingTypes": set()},
+            )
+            item["missingTypes"].update(missing_types)
+            if name and not item["name"]:
+                item["name"] = name
+        if category not in ignored and not family_ids_for(category, mapping):
+            item = categories.setdefault(
+                category, {"category": category, "skus": set()},
+            )
+            item["skus"].add(sku)
+
+    def cap(items):
+        return items[:GAP_LIST_CAP]
+
+    supplier_list = cap(sorted(
+        ({
+            "name": item["name"],
+            "poCount": len(item["poIds"]),
+            "buyer": "、".join(sorted(item["buyers"])),
+        } for item in missing_suppliers.values()),
+        key=lambda item: (-item["poCount"], item["name"]),
+    ))
+    image_list = cap(sorted(
+        ({
+            "sku": item["sku"], "style": item["style"], "name": item["name"],
+            "poCount": len(item["poIds"]),
+        } for item in images.values()),
+        key=lambda item: (-item["poCount"], item["sku"]),
+    ))
+    price_list = cap(sorted(
+        ({
+            "sku": item["sku"], "name": item["name"],
+            "missingTypes": sorted(item["missingTypes"]),
+            "missingLabels": [INVOICE_LABELS[key] for key in sorted(item["missingTypes"])],
+        } for item in prices.values()),
+        key=lambda item: item["sku"],
+    ))
+    category_list = cap(sorted(
+        ({
+            "category": item["category"], "skuCount": len(item["skus"]),
+        } for item in categories.values()),
+        key=lambda item: (-item["skuCount"], item["category"]),
+    ))
+    payload = {
+        "today": today.isoformat(),
+        "days": days,
+        "rowCount": len(window),
+        "invoiceType": INVOICE_LABELS[invoice_type] if invoice_type else "",
+        "missingSuppliers": supplier_list,
+        "missingImages": image_list,
+        "missingPrices": price_list,
+        "unmappedCategories": category_list,
+        "counts": {
+            "missingSuppliers": len(missing_suppliers),
+            "missingImages": len(images),
+            "missingPrices": len(prices),
+            "unmappedCategories": len(categories),
+        },
+        "note": "供应商键是 ERP seller 简称；图片按商品映射 / SKU 本地图 / 缓存；缺价指 products.json 该票种单价为 null",
+    }
+    payload["markdown"] = _gaps_markdown(payload)
+    return payload
+
+
 def _require_order_source(ctx):
     if ctx.setting is None:
         raise ToolError("订单镜像查询尚未配置")
@@ -405,7 +625,6 @@ def _generate_contract(arguments, ctx):
     generate_contract(
         po_id, invoice_type, output_dir / "contract.xlsx",
         tax_rate=arguments.get("tax_rate"),
-        price_overrides=arguments.get("price_overrides") or {},
         gb_overrides=arguments.get("gb_overrides") or arguments.get("gbOverrides") or {},
         preview_path=output_dir / "preview.png",
         env_path=ctx.env_path,
@@ -536,7 +755,64 @@ BUCKETS_PARAM = {
 }
 
 
-def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True) -> ToolRegistry:
+def _quality_or_error(ctx):
+    if ctx.quality is None:
+        raise ToolError("品控台账未启用")
+    return ctx.quality
+
+
+def _record_quality_issue(arguments, ctx):
+    ledger = _quality_or_error(ctx)
+    return ledger.record(
+        description=str(arguments.get("description") or "").strip(),
+        supplier=str(arguments.get("supplier") or "").strip(),
+        po_id=str(arguments.get("po_id") or "").strip(),
+        sku=str(arguments.get("sku") or "").strip(),
+        severity=str(arguments.get("severity") or "").strip(),
+        reporter=ctx.operator, channel=ctx.channel, run_id=ctx.run_id,
+        raw_text=str(arguments.get("description") or ""),
+    )
+
+
+def _record_quality_preview(arguments, ctx):
+    return {
+        "description": str(arguments.get("description") or "").strip(),
+        "supplier": str(arguments.get("supplier") or "").strip(),
+        "po_id": str(arguments.get("po_id") or "").strip(),
+        "sku": str(arguments.get("sku") or "").strip(),
+        "severity": str(arguments.get("severity") or "").strip(),
+        "note": "确认后写入本地品控台账，不改 ERP。",
+    }
+
+
+def _list_quality_issues(arguments, ctx):
+    ledger = _quality_or_error(ctx)
+    issues = ledger.query(query=str(arguments.get("query") or "今天"))
+    summary = ledger.summary(issues)
+    return {
+        "summary": summary,
+        "truncated": len(issues) > 30,
+        "issues": issues[:30],
+        "markdown": ledger.format_query(str(arguments.get("query") or "今天")),
+    }
+
+
+def _push_quality_report(arguments, ctx):
+    scheduler = getattr(ctx.quality, "scheduler", None) if ctx.quality else None
+    if scheduler is None:
+        raise ToolError("品控日报调度未装配")
+    return scheduler.run_once(operator=ctx.operator or "agent")
+
+
+def _push_quality_preview(arguments, ctx):
+    ledger = _quality_or_error(ctx)
+    today = business_today().isoformat()
+    issues = ledger.list_for_report(today)
+    return {"today": today, "count": len(issues), "note": "将把当日品控日报发到钉钉群"}
+
+
+def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True,
+                   with_quality=False) -> ToolRegistry:
     """按已启用的子系统装配工具注册表。"""
     registry = ToolRegistry()
     registry.register(Tool(
@@ -613,6 +889,21 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
             "limit": {"type": "integer", "description": "返回条数，默认 12，最多 40"},
         }},
         risk="L0", handler=_lookup_gb_standards,
+    ))
+    registry.register(Tool(
+        name="master_data_gaps",
+        description=(
+            "汇总近 N 天采购涉及的主数据缺口：供应商未在 suppliers.json 维护、SKU 无图、"
+            "所选票种缺价、分类未映射国标目录族。问「哪些供应商还没维护」「哪些 SKU 没图」时用。"
+            "只读，输出 markdown 可直接发钉钉；不要逐张单猜测或编造全称/单价。"
+        ),
+        parameters={"type": "object", "properties": {
+            "days": {"type": "integer", "description": "回溯天数，默认 30，最多 365"},
+            "invoice_type": {"type": "string", "enum": list(INVOICE_LABELS),
+                             "description": "只检查某票种缺价：no_invoice / normal_invoice / special_invoice；缺省三种都查"},
+            "year": YEAR_PARAM, "today": TODAY_PARAM,
+        }},
+        risk="L0", handler=_master_data_gaps,
     ))
     if with_exchange:
         registry.register(Tool(
@@ -712,5 +1003,34 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
             }},
             risk="L2", handler=_send_reminder, preview=_reminder_preview,
             title=lambda args: "发送交期催办到钉钉群",
+        ))
+    if with_quality:
+        registry.register(Tool(
+            name="record_quality_issue",
+            description="把一条品控问题记入本地台账。字段由你抽取，员工确认后才落库。不要编造供应商或单号。",
+            parameters={"type": "object", "properties": {
+                "description": {"type": "string", "description": "问题描述，必填"},
+                "supplier": {"type": "string", "description": "供应商简称"},
+                "po_id": {"type": "string", "description": "采购单号"},
+                "sku": {"type": "string", "description": "商品编码"},
+                "severity": {"type": "string", "description": "一般或严重"},
+            }, "required": ["description"], "additionalProperties": False},
+            risk="L1", handler=_record_quality_issue, preview=_record_quality_preview,
+            title=lambda args: "登记品控问题",
+        ))
+        registry.register(Tool(
+            name="list_quality_issues",
+            description="按今天/本周/供应商/未关闭查询品控台账。",
+            parameters={"type": "object", "properties": {
+                "query": {"type": "string", "description": "今天 / 本周 / 未关闭 / 供应商名"},
+            }},
+            risk="L0", handler=_list_quality_issues,
+        ))
+        registry.register(Tool(
+            name="push_quality_report",
+            description="手动把当日品控日报发到钉钉群。对外动作，需确认。",
+            parameters={"type": "object", "properties": {}},
+            risk="L2", handler=_push_quality_report, preview=_push_quality_preview,
+            title=lambda args: "发送品控日报",
         ))
     return registry

@@ -10,14 +10,18 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from backend.business_time import business_today  # noqa: E402
 from backend.database import load_all_env  # noqa: E402
 from backend.gb_standards import (  # noqa: E402
     DEFAULT_CATEGORY_MAP,
     GbStandardsSyncer,
     SamrCatalogClient,
     build_queries,
+    fetch_contract_gb_usages,
     fetch_product_categories,
+    gb_change_markdown,
     load_category_map,
+    match_contract_gb_alerts,
     resolve_product_scope,
 )
 
@@ -102,7 +106,17 @@ def main():
         max_pages=max_pages,
     )
     result = syncer.sync()
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    changes = result.pop("statusChanges", [])
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    if changes:
+        usages = fetch_contract_gb_usages(args.env, changes)
+        alerts = match_contract_gb_alerts(changes, usages)
+        print(f"目录状态跃迁 {len(changes)} 条，其中合同已选用 {len(alerts)} 条。")
+        if alerts:
+            print(gb_change_markdown(alerts, today=business_today().isoformat()))
+            print("钉钉推送由运行中的 server.py 在每日同步成功后发出；本命令只打印清单。")
+    else:
+        print("本轮没有目录状态跃迁。")
 
 
 if __name__ == "__main__":

@@ -2,8 +2,9 @@
 """Agent 业务库的连接与表结构。
 
 架构方案 §10 的目标形态是同一 MySQL 实例下的独立 schema。第一阶段沿用换货任务
-队列已经验证过的做法——本地 SQLite，表名、字段名和状态机与方案一致，迁到 MySQL
+队列已经验证过的做法——本地 SQLite，表名、字段名和状态机与方案一致。迁到 MySQL
 只需要换掉这一层，`sessions.py` / `actions.py` / `audit.py` 的调用面不变。
+**换库是 P2，等迁到专用机器之后再做。**
 """
 from __future__ import annotations
 
@@ -124,7 +125,56 @@ CREATE TABLE IF NOT EXISTS notification_deliveries (
     error TEXT,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS quality_issues (
+    id TEXT PRIMARY KEY,
+    report_date TEXT NOT NULL,
+    source_channel TEXT NOT NULL,
+    conversation_id TEXT NOT NULL DEFAULT '',
+    message_id TEXT UNIQUE,
+    reporter TEXT NOT NULL DEFAULT '',
+    reporter_user_id TEXT NOT NULL DEFAULT '',
+    supplier TEXT NOT NULL DEFAULT '',
+    po_id TEXT NOT NULL DEFAULT '',
+    sku TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL DEFAULT '',
+    description TEXT NOT NULL,
+    raw_text TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    resolution TEXT NOT NULL DEFAULT '',
+    run_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_quality_issues_date ON quality_issues(report_date, status);
+CREATE TABLE IF NOT EXISTS agent_session_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    upto_message_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS operator_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operator TEXT NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'preference',
+    content TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT '',
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operator_memories ON operator_memories(operator, active, updated_at);
 """
+
+COLUMN_MIGRATIONS = (
+    ("agent_sessions", "epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("agent_messages", "epoch", "INTEGER NOT NULL DEFAULT 0"),
+    ("pending_actions", "actor_id", "TEXT NOT NULL DEFAULT ''"),
+    ("pending_actions", "confirmed_by", "TEXT NOT NULL DEFAULT ''"),
+    ("agent_runs", "prompt_tokens", "INTEGER"),
+    ("agent_runs", "completion_tokens", "INTEGER"),
+)
 
 
 def now() -> str:
@@ -148,6 +198,14 @@ def loads(value: str | None, default: Any = None) -> Any:
         return default
 
 
+def _migrate_columns(conn) -> None:
+    """SQLite 的 executescript 不会给已有表补列。"""
+    for table, column, decl in COLUMN_MIGRATIONS:
+        names = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in names:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 class AgentStore:
     """Agent 业务库的唯一写入点，串行化写事务。"""
 
@@ -157,6 +215,7 @@ class AgentStore:
         self.lock = threading.RLock()
         with self.write() as conn:
             conn.executescript(SCHEMA)
+            _migrate_columns(conn)
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.database_path, timeout=10)

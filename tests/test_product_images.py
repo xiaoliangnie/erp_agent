@@ -1,6 +1,7 @@
 import base64
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from backend.product_images import ProductImageError, ProductImageService, resolve_product_image
@@ -50,6 +51,39 @@ class ProductImageServiceTests(unittest.TestCase):
                 "sku": "SKU-01", "mimeType": "image/png",
                 "imageBase64": base64.b64encode(b"not-an-image").decode("ascii"),
             })
+
+    def _age(self, job_id: str, minutes: int = 10):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        with self.service._connect() as conn:
+            conn.execute(
+                "UPDATE product_image_jobs SET claimed_at=?, updated_at=? WHERE id=?",
+                (past, past, job_id),
+            )
+
+    def test_syncing_timeout_returns_to_pending_then_rebuilds_after_max_attempts(self):
+        job = self.service.create("557593", [{"sku_id": "SKU-01", "i_id": "STYLE-01"}])
+        self.service.next("erp-one")
+        reused = self.service.create("557593", [{"sku_id": "SKU-01", "i_id": "STYLE-01"}])
+        self.assertEqual(job["id"], reused["id"])
+        self.assertEqual("syncing", reused["status"])
+
+        self._age(job["id"])
+        recovered = self.service.get(job["id"])
+        self.assertEqual("pending", recovered["status"])
+        self.assertEqual(1, recovered["attempts"])
+        same = self.service.create("557593", [{"sku_id": "SKU-01", "i_id": "STYLE-01"}])
+        self.assertEqual(job["id"], same["id"])
+
+        for _ in range(self.service.max_claim_attempts - 1):
+            claimed = self.service.next("erp-one")
+            self.assertEqual(job["id"], claimed["id"])
+            self._age(job["id"])
+            self.service.get(job["id"])
+        failed = self.service.get(job["id"])
+        self.assertEqual("failed", failed["status"])
+        rebuilt = self.service.create("557593", [{"sku_id": "SKU-01", "i_id": "STYLE-01"}])
+        self.assertNotEqual(job["id"], rebuilt["id"])
+        self.assertEqual("pending", rebuilt["status"])
 
 
 if __name__ == "__main__":

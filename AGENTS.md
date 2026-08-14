@@ -6,11 +6,12 @@ This repository contains a procurement dashboard, delivery reminder ledger, Exce
 
 ## Build, Test, and Development Commands
 
-- `npm install && npm run build` typechecks and bundles the frontend into `frontend/dist/`.
+- `npm install && npm run build` checks the payload width contract, typechecks, and bundles the frontend into `frontend/dist/`.
 - `npm run dev` starts Vite on `http://127.0.0.1:5177` and proxies `/api` to the Python server, which must be running too.
 - `.venv/bin/python server.py` serves the built pages and APIs at `http://127.0.0.1:8777/`.
 - `.venv/bin/python scripts/generate_purchase_contract.py --po-id 604264 --invoice-type special_invoice` generates one Excel contract.
 - `.venv/bin/python scripts/run_agent_cli.py --status` prints agent, forecast, and DingTalk subsystem state; drop `--status` for an interactive debug session that bypasses HTTP.
+- `.venv/bin/python scripts/health_watch.py` GETs `/api/health` and sends a DingTalk alert on database/mirror/Stream/reminder faults; `--dry-run` prints without sending.
 - `.venv/bin/python scripts/train_forecast_model.py --csv <sales.csv> --forecaster <module:Class>` trains a forecaster and writes a versioned artifact.
 - `python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py` performs a quick Python syntax check.
 
@@ -22,7 +23,7 @@ Use four spaces for Python and follow PEP 8: `snake_case` functions and variable
 
 ## Testing Guidelines
 
-Before submitting, compile Python files, run the offline suites with `.venv/bin/python -m unittest tests.test_agent tests.test_forecast tests.test_delivery_reminders tests.test_exchange tests.test_dingtalk tests.test_codex_oauth tests.test_gb_standards tests.test_contract_gb`, and run `npm run build` so the frontend passes `tsc --noEmit` (with `noUnusedLocals`) and bundles. `tests/` is not a package, so `unittest discover` does not work; list the modules explicitly. `tests/test_contracts.py` is the one suite that connects to the live database and needs credentials. There is no frontend test suite yet, so exercise the affected pages in a browser against a running `server.py` and check the console for errors. Contract changes must generate a sample workbook, scan formulas, and visually verify the full contract sheet. For parsing changes, add a focused fixture or assertions before relying on visual checks. New agent tools need coverage in `tests/test_agent.py`, and any L1/L2 tool must be verified through the full pending-action confirm flow rather than direct execution.
+Before submitting, compile Python files, run the offline suites with `.venv/bin/python -m unittest tests.test_agent tests.test_forecast tests.test_delivery_reminders tests.test_exchange tests.test_order_source tests.test_product_images tests.test_realtime_mirror tests.test_gb_standards tests.test_contract_gb tests.test_dingtalk tests.test_codex_oauth tests.test_health_watch tests.test_payload_contract tests.test_http_auth tests.test_contracts tests.test_source_cache tests.test_quality`, and run `npm run build` so the frontend passes the payload-width check, `tsc --noEmit` (with `noUnusedLocals`), and bundles. `tests/` is not a package, so `unittest discover` does not work; list the modules explicitly. Live contract assertions against purchase order 604264 are skipped unless `CONTRACT_LIVE_TESTS=1`. There is no frontend test suite yet, so exercise the affected pages in a browser against a running `server.py` and check the console for errors. Contract changes must generate a sample workbook, scan formulas, and visually verify the full contract sheet. For parsing changes, add a focused fixture or assertions before relying on visual checks. New agent tools need coverage in `tests/test_agent.py`, and any L1/L2 tool must be verified through the full pending-action confirm flow rather than direct execution.
 
 ## Commit & Pull Request Guidelines
 

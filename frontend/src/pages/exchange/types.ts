@@ -7,7 +7,8 @@ export type JobStatus =
   | "executing"
   | "done"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "stuck";
 
 export const STATUS_LABELS: Record<JobStatus, string> = {
   pending: "等待 Worker",
@@ -18,6 +19,7 @@ export const STATUS_LABELS: Record<JobStatus, string> = {
   done: "已完成",
   failed: "失败",
   cancelled: "已取消",
+  stuck: "执行中断（需人工核对）",
 };
 
 /** 还能取消的状态。 */
@@ -79,6 +81,8 @@ export interface ExchangeJob {
   result: JobResult | null;
   workerId: string | null;
   error: string | null;
+  attempts?: number;
+  claimedAt?: string | null;
   createdAt: string;
 }
 

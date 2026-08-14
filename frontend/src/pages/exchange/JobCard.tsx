@@ -52,22 +52,35 @@ function PlanTable({ job }: { job: ExchangeJob }) {
   );
 }
 
+function oidLabel(value: unknown): string {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (value && typeof value === "object" && "o_id" in value) {
+    return String((value as { o_id: unknown }).o_id ?? "");
+  }
+  return "";
+}
+
 function Progress({ job }: { job: ExchangeJob }) {
-  if (!job.progress.length && !job.result) return null;
+  const succeeded = (job.result?.succeeded ?? []).map(oidLabel).filter(Boolean);
+  const failed = (job.result?.failed ?? []).map(oidLabel).filter(Boolean);
+  if (!job.progress.length && !job.result && job.status !== "stuck") return null;
   return (
     <div className="notice">
+      {job.status === "stuck" ? (
+        <div>执行已中断，未自动重投。请先核对 ERP 里哪些订单已经改过。</div>
+      ) : null}
       {job.progress.length ? (
         job.progress.map((row) => (
           <div key={row.o_id}>
             {row.o_id}：{row.status === "success" ? "成功" : `失败 ${row.error ?? ""}`}
           </div>
         ))
-      ) : (
-        <div>任务已结束</div>
-      )}
+      ) : null}
       {job.result ? (
         <div className="small" style={{ marginTop: 7 }}>
-          完成：{(job.result.succeeded ?? []).length}，失败：{(job.result.failed ?? []).length}
+          <div>完成：{succeeded.length}，失败：{failed.length}</div>
+          {succeeded.length ? <div>已改 ERP：{succeeded.join("、")}</div> : null}
+          {failed.length ? <div>失败订单：{failed.join("、")}</div> : null}
         </div>
       ) : null}
     </div>
@@ -111,6 +124,7 @@ export function JobCard({ job, open, onToggle, onAct }: JobCardProps) {
           <div className="small">
             创建：{job.operator} · {job.createdAt}
             {job.workerId ? ` · Worker ${job.workerId}` : ""}
+            {job.attempts ? ` · 已回收 ${job.attempts} 次` : ""}
           </div>
         </div>
       ) : null}

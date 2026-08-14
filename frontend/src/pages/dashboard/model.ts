@@ -2,7 +2,7 @@ import { cssVar } from "../../lib/format";
 import { name } from "../../data/payload";
 import type { DashboardData, DashboardLine, DashboardOrder, PayloadDict } from "../../data/payload";
 import { isoMonday, shiftDays } from "./charts/geometry";
-import { TIERS, TIER_BY_KEY, isUrgent, tierOfDays } from "./tiers";
+import { TIERS, TIER_BY_KEY, tierOfDays } from "./tiers";
 import type { TierKey } from "./tiers";
 
 export interface DashFilters {
@@ -66,7 +66,7 @@ export function lineTier(line: DashboardLine, etaDays: EtaDays): TierKey | null 
 
 export interface Slice {
   rows: DashboardLine[];
-  /** 不含到货期限这一条筛选 —— 预警卡按它算，选中某档时其它档不会归零。 */
+  /** 不含到货期限这一条筛选。 */
   baseRows: DashboardLine[];
   orderIndexes: number[];
   from: string;
@@ -261,7 +261,26 @@ export function sizeMatrix(rows: DashboardLine[], dict: PayloadDict, mode: numbe
   for (const row of rowList) {
     for (const [size, qty] of row.cells) if (qty > 0) cols.add(size);
   }
-  return { cols: [...cols].sort((a, b) => Number.parseFloat(a) - Number.parseFloat(b)), rows: rowList };
+  return { cols: sortSizeCols([...cols], mode), rows: rowList };
+}
+
+const ALPHA_ORDER = [
+  "XXXS", "XXS", "XS", "S", "M", "L", "XL", "XXL", "XXXL",
+  "2XL", "3XL", "4XL", "5XL", "6XL", "均码",
+];
+
+function sortSizeCols(cols: string[], mode: number): string[] {
+  if (mode === 3) {
+    return cols.slice().sort((left, right) => {
+      const a = ALPHA_ORDER.indexOf(left);
+      const b = ALPHA_ORDER.indexOf(right);
+      if (a === -1 && b === -1) return left.localeCompare(right);
+      if (a === -1) return 1;
+      if (b === -1) return -1;
+      return a - b;
+    });
+  }
+  return cols.slice().sort((left, right) => Number.parseFloat(left) - Number.parseFloat(right));
 }
 
 export interface MixPart {
@@ -291,130 +310,6 @@ export function openMix(rows: DashboardLine[], today: string): MixPart[] {
   ];
 }
 
-export interface TierBucket {
-  k: TierKey;
-  label: string;
-  note: string;
-  color: string;
-  qty: number;
-  lines: number;
-  orders: number;
-  buyers: number;
-  due: string;
-}
-
-export interface BuyerBucket {
-  k: number;
-  name: string;
-  cells: Map<TierKey, { qty: number; orders: number }>;
-  qty: number;
-  urgent: number;
-  orders: number;
-  due: string;
-}
-
-/** 到货预警：待入库量按提醒档拆开，并落到人头上。 */
-export function alertData(
-  source: DashboardLine[],
-  orders: DashboardOrder[],
-  dict: PayloadDict,
-  etaDays: EtaDays,
-) {
-  const tiers = TIERS.map((tier) => ({
-    k: tier.k,
-    label: tier.label,
-    note: tier.note,
-    color: cssVar(tier.cssVar),
-    qty: 0,
-    lines: 0,
-    orderSet: new Set<number>(),
-    buyerSet: new Set<number>(),
-    due: "",
-  }));
-  const tierByKey = new Map(tiers.map((tier) => [tier.k, tier]));
-  const byBuyer = new Map<
-    number,
-    {
-      k: number;
-      name: string;
-      cells: Map<TierKey, { qty: number; orderSet: Set<number> }>;
-      qty: number;
-      urgent: number;
-      orderSet: Set<number>;
-      due: string;
-    }
-  >();
-
-  for (const line of source) {
-    const tierKey = lineTier(line, etaDays);
-    if (!tierKey) continue;
-    const order = orders[line.order];
-    if (!order) continue;
-    const open = line.qty - line.inQty;
-    const tier = tierByKey.get(tierKey)!;
-    tier.qty += open;
-    tier.lines += 1;
-    tier.orderSet.add(line.order);
-    tier.buyerSet.add(order.buyer);
-    if (line.eta && (!tier.due || line.eta < tier.due)) tier.due = line.eta;
-
-    let buyer = byBuyer.get(order.buyer);
-    if (!buyer) {
-      buyer = {
-        k: order.buyer,
-        name: name(dict.buyers, order.buyer),
-        cells: new Map(),
-        qty: 0,
-        urgent: 0,
-        orderSet: new Set(),
-        due: "",
-      };
-      byBuyer.set(order.buyer, buyer);
-    }
-    let cell = buyer.cells.get(tierKey);
-    if (!cell) {
-      cell = { qty: 0, orderSet: new Set() };
-      buyer.cells.set(tierKey, cell);
-    }
-    cell.qty += open;
-    cell.orderSet.add(line.order);
-    buyer.qty += open;
-    buyer.orderSet.add(line.order);
-    if (isUrgent(tierKey)) buyer.urgent += open;
-    if (line.eta && (!buyer.due || line.eta < buyer.due)) buyer.due = line.eta;
-  }
-
-  const tierBuckets: TierBucket[] = tiers.map((tier) => ({
-    k: tier.k,
-    label: tier.label,
-    note: tier.note,
-    color: tier.color,
-    qty: tier.qty,
-    lines: tier.lines,
-    orders: tier.orderSet.size,
-    buyers: tier.buyerSet.size,
-    due: tier.due,
-  }));
-
-  const buyerBuckets: BuyerBucket[] = [...byBuyer.values()]
-    .sort((a, b) => b.urgent - a.urgent || b.qty - a.qty)
-    .map((buyer) => ({
-      k: buyer.k,
-      name: buyer.name,
-      cells: new Map([...buyer.cells].map(([key, cell]) => [key, { qty: cell.qty, orders: cell.orderSet.size }])),
-      qty: buyer.qty,
-      urgent: buyer.urgent,
-      orders: buyer.orderSet.size,
-      due: buyer.due,
-    }));
-
-  return {
-    tiers: tierBuckets,
-    buyers: buyerBuckets,
-    total: tierBuckets.reduce((sum, tier) => sum + tier.qty, 0),
-    urgent: tierBuckets.filter((tier) => isUrgent(tier.k)).reduce((sum, tier) => sum + tier.qty, 0),
-  };
-}
 
 export interface OrderDue {
   due: string;

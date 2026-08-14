@@ -12,9 +12,9 @@ from .service import ExchangeError
 RULE_PATH = Path(__file__).resolve().parents[2] / "config" / "exchange-rules.json"
 
 
-@lru_cache(maxsize=1)
-def load_policy() -> dict:
-    value = json.loads(RULE_PATH.read_text(encoding="utf-8"))
+@lru_cache(maxsize=4)
+def _load_policy(path: str, mtime: float) -> dict:
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
     mappings = []
     for raw in value.get("specialMappings") or []:
         targets = [str(item).strip() for item in raw.get("targetSkus") or [] if str(item).strip()]
@@ -26,6 +26,14 @@ def load_policy() -> dict:
             "targetSkus": targets,
         })
     return {"defaultPolicy": "same_style", "specialMappings": mappings}
+
+
+def load_policy() -> dict:
+    try:
+        mtime = RULE_PATH.stat().st_mtime
+    except OSError as exc:
+        raise ExchangeError("无法读取换货规则配置") from exc
+    return _load_policy(str(RULE_PATH.resolve()), mtime)
 
 
 def public_policy() -> dict:
@@ -54,7 +62,7 @@ def enforce_replacement(source: str, target: str, source_style: str, target_styl
     if source_style != target_style:
         raise ExchangeError(
             f"普通商品只能在同一款式内换货：{source_style} ≠ {target_style}；"
-            "仅 XZ25401308-101 允许使用特殊跨款映射"
+            "仅已维护特殊映射的商品允许跨款"
         )
     return {
         "exchangeType": "same_style",

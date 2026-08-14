@@ -1,3 +1,6 @@
+from datetime import datetime, timedelta, timezone
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -69,9 +72,19 @@ class ExchangeServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(ExchangeError, first["id"]):
             self.service.create_job(overlap, operator="李四")
 
-        self.service.cancel(first["id"])
+        self.service.cancel(first["id"], "张三")
         created = self.service.create_job(overlap, operator="李四")
         self.assertEqual(["10002", "20001"], created["targets"]["o_ids"])
+
+    def test_cancel_requires_creating_operator(self):
+        job = self.create()
+        with self.assertRaisesRegex(ExchangeError, "操作人姓名"):
+            self.service.cancel(job["id"], "")
+        with self.assertRaisesRegex(ExchangeError, "创建该任务的操作人"):
+            self.service.cancel(job["id"], "李四")
+        cancelled = self.service.cancel(job["id"], "张三")
+        self.assertEqual("cancelled", cancelled["status"])
+        self.assertEqual("cancelled", self.service.cancel(job["id"], "李四")["status"])
 
     def test_confirmed_execution_is_claimed_before_new_planning(self):
         ready = self.create()
@@ -221,6 +234,145 @@ class ExchangeServiceTests(unittest.TestCase):
         })
         self.assertEqual("done", done["status"])
         self.assertEqual("SKU-01", done["result"]["items"][0]["sku_id"])
+
+    def _age(self, table: str, row_id: str, minutes: int = 10):
+        past = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat(timespec="seconds")
+        with self.service._connect() as conn:
+            conn.execute(
+                f"UPDATE {table} SET claimed_at=?, updated_at=? WHERE id=?",
+                (past, past, row_id),
+            )
+
+    def test_planning_timeout_returns_to_pending(self):
+        job = self.create()
+        claimed = self.service.next_job("erp-one")
+        self.assertEqual("planning", claimed["status"])
+        self._age("exchange_jobs", job["id"])
+        jobs = self.service.list_jobs()
+        self.assertEqual("pending", jobs[0]["status"])
+        self.assertEqual(1, jobs[0]["attempts"])
+        again = self.service.next_job("erp-two")
+        self.assertEqual(job["id"], again["id"])
+        self.assertEqual("plan", again["action"])
+
+    def test_planning_timeout_fails_after_max_attempts(self):
+        job = self.create()
+        for _ in range(self.service.max_claim_attempts):
+            claimed = self.service.next_job("erp-one")
+            self.assertIsNotNone(claimed)
+            self._age("exchange_jobs", job["id"])
+            self.service.list_jobs()
+        failed = self.service.get_job(job["id"])
+        self.assertEqual("failed", failed["status"])
+        self.assertEqual(self.service.max_claim_attempts, failed["attempts"])
+        self.assertIsNone(self.service.next_job("erp-two"))
+
+    def _confirm_execute(self, job_id: str, worker: str = "erp-one") -> dict:
+        self.service.next_job(worker)
+        self.service.report_plan(job_id, worker, {
+            "plans": [
+                {"o_id": "10001", "ok": True, "mode": "ChangeItem", "src_sku_id": "OLD-01", "new_sku_id": "NEW-01"},
+                {"o_id": "10002", "ok": False, "reason": "未找到源 SKU"},
+            ],
+        })
+        self.service.confirm(job_id, "张三")
+        return self.service.next_job(worker)
+
+    def test_executing_timeout_marks_stuck_and_alerts(self):
+        seen = []
+        self.service.on_stuck = seen.append
+        job = self.create()
+        execute = self._confirm_execute(job["id"])
+        self.assertEqual("execute", execute["action"])
+        self._age("exchange_jobs", job["id"], minutes=20)
+        listed = self.service.list_jobs()[0]
+        self.assertEqual("stuck", listed["status"])
+        self.assertEqual(1, len(seen))
+        self.assertEqual(job["id"], seen[0]["id"])
+        self.assertIsNone(self.service.next_job("erp-two"))
+
+    def test_stuck_job_does_not_block_new_job_on_same_orders(self):
+        job = self.create()
+        self._confirm_execute(job["id"])
+        self._age("exchange_jobs", job["id"], minutes=20)
+        self.service.list_jobs()
+        created = self.create()
+        self.assertNotEqual(job["id"], created["id"])
+        self.assertEqual("pending", created["status"])
+
+    def test_stuck_job_accepts_late_worker_result(self):
+        job = self.create()
+        execute = self._confirm_execute(job["id"])
+        token = execute["executionToken"]
+        self._age("exchange_jobs", job["id"], minutes=20)
+        self.service.list_jobs()
+        self.assertEqual("stuck", self.service.get_job(job["id"])["status"])
+        done = self.service.report_result(
+            job["id"], "erp-one", token,
+            {"succeeded": ["10001"], "failed": []},
+        )
+        self.assertEqual("done", done["status"])
+        self.assertEqual(["10001"], done["result"]["succeeded"])
+
+    def test_search_timeout_returns_to_pending(self):
+        search = self.service.create_search("OLD-01")
+        self.service.next_search("erp-one")
+        self._age("exchange_searches", search["id"])
+        again = self.service.next_search("erp-two")
+        self.assertEqual(search["id"], again["id"])
+        self.assertEqual("searching", again["status"])
+        self.assertEqual(1, self.service.get_search(search["id"])["attempts"])
+
+    def test_probe_timeout_returns_to_pending(self):
+        probe = self.service.create_probe("purchase_items", "628190")
+        self.service.next_probe("erp-one")
+        self._age("erp_read_probes", probe["id"])
+        again = self.service.next_probe("erp-two")
+        self.assertEqual(probe["id"], again["id"])
+        self.assertEqual("reading", again["status"])
+        self.assertEqual(1, self.service.get_probe(probe["id"])["attempts"])
+
+
+class ExchangePolicyReloadTests(unittest.TestCase):
+    def test_load_policy_picks_up_file_mtime_change(self):
+        from backend.exchange import policy as policy_mod
+
+        original = policy_mod.RULE_PATH
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "exchange-rules.json"
+            path.write_text(json.dumps({
+                "defaultPolicy": "same_style",
+                "specialMappings": [{
+                    "name": "A",
+                    "sourceSku": "SKU-A",
+                    "sourceStyle": "A",
+                    "targetStyle": "B",
+                    "targetSkus": ["T1"],
+                }],
+            }), encoding="utf-8")
+            policy_mod.RULE_PATH = path
+            policy_mod._load_policy.cache_clear()
+            try:
+                first = policy_mod.load_policy()
+                self.assertEqual("SKU-A", first["specialMappings"][0]["sourceSku"])
+                path.write_text(json.dumps({
+                    "defaultPolicy": "same_style",
+                    "specialMappings": [{
+                        "name": "B",
+                        "sourceSku": "SKU-B",
+                        "sourceStyle": "B",
+                        "targetStyle": "C",
+                        "targetSkus": ["T2", "T3"],
+                    }],
+                }), encoding="utf-8")
+                later = path.stat().st_mtime + 2
+                os.utime(path, (later, later))
+                second = policy_mod.load_policy()
+                self.assertEqual("SKU-B", second["specialMappings"][0]["sourceSku"])
+                self.assertEqual(["T2", "T3"], second["specialMappings"][0]["targetSkus"])
+            finally:
+                policy_mod.RULE_PATH = original
+                policy_mod._load_policy.cache_clear()
 
 
 if __name__ == "__main__":

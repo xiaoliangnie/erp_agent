@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """合同执行标准：排序、覆盖解析、Excel 列布局。离线，不连库。"""
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -7,11 +8,9 @@ from backend.contracts import (
     normalize_gb_overrides,
     pick_saved_standard,
     resolve_line_gb,
+    saved_gb_option,
 )
 from backend.gb_standards import category_tokens, rank_standards
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class RankStandardsTests(unittest.TestCase):
@@ -110,6 +109,17 @@ class GbOverrideTests(unittest.TestCase):
         )
         self.assertEqual("", gb["standard_no"])
 
+    def test_saved_option_uses_catalog_status_for_badge(self):
+        option = saved_gb_option(
+            {"samr_id": "dead", "standard_no": "GB/T 1-1993", "name_cn": "旧名"},
+            {"samr_id": "dead", "standard_no": "GB/T 1-1993", "name_cn": "已废止示例", "status": "废止"},
+        )
+        self.assertEqual("废止", option["status"])
+        self.assertEqual("已废止示例", option["nameCn"])
+        missing = saved_gb_option({"standard_no": "GB/T 9", "name_cn": "未入库"})
+        self.assertEqual("已保存", missing["status"])
+        self.assertEqual("GB/T 9", missing["standardNo"])
+
     def test_unknown_standard_fails_closed(self):
         with self.assertRaises(ValueError) as ctx:
             resolve_line_gb(
@@ -141,15 +151,169 @@ class GbOverrideTests(unittest.TestCase):
 
 
 class ExcelLayoutTests(unittest.TestCase):
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory(prefix="contract-gb-")
+        self.dir = Path(self._temp.name)
+
+    def tearDown(self):
+        self._temp.cleanup()
+
+    def _write(self, model, name="layout.xlsx"):
+        from backend.contract_workbook import write_contract_workbook
+        path = self.dir / name
+        write_contract_workbook(model, path)
+        return path
+
     def test_execution_standard_column_sits_after_barcode(self):
-        text = (ROOT / "scripts" / "generate_contract.mjs").read_text(encoding="utf-8")
-        self.assertIn('"国标码"', text)
-        self.assertIn('"执行标准"', text)
-        self.assertIn("=N${itemStart}*L${itemStart}", text)
-        self.assertIn("=SUM(O${itemStart}:O${itemEnd})", text)
-        self.assertIn("A1:P2", text)
-        self.assertNotIn("=M${itemStart}*K${itemStart}", text)
-        self.assertLess(text.index('"国标码"'), text.index('"执行标准"'))
+        from openpyxl import load_workbook
+        from backend.contract_workbook import layout_for, unit_price_header
+
+        png = self.dir / "dot.png"
+        png.write_bytes(
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
+            b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01"
+            b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
+        )
+        model = _sample_model(items=[
+            _sample_item(imagePath=str(png)),
+            _sample_item(
+                poiId="102", sku="SKU-B", nationalCode="ABC-01",
+                gbStandard="", imagePath=None, quantity=2, unitPrice=8.5,
+            ),
+        ])
+        path = self._write(model, "two-items.xlsx")
+        wb = load_workbook(path)
+        ws = wb["合同"]
+        layout = layout_for(2)
+        headers = [ws.cell(8, col).value for col in range(1, 17)]
+        self.assertEqual(16, len(headers))
+        self.assertEqual("国标码", headers[4])
+        self.assertEqual("执行标准", headers[5])
+        self.assertLess(headers.index("国标码"), headers.index("执行标准"))
+        self.assertEqual(unit_price_header(model["invoice"]), headers[13])
+        self.assertIn("13%", headers[13])
+        self.assertIn("专票", headers[13])
+        self.assertEqual("6901234567890", ws["E9"].value)
+        self.assertFalse(str(ws["E9"].value).startswith("="))
+        self.assertEqual("@", ws["E9"].number_format)
+        self.assertEqual("GB/T 9832-2007", ws["F9"].value)
+        self.assertEqual("ABC-01", ws["E10"].value)
+        self.assertFalse(ws["F10"].value)
+        self.assertEqual(10, ws["L9"].value)
+        self.assertEqual("=N9*L9", ws["O9"].value)
+        self.assertEqual("=N10*L10", ws["O10"].value)
+        self.assertEqual(f"=SUM(O{layout.item_start}:O{layout.item_end})", ws["O11"].value)
+        merged = {str(item) for item in ws.merged_cells.ranges}
+        self.assertIn("A1:P2", merged)
+        self.assertIn(f"A{layout.total_row}:N{layout.total_row}", merged)
+        self.assertEqual(1, len(ws._images))
+        self.assertEqual("暂无图片", ws["B10"].value)
+        self.assertIsNone(ws["B9"].value)
+        wb.close()
+
+    def test_decimal_quantity_is_written_not_truncated(self):
+        from decimal import Decimal
+        from openpyxl import load_workbook
+
+        model = _sample_model(items=[_sample_item(quantity=Decimal("100.6"))])
+        path = self._write(model, "qty-decimal.xlsx")
+        wb = load_workbook(path)
+        self.assertEqual(100.6, float(wb["合同"]["L9"].value))
+        self.assertNotEqual(100, wb["合同"]["L9"].value)
+        self.assertEqual("=N9*L9", wb["合同"]["O9"].value)
+        wb.close()
+
+    def test_no_invoice_header_and_empty_items_fail(self):
+        from openpyxl import load_workbook
+        from backend.contract_workbook import write_contract_workbook
+
+        model = _sample_model(invoice_type="no_invoice", tax_rate=0)
+        path = self._write(model, "no-invoice.xlsx")
+        wb = load_workbook(path)
+        self.assertEqual("单价（不开票）", wb["合同"]["N8"].value)
+        wb.close()
+        with self.assertRaises(ValueError):
+            write_contract_workbook({**model, "items": []}, self.dir / "empty.xlsx")
+
+    def test_missing_image_file_writes_failure_placeholder(self):
+        from openpyxl import load_workbook
+
+        model = _sample_model(items=[_sample_item(imagePath="/tmp/not-a-real-product.png")])
+        path = self._write(model, "bad-image.xlsx")
+        wb = load_workbook(path)
+        self.assertEqual("图片读取失败", wb["合同"]["B9"].value)
+        self.assertEqual(0, len(wb["合同"]._images))
+        wb.close()
+
+    def test_webp_is_converted_and_embedded(self):
+        from openpyxl import load_workbook
+        from PIL import Image
+
+        webp = self.dir / "dot.webp"
+        Image.new("RGB", (8, 8), (255, 0, 0)).save(webp, "WEBP")
+        model = _sample_model(items=[_sample_item(imagePath=str(webp))])
+        path = self._write(model, "webp.xlsx")
+        wb = load_workbook(path)
+        self.assertEqual(1, len(wb["合同"]._images))
+        self.assertIsNone(wb["合同"]["B9"].value)
+        wb.close()
+
+
+def _sample_item(**overrides):
+    item = {
+        "poiId": "101",
+        "sku": "SKU-A",
+        "styleCode": "ST-A",
+        "nationalCode": "6901234567890",
+        "gbStandard": "GB/T 9832-2007",
+        "name": "小熊",
+        "category": "毛绒",
+        "virtualCategory": "",
+        "materialProcess": "短毛绒",
+        "packaging": "袋装",
+        "quantity": 10,
+        "unit": "个",
+        "unitPrice": 21.7,
+        "remark": "",
+        "imagePath": None,
+    }
+    item.update(overrides)
+    return item
+
+
+def _sample_model(*, invoice_type="special_invoice", tax_rate=13, items=None, **overrides):
+    labels = {"no_invoice": "不开票", "normal_invoice": "普票", "special_invoice": "专票"}
+    model = {
+        "purchaseOrderNo": "604264",
+        "orderDate": "2026-06-05",
+        "deliveryDate": "2026-07-09",
+        "projectLead": "",
+        "buyer": {
+            "company_name": "杭州无际云帆文化传媒有限公司",
+            "warehouse_name": "鄂州仓",
+            "contact": "蜀黍家 13385711803",
+        },
+        "supplier": {
+            "shortName": "佰特",
+            "legalName": "测试供应商有限公司",
+            "address": "测试地址",
+            "contact": "张三 13800000000",
+        },
+        "invoice": {
+            "type": invoice_type,
+            "label": labels[invoice_type],
+            "taxRate": tax_rate,
+        },
+        "items": items or [_sample_item()],
+        "packagingTerms": "包装条款",
+        "paymentTerms": "100% - 现结\n采购单号604264",
+        "inspectionStandards": "检验条款",
+        "deliveryAddress": "送货地址全文",
+        "terms": ["1、条款一", "2、条款二"],
+        "applicant": "采购员",
+    }
+    model.update(overrides)
+    return model
 
 
 if __name__ == "__main__":

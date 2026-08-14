@@ -23,6 +23,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from statistics import NormalDist
 
+from ..business_time import business_today
 from .dataset import DemandDataset
 
 
@@ -177,13 +178,13 @@ class BaselineForecaster(Forecaster):
         self.levels = levels
         self.sigmas = sigmas
         self.trained_through = dataset.end
-        self.version = f"{dataset.end or date.today().isoformat()}-w{self.window_days}"
+        self.version = f"{dataset.end or business_today().isoformat()}-w{self.window_days}"
 
     def predict(self, keys, horizon_days: int, *, start_date=None) -> list[dict]:
         horizon_days = max(1, int(horizon_days or self.default_horizon_days))
         if not self.levels:
             raise ForecastError("模型尚未训练，无法预测")
-        first = date.fromisoformat(str(start_date)) if start_date else date.today()
+        first = date.fromisoformat(str(start_date)) if start_date else business_today()
         low = NormalDist().inv_cdf(0.1)
         high = NormalDist().inv_cdf(0.9)
         points = []
@@ -204,6 +205,7 @@ class BaselineForecaster(Forecaster):
                     "p10": round(max(0.0, p50 + low * spread), 3),
                     "p90": round(max(0.0, p50 + high * spread), 3),
                 })
+        assert_quantile_order(points)
         return points
 
     def known_keys(self) -> list[str]:
@@ -229,6 +231,22 @@ class BaselineForecaster(Forecaster):
         self.trained_through = str(state.get("trainedThrough") or "")
         self.levels = {str(key): float(value) for key, value in (state.get("levels") or {}).items()}
         self.sigmas = {str(key): float(value) for key, value in (state.get("sigmas") or {}).items()}
+
+
+def assert_quantile_order(points) -> None:
+    """p10 ≤ p50 ≤ p90，违约直接失败，不用错位区间去算安全库存。"""
+    for point in points:
+        try:
+            p10 = float(point["p10"])
+            p50 = float(point["p50"])
+            p90 = float(point["p90"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ForecastError("预测点缺少合法的 p10/p50/p90") from exc
+        if not (p10 <= p50 <= p90):
+            raise ForecastError(
+                f"分位顺序违约 {point.get('key')} {point.get('date')}: "
+                f"p10={p10} p50={p50} p90={p90}"
+            )
 
 
 def sigma_from_interval(p10: float, p90: float) -> float:

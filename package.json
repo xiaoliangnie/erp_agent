@@ -6,9 +6,11 @@
   "description": "采购看板 / 交期提醒台账 / 合同生成 / 换货 / 采购助手对话 的前端，Vite + React + TypeScript",
   "scripts": {
     "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "build": "node scripts/check_payload_contract.mjs && node scripts/check_delivery_waves.mjs && tsc --noEmit && vite build",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:payload": "node scripts/check_payload_contract.mjs",
+    "check:waves": "node scripts/check_delivery_waves.mjs"
   },
   "dependencies": {
     "react": "^19.2.8",

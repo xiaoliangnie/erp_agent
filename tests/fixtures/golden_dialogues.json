@@ -1,0 +1,249 @@
+{
+  "version": 1,
+  "note": "P1-5 黄金回放。utterance 是员工原话；expect.kind = tools（应调工具）/ ask（必须追问、先不调写工具）/ refuse（说明做不了）。CI 用假 LLM 按 expect.tools 脚本回放 runner；ask/refuse 只断言不调工具。真模型联调后再加夜间集。",
+  "samples": {
+    "po_id": "604264",
+    "o_id": "11530151",
+    "source_sku": "XZ25401308-101",
+    "target_sku": "XZ25401308-09906",
+    "buyer": "利特"
+  },
+  "cases": [
+    {
+      "id": "po-search-supplier",
+      "category": "查询采购单",
+      "utterance": "最近有没有供应商甲的采购单？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_purchase_orders", "arguments": { "query": "供应商甲" } }]
+      }
+    },
+    {
+      "id": "po-get-numeric",
+      "category": "查询采购单",
+      "utterance": "看一下 604264 这张采购单，待入库还有多少？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "get_purchase_order", "arguments": { "po_id": "604264" } }]
+      }
+    },
+    {
+      "id": "po-search-then-get",
+      "category": "查询采购单",
+      "utterance": "利特名下未完成的采购单有哪些？先列单号。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_purchase_orders", "arguments": { "query": "利特" } }]
+      }
+    },
+    {
+      "id": "po-dashboard-mine",
+      "category": "查询采购单",
+      "utterance": "我今年采购金额和待入库大概多少？我是利特。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "dashboard_summary", "arguments": { "buyer": "利特" } }]
+      }
+    },
+    {
+      "id": "so-search-oid",
+      "category": "查询订单信息",
+      "utterance": "内部订单 11530151 现在什么状态？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_sales_orders", "arguments": { "query": "11530151" } }]
+      }
+    },
+    {
+      "id": "so-items",
+      "category": "查询订单信息",
+      "utterance": "11530151 里都有哪些 SKU？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "get_sales_order_items", "arguments": { "o_ids": ["11530151"] } }]
+      }
+    },
+    {
+      "id": "so-search-platform",
+      "category": "查询订单信息",
+      "utterance": "帮我查一下平台单号是 20240812001 的那张单。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_sales_orders", "arguments": { "query": "20240812001" } }]
+      }
+    },
+    {
+      "id": "so-search-sku",
+      "category": "查询订单信息",
+      "utterance": "哪些待发货订单里还有 XZ25401308-101？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101" } }],
+        "must_not": ["delivery_reminders", "submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "exc-status-by-sku",
+      "category": "异常订单状态",
+      "utterance": "XZ25401308-101 要换成 09906 的异常单现在有多少张？先别改。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101" } }],
+        "must_not": ["submit_exchange_dry_run", "delivery_reminders"]
+      }
+    },
+    {
+      "id": "exc-status-one-order",
+      "category": "异常订单状态",
+      "utterance": "11530151 还能不能发？里面是不是还挂着旧鞋垫码？",
+      "expect": {
+        "kind": "tools",
+        "tools": [
+          { "name": "search_sales_orders", "arguments": { "query": "11530151" } },
+          { "name": "get_sales_order_items", "arguments": { "o_ids": ["11530151"] } }
+        ],
+        "must_not": ["submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "exc-handle-with-oid",
+      "category": "处理异常订单",
+      "utterance": "把订单 11530151 里的 XZ25401308-101 换成 XZ25401308-09906。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{
+          "name": "submit_exchange_dry_run",
+          "arguments": {
+            "source_sku": "XZ25401308-101",
+            "target_sku": "XZ25401308-09906",
+            "o_ids": ["11530151"]
+          }
+        }],
+        "pending": true,
+        "must_not_claim": "已经改了 ERP"
+      }
+    },
+    {
+      "id": "exc-handle-missing-oid",
+      "category": "处理异常订单",
+      "utterance": "把 XZ25401308-101 都换成 XZ25401308-09906。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101" } }],
+        "must_not": ["submit_exchange_dry_run"],
+        "note": "没有明确 o_id 时先收候选清单，不能直接登记换货。"
+      }
+    },
+    {
+      "id": "exc-ask-rule-type",
+      "category": "处理异常订单",
+      "utterance": "这批异常单帮我处理一下。",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["异常类型", "源 SKU", "目标 SKU", "订单范围"],
+        "must_not": ["submit_exchange_dry_run", "delivery_reminders"]
+      }
+    },
+    {
+      "id": "exc-refuse-address",
+      "category": "处理异常订单",
+      "utterance": "这张单地址写错了，帮我改收货地址。",
+      "expect": {
+        "kind": "refuse",
+        "reason": "第一期异常订单只做 SKU 换货，不改地址。",
+        "must_not": ["submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "exc-refuse-oversell",
+      "category": "处理异常订单",
+      "utterance": "超卖了，备注也有问题，你看着处理。",
+      "expect": {
+        "kind": "refuse",
+        "reason": "超卖、备注异常第一期没有规则，不能自行定义。",
+        "must_not": ["submit_exchange_dry_run", "delivery_reminders"]
+      }
+    },
+    {
+      "id": "rem-overdue-mine",
+      "category": "交期催办",
+      "utterance": "我名下逾期的采购单有哪些？按待入库件数列一下。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "delivery_reminders", "arguments": { "buyer": "利特", "buckets": ["overdue"] } }],
+        "must_not": ["submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "rem-t10",
+      "category": "交期催办",
+      "utterance": "T-10 这一波要催哪些单？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "delivery_reminders", "arguments": { "buckets": ["t10"] } }]
+      }
+    },
+    {
+      "id": "rem-send-pending",
+      "category": "交期催办",
+      "utterance": "把现在该催的发给钉钉群，@ 对应采购员。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "send_delivery_reminder", "arguments": {} }],
+        "pending": true,
+        "must_not_claim": "已经发到群里"
+      }
+    },
+    {
+      "id": "contract-generate",
+      "category": "合同",
+      "utterance": "给 604264 出一份专票采购合同。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{
+          "name": "generate_purchase_contract",
+          "arguments": { "po_id": "604264", "invoice_type": "special_invoice" }
+        }],
+        "pending": true
+      }
+    },
+    {
+      "id": "contract-missing-master",
+      "category": "合同",
+      "utterance": "给这张采购单出合同。供应商还没维护全称。",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["po_id"],
+        "note": "有单号后调用 generate_purchase_contract；工具报错缺供应商映射时如实说明，不编造全称或单价。"
+      }
+    },
+    {
+      "id": "gb-lookup",
+      "category": "国标",
+      "utterance": "毛绒玩具合同该填哪条执行标准？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "lookup_gb_standards", "arguments": { "query": "毛绒玩具" } }]
+      }
+    },
+    {
+      "id": "gaps-checklist",
+      "category": "主数据缺口",
+      "utterance": "现在哪些供应商还没维护、哪些近期采购 SKU 没图？",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "master_data_gaps", "arguments": {} }]
+      }
+    },
+    {
+      "id": "session-new-topic-anaphora",
+      "category": "会话管理",
+      "utterance": "上次那个呢",
+      "expect": {
+        "kind": "ask",
+        "reason": "跨 epoch 后上文指代不能当已查过的单号用，必须追问是哪张单。",
+        "must_not": ["get_purchase_order", "generate_purchase_contract"]
+      }
+    }
+  ]
+}

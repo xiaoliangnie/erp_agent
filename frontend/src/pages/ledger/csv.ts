@@ -10,8 +10,10 @@ const HEAD = [
 ];
 
 const quote = (value: unknown): string => {
-  const text = value == null ? "" : String(value);
-  return /[",\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  let text = value == null ? "" : String(value);
+  text = text.replace(/\r/g, "");
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return /[",\n\t]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 };
 
 /** 一行一个采购单：给到人、给到期限、给到下一次该什么时候催。 */
@@ -37,7 +39,7 @@ export function exportReminderCsv(
         order.eta || "",
         order.etaSource || "",
         next ? dayIso(next.day) : stamp.done || !plan ? "" : "已到最后一波，逐日追",
-        order.no,
+        `\t${order.no}`,
         order.date,
         name(dict.suppliers, order.supplier),
         order.product,

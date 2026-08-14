@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { TopBar } from "../../components/TopBar";
 import { errorText, exchangeApi } from "../../api/client";
 import { useCredentials } from "../../hooks/useCredentials";
+import { newId } from "../../lib/id";
 import type { ExchangeJob, ExchangeOrderItems, ExchangeOrderSearch, ExchangePolicy, ExchangeProduct, ExchangeStatus } from "./types";
 import { JobCard } from "./JobCard";
 import "./exchange.css";
@@ -32,6 +33,7 @@ export default function ExchangePage() {
   const [sourceProduct, setSourceProduct] = useState<ExchangeProduct | null>(null);
   const [orderItems, setOrderItems] = useState<ExchangeOrderItems | null>(null);
   const [form, setForm] = useState({ source: "", target: "", oids: "" });
+  const [pollStale, setPollStale] = useState(false);
 
   // 轮询回调里要读最新凭证，又不想因为凭证变化重启定时器。
   const credentialsRef = useRef(credentials);
@@ -46,6 +48,7 @@ export default function ExchangePage() {
     ]);
     setStatus(next);
     setJobs(list.jobs);
+    setPollStale(false);
   }, []);
 
   const loadProducts = useCallback(async (query: string) => {
@@ -125,7 +128,7 @@ export default function ExchangePage() {
     if (!connected) return;
     const timer = window.setInterval(() => {
       refresh().catch(() => {
-        // 轮询失败不打扰操作，页面保持上一次的状态。
+        setPollStale(true);
       });
     }, POLL_MS);
     return () => window.clearInterval(timer);
@@ -230,7 +233,7 @@ export default function ExchangePage() {
           operator: credentials.operator.trim(),
         },
         credentials,
-        { headers: { "Idempotency-Key": crypto.randomUUID() } },
+        { headers: { "Idempotency-Key": newId() } },
       );
       setForm((current) => ({ ...current, oids: "" }));
       setSelectedOids([]);
@@ -243,6 +246,12 @@ export default function ExchangePage() {
   }
 
   async function act(jobId: string, action: "confirm" | "cancel") {
+    if (
+      action === "cancel" &&
+      !window.confirm("取消该换货任务？未执行的试算和确认都会作废。")
+    ) {
+      return;
+    }
     if (
       action === "confirm" &&
       !window.confirm("确认按当前 dry-run 清单执行真实换货？该操作会修改 ERP 订单，且不会自动重试。")
@@ -262,8 +271,21 @@ export default function ExchangePage() {
 
   return (
     <>
-      <TopBar title="订单 SKU 换货" sub="dry-run 试算，人工确认后才动 ERP" />
+      <TopBar
+        title="订单 SKU 换货"
+        sub={connected && !online ? "ERP Worker 离线，任务不会执行" : "dry-run 试算，人工确认后才动 ERP"}
+      />
       <main className="exchange-layout">
+        {connected && pollStale ? (
+          <div className="notice exchange-stale" role="status">
+            状态可能过时，轮询失败。页面仍显示上一次结果，请检查网络后等待自动刷新。
+          </div>
+        ) : null}
+        {connected && !online ? (
+          <div className="notice exchange-offline" role="alert">
+            ERP Worker 离线，换货任务不会执行。请打开已登录聚水潭的浏览器油猴脚本。
+          </div>
+        ) : null}
         <section className="panel">
           <div className="panel-head">
             <strong>新建换货任务</strong>
@@ -317,7 +339,23 @@ export default function ExchangePage() {
           <form onSubmit={submit}>
             <div className="notice exchange-policy">
               <b>系统强制规则</b>
-              <div>源 SKU 为 XZ25401308-101 时，只能选择已维护的 14 个目标 SKU；其他商品只能在相同款式编码内换货。</div>
+              {policy ? (
+                <>
+                  {policy.specialMappings.map((item) => (
+                    <div key={item.sourceSku}>
+                      源 SKU 为 {item.sourceSku} 时，只能选择已维护的 {item.targetSkus.length} 个目标 SKU
+                      {item.name ? `（${item.name}）` : ""}。
+                    </div>
+                  ))}
+                  <div>
+                    {policy.specialMappings.length
+                      ? "其他商品只能在相同款式编码内换货。"
+                      : "所有商品只能在相同款式编码内换货。"}
+                  </div>
+                </>
+              ) : (
+                <div>连接后读取换货规则。未连接时仍按同款式限制提交，服务端会再校验一遍。</div>
+              )}
             </div>
             <div className="field order-picker">
               <label htmlFor="order-search">第 1 步：从订单库选择订单</label>
@@ -446,7 +484,7 @@ export default function ExchangePage() {
             <small>页面每 3 秒刷新</small>
           </div>
           <p className="small" style={{ margin: "6px 0 16px" }}>
-            ERP 标签页离线时，任务会安全停留在队列中。
+            ERP 标签页离线时，试算任务约 5 分钟后会退回队列重试；已开始改 ERP 的任务超时后标为中断，不会自动重投。
           </p>
           <div className="jobs">
             {!connected ? (

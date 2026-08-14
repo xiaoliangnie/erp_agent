@@ -160,7 +160,7 @@ Anthropic 把系统分成两类：**工作流**（代码规定步骤，中间可
 | 路径 | 编排在哪 | LLM 是否参与 |
 |---|---|---|
 | 看看板 / 导出台账 CSV | 前端直接打 `/api/dashboard` `/api/delivery` | 否 |
-| 生成合同 | `/contract` → `contracts.py` → Node 渲染 | 否（对话里走同一函数，但是 L1 确认） |
+| 生成合同 | `/contract` → `contracts.py` → openpyxl 写表 | 否（对话里走同一函数，但是 L1 确认） |
 | 订单异常 / 换货 | `/exchange` + userscript 队列；对话可定位候选并登记 dry-run | 定位与话术可以走 LLM；筛单规则和 ERP 写入不行 |
 | 每日催办 | `DINGTALK_REMINDER_ENABLED` 定时任务 | 否 |
 | 「张三名下逾期还有哪些」「把这张单做成专票合同」 | `AgentRunner` 工具循环 | 是 |
@@ -200,8 +200,9 @@ Anthropic 把系统分成两类：**工作流**（代码规定步骤，中间可
 ### 5.3 评测：工具用例不够，对话要有黄金回放
 
 `tests/test_agent.py` 覆盖注册表、确认流、换货消歧，**不调用真模型**，这层必须保住。
-缺的是「员工原话 → 期望选哪个工具、入参是什么、缺参时必须追问」的回放集。先做 20 条左右，
-用假 LLM 按脚本吐 `tool_calls`，CI 里跑；真模型联调后再加一个可关的夜间集。
+缺的是「员工原话 → 期望选哪个工具、入参是什么、缺参时必须追问」的回放集。夹具在
+`tests/fixtures/golden_dialogues.json`（约 20 条），CI 用假 LLM 按脚本吐 `tool_calls`
+跑 `GoldenReplayTests`；真模型联调后再加一个可关的夜间集。
 
 最低要覆盖的场景（与当前 system prompt 里的硬约束对应）：
 
@@ -345,7 +346,7 @@ o_id 清单**，确认针对的就是这份清单，不存在"大概换一批"�
 | 环节 | 在哪 | 说明 |
 |---|---|---|
 | 配置界面 | Agent 系统 | 商品数据先用采购明细出现过的 SKU + `config/products.json`；商品主数据表进实时库后切换 |
-| 任务队列 / 确认 / 审计 | 服务端 | 状态机 pending → planning → awaiting_confirm → executing → done/failed；确认走 §5 pending-action |
+| 任务队列 / 确认 / 审计 | 服务端 | 状态机 pending → planning → awaiting_confirm → executing → done/failed/`stuck`；试算领取超时退回 pending，执行超时标 `stuck` 不重投；确认走 §5 pending-action |
 | 订单解析 / 试算 / 执行 | ERP 页内 worker | `plan.py`/`rules.py` 规则匹配移植成 JS；`engine.py` 的页面 JS 片段直接复用 |
 | 全自动（无人值守） | 后续可选 | Playwright 只当浏览器宿主：`page.evaluate()` 注入同一段 worker JS，仍走 `_ACP` 接口级调用，**速度与油猴相同、不是模拟点击**；代价是要维护专用账号登录态（扫码、续期、风控），不进第一期 |
 
@@ -426,7 +427,8 @@ ERP 镜像库只读；禁止模型生成或执行任意 SQL，每项查询对应
 | `generated_contracts` / `notification_deliveries` | 合同产物与通知投递结果 |
 | `approval_requests` | L3 审批（后期） |
 
-供应商/商品/人员映射后续从 JSON 迁移为带版本与修改人的业务表；历史合同保留生成时的映射快照。
+供应商/商品/人员映射后续从 JSON 迁移为带版本与修改人的业务表（P2，迁专用机器后；
+单价仍只认配置或 ERP）；历史合同保留生成时的映射快照。
 
 ## 11. 部署与运行形态
 
@@ -436,8 +438,9 @@ ERP 镜像库只读；禁止模型生成或执行任意 SQL，每项查询对应
 2. 钉钉 Stream 客户端线程（自带事件循环，断线重连不影响网页链路）；
 3. 任务工作线程：执行确认后的长任务（合同渲染、换货执行），带失败重试。
 
-模型训练离线跑（cron / 定时任务），服务端只读工件。`/api/health` 扩展为逐子系统状态：
-db / llm / dingtalk / forecast 工件版本。DB、LLM、钉钉调用全部设超时。
+模型训练离线跑（cron / 定时任务），服务端只读工件。`/api/health` 给出库连通、镜像滞后、
+国标同步、换货、Agent、预测工件和钉钉 Stream / 催办状态。`scripts/health_watch.py`
+每 5 分钟拉一次，异常发钉钉，不另建监控系统。DB、LLM、钉钉调用全部设超时。
 部署已确认：**先跑在一台常开的办公台式机上**，后续可能迁服务器——配置全走 `.env`，
 不写死路径和地址，保证可迁移。固定内网 IP，systemd（Linux）或注册系统服务（Windows）
 自启，防火墙只放办公网段；钉钉 Stream 模式不需要公网回调，台式机部署即可用。
@@ -470,7 +473,7 @@ FORECAST_MODEL_DIR=data/models         # 模型工件目录（gitignored）
 | 3. 预测子系统 | 销售/库存表进实时数据库 → `dataset` → Baseline Forecaster + 训练脚本 + `/api/forecast/*` + 订货建议工具 | **接口与链路已实现**；**等销售/库存表与训练好的模型**，接入方式见 `docs/预测模型接入.md` |
 | 4. 钉钉接入 | Stream 客户端、`staff_bindings`、消息幂等；先开只读、合同预览与定时催办推送，再放开确认类动作 | **代码已就绪**：`scripts/run_dingtalk_cli.py`、群内「绑定 姓名」、启动日志。待填 AppKey/Secret 并拉机器人进群后验收 |
 | 5. 换货接入 | 换货配置页 + SQLite 任务队列 + ERP userscript。组合筛选待销售订单库接入后开放 | **第一版已实现**；待在真实 ERP 测试环境完成一次人工确认验收 |
-| 6. 对话硬化（本轮补进路线） | 工具结果信封（§5.2）；黄金回放（§5.3）；`staff_bindings` 校验网页 `operator`；**订单异常候选**：给 `search_sales_orders` 补 status/date/shop + 源 SKU 组合筛选（默认待发货），把范围收成 `o_id` 清单；L0 `master_data_gaps` | **未开始**。换货写入仍是 L1 dry-run + 换货页二次确认。合同主数据仍先靠人工补 `config/*.json` |
+| 6. 对话硬化（本轮补进路线） | 工具结果信封（§5.2）；黄金回放（§5.3）；`staff_bindings` 校验网页 `operator`；**订单异常候选**：给 `search_sales_orders` 补 status/date/shop + 源 SKU 组合筛选（默认待发货），把范围收成 `o_id` 清单；L0 `master_data_gaps` | **黄金回放 / 网页 operator 校验 / `master_data_gaps` / 台账发送提醒已落地**。换货写入仍是 L1 dry-run + 换货页二次确认。工具结果信封、订单候选筛选的 status/date/shop 仍待做 |
 | 7. 运维硬化 | 监控告警、失败重试、备份、L3 审批流 | 按需 |
 
 阶段 3 的数据同步与阶段 1–2 无依赖，可并行准备；阶段 4 的定时催办推送不依赖 LLM 和
@@ -481,25 +484,25 @@ Agent 核心，`DINGTALK_REMINDER_ENABLED=true` 即可单独上线（§15 待定
 1. **Agent 业务库第一阶段用本地 SQLite**（`AGENT_DATABASE_PATH`，默认 `data/agent.sqlite3`），
    不是 §10 写的 MySQL 独立 schema。表名、字段和状态机与 §10 一致，连接与建表集中在
    `backend/agent/store.py` 一处，迁到 MySQL 只换这一层，`sessions.py` / `actions.py` /
-   `audit.py` 的调用面不变。理由：与已上线的换货任务队列保持一致，且离线可测（59 个用例
-   不需要任何凭证）。
+   `audit.py` 的调用面不变。**换 MySQL 是 P2，迁到专用机器之后再做**（与镜像库同一套备份）。
+   理由：与已上线的换货任务队列保持一致，且离线可测。
 2. **`backend/agent/store.py` 是本文档 §4 代码布局之外新增的模块**，承担三个模块共享的
    连接与 schema，避免同一套建表语句抄三遍。
 
-## 14. 可扩展功能预留（已确认全部留口，本期不实现）
+## 14. 可扩展功能预留（迁专用机器之后的 P2；本期不实现）
 
 | 功能 | 数据来源 | 预留的口 |
 |---|---|---|
 | 供应商绩效评价 | 现有采购主表/明细（交期达成率、逾期率、入库速度） | 工具注册表留 `supplier_scorecard` 只读工具位；指标口径届时在 README 口径章节定义 |
-| 库存预警与滞销分析 | 库存表（与预测同一数据前提） | 复用 `forecast/dataset.py` 的库存特征；推送复用催办链路，多一类消息模板 |
-| 价格异常监控 | 现有采购明细（同 SKU 历史价、跨供应商比价） | 只读工具位 `price_watch`；异常规则做成阈值配置，不做模型 |
-| 自动创建采购单草稿 | 订货建议单 + ERP 写接口（或页面接口） | L2/L3 写操作，`pending_actions` 确认流直接复用；执行载体届时二选一（同换货的 userscript 路线 / ERP 开放接口）。**没有写接口之前不准用模型「假装下单」** |
-| 主数据缺口汇总 | 现有采购单 + `config/suppliers.json` / 图片缓存 | L0 工具位 `master_data_gaps`：最近 N 天采购涉及的供应商未维护、SKU 无图、合同预览会失败的原因。推送复用催办模板 |
+| 库存预警与滞销分析 | — | **取消**，不再占位 |
+| 价格异常监控 | — | **取消**，不再占位 |
+| 自动创建采购单草稿 | — | **取消**，不再占位 |
+| 主数据缺口汇总 | 现有采购单 + `config/suppliers.json` / 图片缓存 | L0 工具 `master_data_gaps`：最近 N 天采购涉及的供应商未维护、SKU 无图、票种缺价、分类未映射国标目录族。输出催办风格 markdown |
 | MCP 适配器 | 现有 `ToolRegistry.schemas()` | 可选：把同一张注册表暴露成 MCP server，供 Cursor 等客户端发现。handler、风险级、确认流全部不改。**不作为运行时替换** |
 
 预留原则：只在工具注册表、表结构和风险分级里占位，不提前写实现；上线任何一项都是按
-§5 的注册表加工具，不改 Agent Core。`RESERVED_TOOLS` 里的占位保持不写 handler，
-`master_data_gaps` 进阶段 6 时再 `registry.register`。
+§5 的注册表加工具，不改 Agent Core。`RESERVED_TOOLS` 目前只留 `supplier_scorecard`。
+`master_data_gaps` 已在阶段 6 注册为 L0。
 
 ## 15. 待定问题（grillme 拷问记录，敲定后移入正文）
 

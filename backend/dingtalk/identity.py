@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """采购员 ↔ 钉钉身份映射。
 
-只用于群内 @ 到人（架构方案 §9：员工同权，第一期不做角色矩阵），不承担权限判定。
-数据落 Agent 业务库 `staff_bindings`，也可以用 `config/staff_bindings.json` 做初始种子。
+用于群内 @ 到人，以及网页 L1/L2 判断署名是否为已知员工（架构方案 §9：员工同权，
+第一期不做角色矩阵）。数据落 Agent 业务库 `staff_bindings`，也可以用
+`config/staff_bindings.json` 做初始种子。
 同一人在 ERP 里可能有花名和「真名（花名）」两套署名，绑定任一即可 @ 到。
 """
 from __future__ import annotations
@@ -71,6 +72,16 @@ class StaffDirectory:
             rows = conn.execute("SELECT * FROM staff_bindings ORDER BY buyer_name").fetchall()
         return [self._row(row) for row in rows]
 
+    def known_operator(self, operator: str) -> bool:
+        """网页署名是否对应绑定表里的采购员/钉钉姓名（空表失败关闭）。"""
+        name = str(operator or "").strip()
+        if not name:
+            return False
+        for item in self.list():
+            if buyer_names_equivalent(name, item["buyerName"], include_nick=True):
+                return True
+        return False
+
     def resolve(self, buyer_names) -> dict:
         """把采购员姓名换成钉钉 userId / 手机号，并列出未绑定的人。
 
@@ -98,7 +109,7 @@ class StaffDirectory:
             if item["buyerName"] == name:
                 return item
         for item in bindings:
-            if buyer_names_equivalent(name, item["buyerName"]):
+            if buyer_names_equivalent(name, item["buyerName"], include_nick=True):
                 return item
         return {}
 

@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """从实时 ERP 数据组装并生成采购合同。"""
 import json
+import math
 import os
 import shutil
 import subprocess
 import tempfile
-from datetime import date, datetime
-from decimal import Decimal
+import threading
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .business_time import business_now
+from .contract_workbook import write_contract_workbook
 from .database import connect, fetch_contract_order, load_all_env
 from .gb_standards import (
     CONTRACT_GB_STATUSES,
@@ -26,7 +28,6 @@ from .product_images import resolve_product_image
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "config"
-GENERATOR = ROOT / "scripts" / "generate_contract.mjs"
 PROJECT_ENV = load_all_env(ROOT / ".env") if (ROOT / ".env").exists() else {}
 CONTRACT_GB_TABLE = "contract_line_gb"
 CONTRACT_GB_SCHEMA = f"""
@@ -83,17 +84,34 @@ def contract_setting(name, default=""):
     return os.environ.get(name, PROJECT_ENV.get(name, default))
 
 
-def plain(value):
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (date, datetime)):
-        return value.isoformat()
-    return value
-
-
 def day(value):
     value = str(value or "")
     return value[:10] if len(value) >= 10 else ""
+
+
+def parse_quantity(value, *, field="数量"):
+    """把 ERP 数量收成 Decimal，保留小数；空当 0，负数拒绝。禁止 int() 截断。"""
+    if value is None or value == "":
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        qty = value
+    elif isinstance(value, bool):
+        raise ValueError(f"{field}不是合法数字：{value}")
+    elif isinstance(value, int):
+        qty = Decimal(value)
+    else:
+        text = str(value).strip()
+        if not text:
+            return Decimal("0")
+        try:
+            qty = Decimal(text)
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"{field}不是合法数字：{value}") from None
+    if not qty.is_finite():
+        raise ValueError(f"{field}不是合法数字：{value}")
+    if qty < 0:
+        raise ValueError(f"{field}不能为负数")
+    return qty
 
 
 def invoice_term(invoice_type, tax_rate):
@@ -108,6 +126,29 @@ def invoice_term(invoice_type, tax_rate):
         f"本订货单签署时约定开具{invoice_name}，税率为{rate}。若适用的增值税率发生变化的，该增值税金额"
         "应按届时税率相应调整，本合同约定的不含税价保持不变，供方未按要求开票的，购买方可延迟付款直至供方开票；"
     )
+
+
+_PREVIEW_SLOTS = threading.BoundedSemaphore(2)
+BUYER_REQUIRED = ("company_name", "delivery_address", "packaging_terms", "inspection_standards")
+
+
+def normalize_price_overrides(raw):
+    if raw is None or raw == {}:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("priceOverrides 必须是对象")
+    overrides = {}
+    for key, value in raw.items():
+        sku = str(key or "").strip()
+        if not sku:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+            raise ValueError(f"单价覆盖 {sku} 必须是数字")
+        price = float(value)
+        if not math.isfinite(price) or price <= 0:
+            raise ValueError(f"单价覆盖 {sku} 必须是有限正数")
+        overrides[sku] = price
+    return overrides
 
 
 def normalize_gb_overrides(raw):
@@ -258,6 +299,20 @@ def persist_contract_gb(env_path, po_id, items):
             raise
 
 
+def saved_gb_option(saved: dict, catalog: dict | None = None) -> dict:
+    """已保存但不在现行/即将实施候选里的执行标准：带上目录里的真实状态，便于角标。"""
+    catalog = catalog or {}
+    status = str(catalog.get("status") or "").strip() or "已保存"
+    return {
+        "samrId": str(catalog.get("samr_id") or saved.get("samr_id") or ""),
+        "standardNo": str(catalog.get("standard_no") or saved.get("standard_no") or ""),
+        "nameCn": str(catalog.get("name_cn") or saved.get("name_cn") or ""),
+        "status": status,
+        "nature": str(catalog.get("nature") or ""),
+        "stdType": str(catalog.get("std_type") or ""),
+    }
+
+
 def _family_rows(env_path, family_ids, cache):
     key = tuple(family_ids)
     if key not in cache:
@@ -299,20 +354,15 @@ def get_contract_options(po_id, env_path=None):
         gb_standard = str(saved.get("standard_no") or "")
         allowed = {option["standardNo"] for option in gb_options}
         if gb_standard and gb_standard not in allowed:
-            gb_options = [{
-                "samrId": str(saved.get("samr_id") or ""),
-                "standardNo": gb_standard,
-                "nameCn": str(saved.get("name_cn") or ""),
-                "status": "已保存",
-                "nature": "",
-                "stdType": "",
-            }] + gb_options
+            gb_options = [
+                saved_gb_option(saved, lookup_standard_by_no(env_path, gb_standard)),
+            ] + gb_options
         items.append({
             "poiId": poi_id,
             "sku": sku,
             "styleCode": style,
             "name": str(item.get("name") or ""),
-            "quantity": int(float(item.get("qty") or 0)),
+            "quantity": float(parse_quantity(item.get("qty"))),
             "inQuantity": int(float(item.get("in_qty") or 0)),
             "erpPrice": float(item.get("price") or 0),
             "prices": product.get("prices") or {},
@@ -352,12 +402,17 @@ def get_contract_options(po_id, env_path=None):
     }
 
 
-def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=None, gb_overrides=None, env_path=None):
+def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=None,
+                         gb_overrides=None, env_path=None, fetched=None,
+                         saved_gb=None, gb_lookup=None):
     """把 ERP、供应商字典和产品补充资料合并成合同模型。"""
     if invoice_type not in INVOICE_LABELS:
         raise ValueError("票种只能是 no_invoice、normal_invoice 或 special_invoice")
     env_path = env_path or str(ROOT / "hanli.env")
-    order, erp_items = fetch_contract_order(po_id, env_path)
+    if fetched is None:
+        order, erp_items = fetch_contract_order(po_id, env_path)
+    else:
+        order, erp_items = fetched
     buyers = load_json("buyers.json")
     suppliers = load_json("suppliers.json")
     products = load_json("products.json")
@@ -374,17 +429,28 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
     default_rate = configured_rate if configured_rate is not None else DEFAULT_INVOICE_RATES[invoice_type]
     rate_value = tax_rate if tax_rate is not None else default_rate
     selected_rate = float(rate_value)
-    if selected_rate < 0 or selected_rate > 100:
+    if not math.isfinite(selected_rate) or selected_rate < 0 or selected_rate > 100:
         raise ValueError("税率必须在 0% 到 100% 之间")
 
     warehouse_key = str(order.get("send_address") or "").strip()
     buyer = (buyers.get("warehouses") or {}).get(warehouse_key, buyers["default"])
-    overrides = price_overrides or {}
+    missing_buyer = [key for key in BUYER_REQUIRED if not str(buyer.get(key) or "").strip()]
+    if missing_buyer:
+        raise ValueError("买方资料缺少字段：" + "、".join(missing_buyer))
+    payment_key = order.get("payment_method")
+    if payment_key not in PAYMENT_METHODS:
+        raise ValueError("付款方式未维护，不能生成合同")
+    overrides = normalize_price_overrides(price_overrides)
     gb_overrides = normalize_gb_overrides(gb_overrides)
     sku_ids = [str(item.get("sku_id") or "").strip() for item in erp_items]
-    line_saves, sku_saves = load_saved_line_gb(env_path, str(order["po_id"]), sku_ids)
+    if saved_gb is None:
+        line_saves, sku_saves = load_saved_line_gb(env_path, str(order["po_id"]), sku_ids)
+    else:
+        line_saves, sku_saves = saved_gb
 
     def lookup(standard_no):
+        if gb_lookup is not None:
+            return gb_lookup(standard_no)
         return lookup_standard_by_no(env_path, standard_no)
 
     items = []
@@ -398,9 +464,14 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
         if price is None:
             price = (product.get("prices") or {}).get(invoice_type)
         if price is None and supplier.get("erp_price_mode") == invoice_type:
+            if not product:
+                raise ValueError(f"商品 {sku} 未维护商品档案，不能用 ERP 价")
             price = erp_item.get("price")
         if price is None:
             raise ValueError(f"商品 {sku} 尚未维护“{INVOICE_LABELS[invoice_type]}”单价")
+        unit = str(product.get("unit") or "").strip()
+        if not unit:
+            raise ValueError(f"商品 {sku} 未维护单位")
         eta = day(erp_item.get("delivery_date"))
         if eta:
             delivery_dates.append(eta)
@@ -422,8 +493,8 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
             "virtualCategory": str(product.get("virtual_category") or ""),
             "materialProcess": str(product.get("material_process") or erp_item.get("properties_value") or ""),
             "packaging": str(product.get("packaging") or ""),
-            "quantity": int(float(erp_item.get("qty") or 0)),
-            "unit": str(product.get("unit") or "个"),
+            "quantity": parse_quantity(erp_item.get("qty")),
+            "unit": unit,
             "unitPrice": float(price),
             "remark": str(erp_item.get("remark") or ""),
             "imagePath": image["path"],
@@ -435,7 +506,7 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
     terms = BASE_TERMS.copy()
     terms[3] = invoice_term(invoice_type, selected_rate)
     delivery_date = max(delivery_dates) if delivery_dates else ""
-    payment = PAYMENT_METHODS.get(order.get("payment_method"), str(order.get("payment_method") or "待维护付款方式"))
+    payment = PAYMENT_METHODS[payment_key]
     return {
         "purchaseOrderNo": str(order["po_id"]),
         "orderDate": day(order.get("po_date")),
@@ -454,17 +525,17 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
             "taxRate": selected_rate,
         },
         "items": items,
-        "packagingTerms": buyer.get("packaging_terms", ""),
+        "packagingTerms": buyer["packaging_terms"],
         "paymentTerms": f"{payment}\n采购单号{order['po_id']}",
-        "inspectionStandards": buyer.get("inspection_standards", ""),
-        "deliveryAddress": buyer.get("delivery_address", warehouse_key),
+        "inspectionStandards": buyer["inspection_standards"],
+        "deliveryAddress": buyer["delivery_address"],
         "terms": [f"{index + 1}、{term}" for index, term in enumerate(terms)],
         "applicant": str(order.get("purchaser_name") or ""),
     }
 
 
 def generate_contract(po_id, invoice_type, output_path, *, tax_rate=None, price_overrides=None, gb_overrides=None, preview_path=None, env_path=None):
-    """生成最终 Excel；电子表格写入由 artifact-tool 完成。"""
+    """生成最终 Excel；电子表格由 openpyxl 在进程内写入。"""
     env_path = env_path or str(ROOT / "hanli.env")
     model = build_contract_model(
         po_id, invoice_type, tax_rate=tax_rate,
@@ -472,30 +543,11 @@ def generate_contract(po_id, invoice_type, output_path, *, tax_rate=None, price_
     )
     persist_contract_gb(env_path, po_id, model["items"])
     output_path = Path(output_path).resolve()
+    outputs_root = (ROOT / "outputs").resolve()
+    if outputs_root not in output_path.parents and output_path.parent != outputs_root:
+        raise ValueError("合同输出路径必须位于 outputs/ 下")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    input_path = output_path.with_suffix(".contract-input.json")
-    input_path.write_text(json.dumps(model, ensure_ascii=False, indent=2, default=plain), encoding="utf-8")
-    node = contract_setting("CONTRACT_NODE") or shutil.which("node")
-    if not node:
-        raise RuntimeError("未找到 Node.js，无法生成采购合同")
-    process_env = os.environ.copy()
-    artifact_tool = contract_setting("CONTRACT_ARTIFACT_TOOL_PATH")
-    if artifact_tool:
-        artifact_path = Path(artifact_tool).expanduser().resolve()
-        if not artifact_path.is_file():
-            raise RuntimeError(f"CONTRACT_ARTIFACT_TOOL_PATH 不存在：{artifact_path}")
-        process_env["CONTRACT_ARTIFACT_TOOL_PATH"] = str(artifact_path)
-    command = [node, str(GENERATOR), str(input_path), str(output_path)]
-    try:
-        completed = subprocess.run(
-            command, cwd=ROOT, env=process_env, check=False,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        if completed.returncode != 0:
-            detail = (completed.stderr or completed.stdout or "未知错误").strip()
-            raise RuntimeError(f"采购合同 Excel 写入失败：{detail[-2000:]}")
-    finally:
-        input_path.unlink(missing_ok=True)
+    write_contract_workbook(model, output_path)
     if preview_path:
         render_contract_preview(output_path, preview_path)
     return output_path
@@ -516,20 +568,32 @@ def render_contract_preview(xlsx_path, preview_path):
         fontconfig = "/opt/homebrew/etc/fonts/fonts.conf"
     if fontconfig:
         process_env["FONTCONFIG_FILE"] = fontconfig
-    with tempfile.TemporaryDirectory(prefix="contract-preview-") as temp_dir:
-        subprocess.run([
-            soffice, "--headless", "--convert-to",
-            'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}',
-            "--outdir", temp_dir, str(xlsx_path),
-        ], cwd=ROOT, env=process_env, check=True, stdout=subprocess.DEVNULL)
-        pdf_path = Path(temp_dir) / f"{xlsx_path.stem}.pdf"
-        if not pdf_path.exists():
-            raise RuntimeError("办公套件未生成合同预览 PDF")
-        prefix = preview_path.with_suffix("")
-        subprocess.run([
-            pdftoppm, "-png", "-singlefile", "-r", "130",
-            str(pdf_path), str(prefix),
-        ], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+    acquired = _PREVIEW_SLOTS.acquire(timeout=30)
+    if not acquired:
+        raise RuntimeError("合同预览繁忙，请稍后再试")
+    try:
+        with tempfile.TemporaryDirectory(prefix="contract-preview-") as temp_dir:
+            profile = Path(temp_dir) / "lo-profile"
+            subprocess.run([
+                soffice, "--headless",
+                f"-env:UserInstallation=file://{profile}",
+                "--convert-to",
+                'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}',
+                "--outdir", temp_dir, str(xlsx_path),
+            ], cwd=ROOT, env=process_env, check=True, stdout=subprocess.DEVNULL,
+               timeout=120)
+            pdf_path = Path(temp_dir) / f"{xlsx_path.stem}.pdf"
+            if not pdf_path.exists():
+                raise RuntimeError("办公套件未生成合同预览 PDF")
+            prefix = preview_path.with_suffix("")
+            subprocess.run([
+                pdftoppm, "-png", "-singlefile", "-r", "130",
+                str(pdf_path), str(prefix),
+            ], cwd=ROOT, check=True, stdout=subprocess.DEVNULL, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("合同预览超时") from exc
+    finally:
+        _PREVIEW_SLOTS.release()
     if not preview_path.exists():
         raise RuntimeError("合同预览图片生成失败")
     return preview_path

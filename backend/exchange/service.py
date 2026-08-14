@@ -8,18 +8,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 import secrets
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
-TERMINAL_STATUSES = {"done", "failed", "cancelled"}
+TERMINAL_STATUSES = {"done", "failed", "cancelled", "stuck"}
 ACTIVE_STATUSES = {"pending", "planning", "awaiting_confirm", "confirmed", "executing"}
+PLAN_TIMEOUT_SECONDS = 5 * 60
+EXECUTE_TIMEOUT_SECONDS = 15 * 60
+MAX_CLAIM_ATTEMPTS = 3
 OID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+logger = logging.getLogger(__name__)
 
 
 class ExchangeError(ValueError):
@@ -51,12 +57,53 @@ def _token_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def _parse_ts(value) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _is_stale(stamp, timeout_seconds: int, *, now: datetime | None = None) -> bool:
+    parsed = _parse_ts(stamp)
+    if parsed is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return (current - parsed).total_seconds() >= timeout_seconds
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    names = {info[1] for info in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in names:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 class ExchangeService:
     """持久化换货任务并强制 dry-run → 人工确认 → 单次执行。"""
 
-    def __init__(self, database_path: str | Path):
+    def __init__(
+        self,
+        database_path: str | Path,
+        *,
+        plan_timeout_seconds: int = PLAN_TIMEOUT_SECONDS,
+        execute_timeout_seconds: int = EXECUTE_TIMEOUT_SECONDS,
+        max_claim_attempts: int = MAX_CLAIM_ATTEMPTS,
+        on_stuck=None,
+    ):
         self.database_path = Path(database_path)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
+        self.plan_timeout_seconds = max(1, int(plan_timeout_seconds))
+        self.execute_timeout_seconds = max(1, int(execute_timeout_seconds))
+        self.max_claim_attempts = max(1, int(max_claim_attempts))
+        self.on_stuck = on_stuck
         self._lock = threading.RLock()
         self._init_schema()
 
@@ -130,6 +177,113 @@ class ExchangeService:
                     ON erp_read_probes(status, created_at);
                 """
             )
+            _ensure_column(conn, "exchange_jobs", "claimed_at", "TEXT")
+            _ensure_column(conn, "exchange_jobs", "attempts", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "exchange_searches", "claimed_at", "TEXT")
+            _ensure_column(conn, "exchange_searches", "attempts", "INTEGER NOT NULL DEFAULT 0")
+            _ensure_column(conn, "erp_read_probes", "claimed_at", "TEXT")
+            _ensure_column(conn, "erp_read_probes", "attempts", "INTEGER NOT NULL DEFAULT 0")
+
+    @staticmethod
+    def _claim_stamp(row: sqlite3.Row) -> str | None:
+        keys = row.keys()
+        claimed = row["claimed_at"] if "claimed_at" in keys else None
+        return str(claimed or row["updated_at"] or "") or None
+
+    @staticmethod
+    def _attempts(row: sqlite3.Row) -> int:
+        keys = row.keys()
+        if "attempts" not in keys:
+            return 0
+        try:
+            return int(row["attempts"] or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _reclaim_queue_locked(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        table: str,
+        claimed_status: str,
+        now: str,
+        fail_message: str,
+    ) -> None:
+        now_dt = _parse_ts(now) or datetime.now(timezone.utc)
+        rows = conn.execute(
+            f"SELECT * FROM {table} WHERE status=?", (claimed_status,)
+        ).fetchall()
+        for row in rows:
+            if not _is_stale(self._claim_stamp(row), self.plan_timeout_seconds, now=now_dt):
+                continue
+            attempts = self._attempts(row) + 1
+            if attempts >= self.max_claim_attempts:
+                conn.execute(
+                    f"""UPDATE {table} SET status='failed', attempts=?, worker_id=NULL,
+                        claimed_at=NULL, error=?, updated_at=?, finished_at=? WHERE id=?""",
+                    (attempts, fail_message, now, now, row["id"]),
+                )
+            else:
+                conn.execute(
+                    f"""UPDATE {table} SET status='pending', attempts=?, worker_id=NULL,
+                        claimed_at=NULL, updated_at=? WHERE id=?""",
+                    (attempts, now, row["id"]),
+                )
+
+    def _reclaim_jobs_locked(self, conn: sqlite3.Connection, now: str) -> list[dict]:
+        self._reclaim_queue_locked(
+            conn, table="exchange_jobs", claimed_status="planning", now=now,
+            fail_message="试算领取超时，已超过最大重试次数",
+        )
+        stuck_jobs: list[dict] = []
+        now_dt = _parse_ts(now) or datetime.now(timezone.utc)
+        rows = conn.execute("SELECT * FROM exchange_jobs WHERE status='executing'").fetchall()
+        for row in rows:
+            if not _is_stale(self._claim_stamp(row), self.execute_timeout_seconds, now=now_dt):
+                continue
+            conn.execute(
+                """UPDATE exchange_jobs SET status='stuck', error=?, updated_at=? WHERE id=?""",
+                ("执行超时，已中断且未自动重投，请人工核对 ERP", now, row["id"]),
+            )
+            fresh = conn.execute("SELECT * FROM exchange_jobs WHERE id=?", (row["id"],)).fetchone()
+            stuck_jobs.append(self._row(fresh))
+        return stuck_jobs
+
+    def _reclaim_all_locked(self, conn: sqlite3.Connection, now: str) -> list[dict]:
+        stuck = self._reclaim_jobs_locked(conn, now)
+        self._reclaim_queue_locked(
+            conn, table="exchange_searches", claimed_status="searching", now=now,
+            fail_message="订单搜索领取超时，已超过最大重试次数",
+        )
+        self._reclaim_queue_locked(
+            conn, table="erp_read_probes", claimed_status="reading", now=now,
+            fail_message="只读探测领取超时，已超过最大重试次数",
+        )
+        return stuck
+
+    def _emit_stuck(self, jobs: list[dict]) -> None:
+        callback = self.on_stuck
+        if not callback:
+            return
+        for job in jobs:
+            try:
+                callback(job)
+            except Exception as exc:
+                logger.error("Exchange stuck callback failed: %s", exc)
+
+    def _reclaim_now(self) -> None:
+        stuck: list[dict] = []
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            stuck = self._reclaim_all_locked(conn, _now())
+        self._emit_stuck(stuck)
+
+    @contextmanager
+    def _txn(self) -> Iterator[sqlite3.Connection]:
+        self._reclaim_now()
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
 
     def create_probe(self, kind: str, reference: str) -> dict:
         kind = str(kind or "").strip()
@@ -146,21 +300,24 @@ class ExchangeService:
             return self._probe_row(conn.execute("SELECT * FROM erp_read_probes WHERE id=?", (probe_id,)).fetchone())
 
     def get_probe(self, probe_id: str) -> dict:
-        with self._connect() as conn:
+        with self._txn() as conn:
             row = conn.execute("SELECT * FROM erp_read_probes WHERE id=?", (probe_id,)).fetchone()
-        if not row:
+            probe = self._probe_row(row) if row else None
+        if not probe:
             raise ExchangeError("只读探测任务不存在", 404)
-        return self._probe_row(row)
+        return probe
 
     def next_probe(self, worker_id: str) -> dict | None:
         worker_id = self._validate_worker_id(worker_id)
         now = _now()
-        with self._lock, self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._txn() as conn:
             row = conn.execute("SELECT * FROM erp_read_probes WHERE status='pending' ORDER BY created_at LIMIT 1").fetchone()
             if not row:
                 return None
-            conn.execute("UPDATE erp_read_probes SET status='reading',worker_id=?,updated_at=? WHERE id=?", (worker_id, now, row["id"]))
+            conn.execute(
+                "UPDATE erp_read_probes SET status='reading',worker_id=?,claimed_at=?,updated_at=? WHERE id=?",
+                (worker_id, now, now, row["id"]),
+            )
             return self._probe_row(conn.execute("SELECT * FROM erp_read_probes WHERE id=?", (row["id"],)).fetchone())
 
     def report_probe(self, probe_id: str, worker_id: str, result: dict) -> dict:
@@ -181,10 +338,14 @@ class ExchangeService:
     def _probe_row(row: sqlite3.Row | None) -> dict:
         if row is None:
             return {}
-        return {"id": row["id"], "kind": row["kind"], "reference": row["reference"],
-                "status": row["status"], "result": _loads(row["result_json"], None),
-                "workerId": row["worker_id"], "error": row["error"],
-                "createdAt": row["created_at"], "updatedAt": row["updated_at"], "finishedAt": row["finished_at"]}
+        return {
+            "id": row["id"], "kind": row["kind"], "reference": row["reference"],
+            "status": row["status"], "result": _loads(row["result_json"], None),
+            "workerId": row["worker_id"], "error": row["error"],
+            "attempts": ExchangeService._attempts(row),
+            "claimedAt": row["claimed_at"] if "claimed_at" in row.keys() else None,
+            "createdAt": row["created_at"], "updatedAt": row["updated_at"], "finishedAt": row["finished_at"],
+        }
 
     def create_search(self, sku: str) -> dict:
         sku = str(sku or "").strip()
@@ -201,25 +362,25 @@ class ExchangeService:
         return self._search_row(row)
 
     def get_search(self, search_id: str) -> dict:
-        with self._connect() as conn:
+        with self._txn() as conn:
             row = conn.execute("SELECT * FROM exchange_searches WHERE id=?", (search_id,)).fetchone()
-        if not row:
+            search = self._search_row(row) if row else None
+        if not search:
             raise ExchangeError("订单搜索任务不存在", 404)
-        return self._search_row(row)
+        return search
 
     def next_search(self, worker_id: str) -> dict | None:
         worker_id = self._validate_worker_id(worker_id)
         now = _now()
-        with self._lock, self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._txn() as conn:
             row = conn.execute(
                 "SELECT * FROM exchange_searches WHERE status='pending' ORDER BY created_at LIMIT 1"
             ).fetchone()
             if not row:
                 return None
             conn.execute(
-                "UPDATE exchange_searches SET status='searching',worker_id=?,updated_at=? WHERE id=?",
-                (worker_id, now, row["id"]),
+                "UPDATE exchange_searches SET status='searching',worker_id=?,claimed_at=?,updated_at=? WHERE id=?",
+                (worker_id, now, now, row["id"]),
             )
             return self._search_row(conn.execute("SELECT * FROM exchange_searches WHERE id=?", (row["id"],)).fetchone())
 
@@ -250,7 +411,9 @@ class ExchangeService:
         return {
             "id": row["id"], "sku": row["sku"], "status": row["status"],
             "result": _loads(row["result_json"], None), "workerId": row["worker_id"],
-            "error": row["error"], "createdAt": row["created_at"],
+            "error": row["error"], "attempts": ExchangeService._attempts(row),
+            "claimedAt": row["claimed_at"] if "claimed_at" in row.keys() else None,
+            "createdAt": row["created_at"],
             "updatedAt": row["updated_at"], "finishedAt": row["finished_at"],
         }
 
@@ -329,8 +492,7 @@ class ExchangeService:
         operator = str(operator or "web").strip()[:120] or "web"
         idem = str(idempotency_key or "").strip()[:200] or None
         now = _now()
-        with self._lock, self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._txn() as conn:
             if idem:
                 existing = conn.execute(
                     "SELECT * FROM exchange_jobs WHERE idempotency_key = ?", (idem,)
@@ -340,9 +502,10 @@ class ExchangeService:
             # 不同订单的任务可以由多个 Worker 并行；同一订单禁止同时进入两个活动任务，
             # 否则两个 ERP 标签页可能基于不同 dry-run 结果重复改同一张单。
             requested_oids = set(targets["o_ids"])
+            placeholders = ",".join("?" * len(ACTIVE_STATUSES))
             active_rows = conn.execute(
-                "SELECT id, targets_json FROM exchange_jobs "
-                "WHERE status IN ('pending','planning','awaiting_confirm','confirmed','executing')"
+                f"SELECT id, targets_json FROM exchange_jobs WHERE status IN ({placeholders})",
+                tuple(ACTIVE_STATUSES),
             ).fetchall()
             for active in active_rows:
                 active_oids = set((_loads(active["targets_json"], {}) or {}).get("o_ids") or [])
@@ -368,18 +531,19 @@ class ExchangeService:
 
     def list_jobs(self, *, limit: int = 100) -> list[dict]:
         limit = max(1, min(int(limit), 500))
-        with self._connect() as conn:
+        with self._txn() as conn:
             rows = conn.execute(
                 "SELECT * FROM exchange_jobs ORDER BY created_at DESC LIMIT ?", (limit,)
             ).fetchall()
-        return [self._row(row) for row in rows]
+            return [self._row(row) for row in rows]
 
     def get_job(self, job_id: str) -> dict:
-        with self._connect() as conn:
+        with self._txn() as conn:
             row = conn.execute("SELECT * FROM exchange_jobs WHERE id = ?", (job_id,)).fetchone()
-        if not row:
+            job = self._row(row) if row else None
+        if not job:
             raise ExchangeError("换货任务不存在", 404)
-        return self._row(row)
+        return job
 
     def heartbeat(self, worker_id: str, payload: dict[str, Any]) -> dict:
         worker_id = self._validate_worker_id(worker_id)
@@ -402,16 +566,18 @@ class ExchangeService:
         return {"ok": True, "workerId": worker_id, "serverTime": now}
 
     def status(self) -> dict:
-        with self._connect() as conn:
+        with self._txn() as conn:
             workers = conn.execute(
                 "SELECT * FROM exchange_workers ORDER BY last_seen_at DESC LIMIT 20"
             ).fetchall()
             counts = conn.execute(
                 "SELECT status, COUNT(*) AS n FROM exchange_jobs GROUP BY status"
             ).fetchall()
+            worker_rows = [dict(row) for row in workers]
+            job_counts = {row["status"]: row["n"] for row in counts}
         now = datetime.now(timezone.utc)
         result = []
-        for row in workers:
+        for row in worker_rows:
             try:
                 seen = datetime.fromisoformat(row["last_seen_at"])
                 online = (now - seen).total_seconds() <= 45
@@ -429,7 +595,7 @@ class ExchangeService:
         return {
             "workers": result,
             "onlineWorkers": sum(1 for item in result if item["online"] and item["ready"]),
-            "jobs": {row["status"]: row["n"] for row in counts},
+            "jobs": job_counts,
         }
 
     def next_job(self, worker_id: str) -> dict | None:
@@ -440,8 +606,7 @@ class ExchangeService:
         """
         worker_id = self._validate_worker_id(worker_id)
         now = _now()
-        with self._lock, self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
+        with self._txn() as conn:
             # 已人工确认的执行优先，避免前面不断新增 dry-run 时真实任务长期排不到。
             row = conn.execute(
                 """SELECT * FROM exchange_jobs
@@ -454,8 +619,8 @@ class ExchangeService:
                 conn.execute(
                     """UPDATE exchange_jobs SET status='executing', worker_id=?,
                        execution_token_hash=?, execution_token_delivered=1,
-                       started_at=?, updated_at=? WHERE id=?""",
-                    (worker_id, _token_hash(token), now, now, row["id"]),
+                       started_at=?, claimed_at=?, updated_at=? WHERE id=?""",
+                    (worker_id, _token_hash(token), now, now, now, row["id"]),
                 )
             else:
                 row = conn.execute(
@@ -465,8 +630,8 @@ class ExchangeService:
                 action = "plan"
                 if row:
                     conn.execute(
-                        "UPDATE exchange_jobs SET status='planning', worker_id=?, updated_at=? WHERE id=?",
-                        (worker_id, now, row["id"]),
+                        "UPDATE exchange_jobs SET status='planning', worker_id=?, claimed_at=?, updated_at=? WHERE id=?",
+                        (worker_id, now, now, row["id"]),
                     )
             if not row:
                 return None
@@ -520,8 +685,11 @@ class ExchangeService:
             )
             return self._row(self._must_row(conn, job_id))
 
-    def cancel(self, job_id: str) -> dict:
+    def cancel(self, job_id: str, operator: str) -> dict:
         now = _now()
+        operator = str(operator or "").strip()
+        if not operator:
+            raise ExchangeError("取消必须填写操作人姓名", 403)
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             row = self._must_row(conn, job_id)
@@ -529,6 +697,8 @@ class ExchangeService:
                 return self._row(row)
             if row["status"] not in {"pending", "planning", "awaiting_confirm", "confirmed"}:
                 raise ExchangeError("执行中或已结束的任务不能取消", 409)
+            if operator != row["operator"]:
+                raise ExchangeError("必须由创建该任务的操作人取消", 403)
             conn.execute(
                 "UPDATE exchange_jobs SET status='cancelled', finished_at=?, updated_at=? WHERE id=?",
                 (now, now, job_id),
@@ -544,7 +714,7 @@ class ExchangeService:
         now = _now()
         with self._lock, self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = self._must_executing(conn, job_id, worker_id, execution_token)
+            row = self._must_executing(conn, job_id, worker_id, execution_token, allow_stuck=True)
             progress = _loads(row["progress_json"], [])
             progress.append({**event, "reportedAt": now})
             progress = progress[-1000:]
@@ -566,7 +736,7 @@ class ExchangeService:
             row = self._must_row(conn, job_id)
             if row["status"] in {"done", "failed"}:
                 return self._row(row)
-            self._must_executing(conn, job_id, worker_id, execution_token)
+            self._must_executing(conn, job_id, worker_id, execution_token, allow_stuck=True)
             failed = result.get("failed") or result.get("fail") or []
             succeeded = result.get("succeeded") or result.get("success") or []
             status = "done" if succeeded and not failed else "failed"
@@ -581,7 +751,8 @@ class ExchangeService:
     def _validate_plan(self, job_id: str, plan: dict[str, Any]) -> dict:
         if not isinstance(plan, dict) or not isinstance(plan.get("plans"), list):
             raise ExchangeError("试算结果必须包含 plans 列表")
-        job = self.get_job(job_id)
+        with self._connect() as conn:
+            job = self._row(self._must_row(conn, job_id))
         allowed = set(job["targets"]["o_ids"])
         expected_replacement = job["rules"]["replacements"][0]
         expected_source = str(expected_replacement["from"])
@@ -630,10 +801,12 @@ class ExchangeService:
         return row
 
     def _must_executing(
-        self, conn: sqlite3.Connection, job_id: str, worker_id: str, token: str
+        self, conn: sqlite3.Connection, job_id: str, worker_id: str, token: str,
+        *, allow_stuck: bool = False,
     ) -> sqlite3.Row:
         row = self._must_row(conn, job_id)
-        if row["status"] != "executing":
+        allowed = {"executing", "stuck"} if allow_stuck else {"executing"}
+        if row["status"] not in allowed:
             raise ExchangeError("任务当前不在执行状态", 409)
         if row["worker_id"] != worker_id:
             raise ExchangeError("执行 worker 不匹配", 403)
@@ -658,6 +831,8 @@ class ExchangeService:
             "result": _loads(row["result_json"], None),
             "workerId": row["worker_id"],
             "error": row["error"],
+            "attempts": ExchangeService._attempts(row),
+            "claimedAt": row["claimed_at"] if "claimed_at" in row.keys() else None,
             "createdAt": row["created_at"],
             "updatedAt": row["updated_at"],
             "confirmedAt": row["confirmed_at"],

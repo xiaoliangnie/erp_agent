@@ -3,12 +3,34 @@ import { useSearchParams } from "react-router-dom";
 import { TopBar } from "../../components/TopBar";
 import { errorText, openBlob, publicApi } from "../../api/client";
 import { DEFAULT_RATES, INVOICE_LABELS } from "./types";
-import type { ContractItem, ContractOptions, InvoiceType, OrderChoice, ProductImageJob } from "./types";
+import type { ContractItem, ContractOptions, GbOption, InvoiceType, OrderChoice, ProductImageJob } from "./types";
 import "./contract.css";
 
 type StatusKind = "" | "ok" | "error";
 
 const isPoId = (value: string) => /^\d+$/.test(value);
+
+function gbStatusKind(status: string): "critical" | "warning" | "good" | "" {
+  if (status === "废止") return "critical";
+  if (status === "即将实施") return "warning";
+  if (status === "现行") return "good";
+  return "";
+}
+
+function gbOptionLabel(option: GbOption): string {
+  const extra = option.status && option.status !== "现行" ? ` · ${option.status}` : "";
+  return `${option.standardNo} ${option.nameCn}${extra}`.trim();
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
+}
+
+function parseFiniteNumber(value: string, label: string): number {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) throw new Error(`${label}不是有效数字。`);
+  return parsed;
+}
 
 /** 该票种维护了价格就用它，否则只有 ERP 单价口径匹配时才带出来 —— 不猜价格。 */
 function priceFor(item: ContractItem, mode: InvoiceType, erpPriceMode: InvoiceType | null): string {
@@ -71,7 +93,7 @@ export default function ContractPage() {
   }, []);
 
   const loadOrder = useCallback(
-    async (poId: string) => {
+    async (poId: string, signal?: AbortSignal) => {
       invalidatePreview();
       if (!poId) {
         setOrder(null);
@@ -80,7 +102,10 @@ export default function ContractPage() {
       }
       say("正在读取实时采购信息…");
       try {
-        const data = await publicApi.get<ContractOptions>(`/api/contracts/options?po_id=${encodeURIComponent(poId)}`);
+        const data = await publicApi.get<ContractOptions>(
+          `/api/contracts/options?po_id=${encodeURIComponent(poId)}`,
+          { signal },
+        );
         setOrder(data);
         applyPrices(data, invoiceTypeRef.current);
         applyGb(data);
@@ -91,6 +116,7 @@ export default function ContractPage() {
           data.supplierMapped ? "ok" : "error",
         );
       } catch (error) {
+        if (isAbortError(error)) return;
         setOrder(null);
         setGbSelections({});
         say(errorText(error), "error");
@@ -100,14 +126,16 @@ export default function ContractPage() {
   );
 
   const loadChoices = useCallback(
-    async (search: string) => {
+    async (search: string, signal?: AbortSignal) => {
       try {
         const data = await publicApi.get<{ orders: OrderChoice[] }>(
           `/api/contracts/orders?q=${encodeURIComponent(search)}`,
+          { signal },
         );
         setChoices(data.orders);
         if (!search) say("可直接选择最近采购单，也可输入单号、供应商或采购员搜索。");
       } catch (error) {
+        if (isAbortError(error)) return;
         say(errorText(error), "error");
       }
     },
@@ -118,18 +146,23 @@ export default function ContractPage() {
    * 搜索防抖：输入停下来就刷新候选单，输入的是纯数字单号时顺带把该单载进来。
    * 从下拉里选一条也走这条路（datalist 选中会触发 input），所以不用等失焦；
    * 首次带 ?po_id= 进来同样命中，不需要另写引导逻辑。
+   * 后发先至的响应靠 AbortController 丢弃，避免旧采购单盖住新选择。
    */
   const loadedPoId = useRef("");
   useEffect(() => {
     const search = query.trim();
+    const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      void loadChoices(search);
+      void loadChoices(search, controller.signal);
       if (isPoId(search) && loadedPoId.current !== search) {
         loadedPoId.current = search;
-        void loadOrder(search);
+        void loadOrder(search, controller.signal);
       }
     }, 220);
-    return () => window.clearTimeout(timer);
+    return () => {
+      window.clearTimeout(timer);
+      controller.abort();
+    };
   }, [loadChoices, loadOrder, query]);
 
   function changeInvoiceType(next: InvoiceType) {
@@ -146,14 +179,20 @@ export default function ContractPage() {
     for (const item of order.items) {
       const value = prices[item.sku];
       if (value === "" || value == null) throw new Error("请填写所有商品的合同单价。");
-      priceOverrides[item.sku] = Number(value);
+      priceOverrides[item.sku] = parseFiniteNumber(value, `商品 ${item.sku} 的合同单价`);
     }
     if (taxRate === "") throw new Error("请填写所选票种的税率。");
     const gbOverrides: Record<string, string> = {};
     for (const item of order.items) {
       gbOverrides[item.poiId] = gbSelections[item.poiId] ?? "";
     }
-    return { poId: order.purchaseOrderNo, invoiceType, taxRate: Number(taxRate), priceOverrides, gbOverrides };
+    return {
+      poId: order.purchaseOrderNo,
+      invoiceType,
+      taxRate: parseFiniteNumber(taxRate, "税率"),
+      priceOverrides,
+      gbOverrides,
+    };
   }
 
   async function makePreview() {
@@ -391,10 +430,14 @@ export default function ContractPage() {
                   {order.items.map((item) => {
                     const current = (item.gbOptions ?? []).filter((option) => option.status === "现行");
                     const upcoming = (item.gbOptions ?? []).filter((option) => option.status === "即将实施");
+                    const revoked = (item.gbOptions ?? []).filter((option) => option.status === "废止");
                     const other = (item.gbOptions ?? []).filter(
-                      (option) => option.status !== "现行" && option.status !== "即将实施",
+                      (option) =>
+                        option.status !== "现行" && option.status !== "即将实施" && option.status !== "废止",
                     );
                     const selected = gbSelections[item.poiId] ?? "";
+                    const selectedOption = (item.gbOptions ?? []).find((option) => option.standardNo === selected);
+                    const badgeKind = gbStatusKind(selectedOption?.status ?? "");
                     return (
                     <tr key={item.poiId || item.sku}>
                       <td>{item.sku + (item.styleCode ? ` / ${item.styleCode}` : "")}</td>
@@ -404,6 +447,7 @@ export default function ContractPage() {
                         {(item.gbOptions ?? []).length === 0 ? (
                           <span className="gb-empty">该类暂无国标目录</span>
                         ) : (
+                          <div className="gb-pick">
                           <select
                             className="gb-select"
                             value={selected}
@@ -418,14 +462,14 @@ export default function ContractPage() {
                             <option value="">未选执行标准</option>
                             {other.map((option) => (
                               <option key={option.standardNo} value={option.standardNo}>
-                                {option.standardNo} {option.nameCn}
+                                {gbOptionLabel(option)}
                               </option>
                             ))}
                             {current.length ? (
                               <optgroup label="现行">
                                 {current.map((option) => (
                                   <option key={option.standardNo} value={option.standardNo}>
-                                    {option.standardNo} {option.nameCn}
+                                    {gbOptionLabel(option)}
                                   </option>
                                 ))}
                               </optgroup>
@@ -434,12 +478,27 @@ export default function ContractPage() {
                               <optgroup label="即将实施">
                                 {upcoming.map((option) => (
                                   <option key={option.standardNo} value={option.standardNo}>
-                                    {option.standardNo} {option.nameCn}
+                                    {gbOptionLabel(option)}
+                                  </option>
+                                ))}
+                              </optgroup>
+                            ) : null}
+                            {revoked.length ? (
+                              <optgroup label="废止">
+                                {revoked.map((option) => (
+                                  <option key={option.standardNo} value={option.standardNo}>
+                                    {gbOptionLabel(option)}
                                   </option>
                                 ))}
                               </optgroup>
                             ) : null}
                           </select>
+                          {selectedOption?.status ? (
+                            <span className={`gb-badge${badgeKind ? ` ${badgeKind}` : ""}`}>
+                              {selectedOption.status}
+                            </span>
+                          ) : null}
+                          </div>
                         )}
                       </td>
                       <td>{item.deliveryDate || "—"}</td>

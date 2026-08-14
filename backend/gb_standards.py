@@ -10,6 +10,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import logging
 import re
 import ssl
 import threading
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover
     certifi = None
 
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where() if certifi else None)
+logger = logging.getLogger(__name__)
 
 GB_STANDARDS_TABLE = "gb_standards"
 GB_FAMILY_TABLE = "gb_standard_families"
@@ -333,12 +335,16 @@ def lookup_standard_by_no(env_path: str, standard_no: str) -> dict | None:
     code = str(standard_no or "").strip()
     if not code:
         return None
+    compact = compact_standard_no(code)
     sql = (
         f"SELECT samr_id, standard_no, name_cn, status, nature, std_type "
-        f"FROM `{GB_STANDARDS_TABLE}` WHERE standard_no = %s LIMIT 1"
+        f"FROM `{GB_STANDARDS_TABLE}` "
+        "WHERE standard_no = %s OR standard_no_compact = %s "
+        "ORDER BY CASE status WHEN '现行' THEN 0 WHEN '即将实施' THEN 1 ELSE 2 END, "
+        "issue_date DESC, samr_id LIMIT 1"
     )
     try:
-        return read_query(env_path, sql, (code,), one=True)
+        return read_query(env_path, sql, (code, compact), one=True)
     except Exception as exc:
         if _is_missing_relation(exc):
             return None
@@ -1030,7 +1036,7 @@ def normalize_standard(row: dict, synced_at: str) -> dict | None:
     return {
         "samr_id": samr_id,
         "standard_no": standard_no,
-        "standard_no_compact": _row_value(row, "STD_CODE2", "STD_CODE4", limit=128),
+        "standard_no_compact": compact_standard_no(standard_no)[:128],
         "name_cn": name_cn,
         "name_en": name_en,
         "status": status,
@@ -1070,6 +1076,168 @@ def classify_changes(existing_hashes: dict[str, str], records: list[dict]) -> di
         else:
             updated += 1
     return {"inserted": inserted, "updated": updated, "unchanged": unchanged}
+
+
+def noteworthy_transition(from_status: str, to_status: str) -> str:
+    """合同已选用标准才值得推送的跃迁标签；其它状态变化返回空串。"""
+    previous = str(from_status or "").strip()
+    current = str(to_status or "").strip()
+    if not current or previous == current:
+        return ""
+    if current == "废止":
+        return f"{previous or '未知'} → 废止"
+    if previous == "即将实施" and current == "现行":
+        return "即将实施 → 现行"
+    return ""
+
+
+def collect_status_transitions(existing: dict[str, dict], records: list[dict]) -> list[dict]:
+    """对比写入前的目录行，只收集状态跃迁（插入和新名字改都不算）。"""
+    changes = []
+    for record in records:
+        samr_id = str(record.get("samr_id") or "")
+        previous = existing.get(samr_id) or {}
+        if not previous:
+            continue
+        label = noteworthy_transition(previous.get("status"), record.get("status"))
+        if not label:
+            continue
+        changes.append({
+            "samrId": samr_id,
+            "standardNo": str(record.get("standard_no") or previous.get("standard_no") or ""),
+            "nameCn": str(record.get("name_cn") or previous.get("name_cn") or ""),
+            "fromStatus": str(previous.get("status") or ""),
+            "toStatus": str(record.get("status") or ""),
+            "label": label,
+        })
+    return changes
+
+
+def match_contract_gb_alerts(changes: list[dict], usages: list[dict]) -> list[dict]:
+    """只保留已经写进 contract_line_gb 的跃迁。"""
+    alerts = []
+    for change in changes:
+        hits = []
+        samr_id = str(change.get("samrId") or "")
+        standard_no = str(change.get("standardNo") or "")
+        for usage in usages:
+            usage_samr = str(usage.get("samr_id") or "")
+            usage_no = str(usage.get("standard_no") or "")
+            if samr_id and usage_samr and samr_id == usage_samr:
+                hits.append(usage)
+            elif standard_no and usage_no and standard_no == usage_no:
+                hits.append(usage)
+        if not hits:
+            continue
+        po_ids = sorted({str(item.get("po_id") or "") for item in hits if item.get("po_id")})
+        skus = sorted({str(item.get("sku_id") or "") for item in hits if item.get("sku_id")})
+        alerts.append({
+            **change,
+            "poIds": po_ids,
+            "skus": skus,
+            "lineCount": len(hits),
+        })
+    return alerts
+
+
+def gb_change_markdown(alerts: list[dict], *, today: str, title: str = "合同已选用的执行标准有变更") -> str:
+    """钉钉可直接粘贴；结构对齐催办 markdown。"""
+    implemented = sum(1 for item in alerts if item.get("toStatus") == "现行")
+    revoked = sum(1 for item in alerts if item.get("toStatus") == "废止")
+    lines = [f"### {title}（{today}）"]
+    lines.append(f"> 即将实施 → 现行 **{implemented}** · 废止 **{revoked}**")
+    for item in alerts[:30]:
+        po_ids = "、".join(item.get("poIds") or []) or "—"
+        skus = "、".join((item.get("skus") or [])[:8])
+        extra = f" 等 {len(item.get('skus') or [])} 个 SKU" if len(item.get("skus") or []) > 8 else (f" · {skus}" if skus else "")
+        lines.append(f"\n**{item.get('standardNo') or item.get('samrId')}** {item.get('nameCn') or ''}".rstrip())
+        lines.append(f"{item.get('label')} · {item.get('lineCount', 0)} 行 · 采购单 {po_ids}{extra}")
+    extra = len(alerts) - 30
+    if extra > 0:
+        lines.append(f"\n…另有 {extra} 条")
+    return "\n".join(lines)
+
+
+def fetch_contract_gb_usages(env_path: str, changes: list[dict]) -> list[dict]:
+    """已写入合同的执行标准行。表还不存在时当作从未选用。"""
+    samr_ids = [str(item.get("samrId") or "") for item in changes if item.get("samrId")]
+    standard_nos = [str(item.get("standardNo") or "") for item in changes if item.get("standardNo")]
+    samr_ids = list(dict.fromkeys(samr_ids))
+    standard_nos = list(dict.fromkeys(standard_nos))
+    if not samr_ids and not standard_nos:
+        return []
+    clauses, params = [], []
+    if samr_ids:
+        clauses.append("samr_id IN (" + ",".join(["%s"] * len(samr_ids)) + ")")
+        params.extend(samr_ids)
+    if standard_nos:
+        clauses.append("standard_no IN (" + ",".join(["%s"] * len(standard_nos)) + ")")
+        params.extend(standard_nos)
+    sql = (
+        "SELECT po_id, poi_id, sku_id, samr_id, standard_no FROM `contract_line_gb` "
+        "WHERE " + " OR ".join(clauses)
+    )
+    try:
+        return list(read_query(env_path, sql, tuple(params)) or [])
+    except Exception as exc:
+        if _is_missing_relation(exc):
+            return []
+        raise
+
+
+def notify_contract_gb_changes(
+    env_path: str, changes: list[dict], *, sender=None, audit=None,
+    usages: list[dict] | None = None, today: str | None = None,
+) -> dict:
+    """同步成功后：过滤合同已选用的跃迁，推钉钉；同一标准同一天只发一次。"""
+    today = today or business_today().isoformat()
+    if not changes:
+        return {"skipped": True, "reason": "没有状态跃迁", "today": today, "count": 0}
+    if usages is None:
+        usages = fetch_contract_gb_usages(env_path, changes)
+    alerts = match_contract_gb_alerts(changes, usages)
+    if not alerts:
+        return {"skipped": True, "reason": "状态跃迁未出现在已选合同执行标准中", "today": today, "count": 0}
+    remaining = []
+    for item in alerts:
+        key = f"gb-contract-change-{today}-{item.get('samrId') or item.get('standardNo')}"
+        if audit is not None and audit.has_successful_delivery(key):
+            continue
+        remaining.append({**item, "idempotencyKey": key})
+    if not remaining:
+        return {"skipped": True, "reason": "同一批国标变更已经提醒过", "today": today, "count": 0}
+    text = gb_change_markdown(remaining, today=today)
+    if sender is None or not getattr(sender, "configured", False):
+        return {
+            "skipped": True, "reason": "钉钉发送通道未配置", "today": today,
+            "count": len(remaining),
+        }
+    try:
+        response = sender.send_markdown(f"合同执行标准变更 · {today}", text)
+    except Exception as exc:
+        if audit is not None:
+            audit.record_delivery(
+                channel="dingtalk", target="group", kind="gb_change_alert",
+                status="failed", detail={"today": today, "count": len(remaining)},
+                error=str(exc),
+            )
+        raise
+    if audit is not None:
+        for item in remaining:
+            audit.record_delivery(
+                channel="dingtalk", target="group", kind="gb_change_alert",
+                status="sent",
+                detail={
+                    "today": today, "samrId": item.get("samrId"),
+                    "standardNo": item.get("standardNo"), "label": item.get("label"),
+                    "poIds": item.get("poIds"), "channel": (response or {}).get("channel"),
+                },
+                idempotency_key=item["idempotencyKey"],
+            )
+    return {
+        "sent": True, "today": today, "count": len(remaining),
+        "channel": (response or {}).get("channel"),
+    }
 
 
 def search_params(query: dict, *, page: int, page_size: int) -> dict[str, str]:
@@ -1168,6 +1336,33 @@ def ensure_schema(env_path: str) -> None:
             raise
 
 
+def backfill_standard_no_compact(env_path: str, *, batch: int = 500) -> int:
+    """把存量空 compact 列回填成 standard_no 的紧凑值。"""
+    updated = 0
+    while True:
+        rows = read_query(
+            env_path,
+            f"SELECT samr_id, standard_no FROM `{GB_STANDARDS_TABLE}` "
+            "WHERE standard_no_compact = '' OR standard_no_compact IS NULL LIMIT %s",
+            (batch,),
+        ) or []
+        if not rows:
+            break
+        with connect(env_path) as conn:
+            with conn.cursor() as cursor:
+                for row in rows:
+                    compact = compact_standard_no(row["standard_no"])[:128]
+                    cursor.execute(
+                        f"UPDATE `{GB_STANDARDS_TABLE}` SET standard_no_compact=%s WHERE samr_id=%s",
+                        (compact, row["samr_id"]),
+                    )
+                    updated += 1
+            conn.commit()
+        if len(rows) < batch:
+            break
+    return updated
+
+
 def _row_tuple(record: dict) -> tuple:
     return tuple(
         _json(record[column]) if column == "source_payload" else record[column]
@@ -1175,21 +1370,30 @@ def _row_tuple(record: dict) -> tuple:
     )
 
 
-def _existing_hashes(cursor, samr_ids: list[str]) -> dict[str, str]:
+def _existing_rows(cursor, samr_ids: list[str]) -> dict[str, dict]:
     if not samr_ids:
         return {}
     marks = ",".join(["%s"] * len(samr_ids))
     cursor.execute(
-        f"SELECT samr_id, content_hash FROM `{GB_STANDARDS_TABLE}` WHERE samr_id IN ({marks})",
+        f"SELECT samr_id, content_hash, status, standard_no, name_cn "
+        f"FROM `{GB_STANDARDS_TABLE}` WHERE samr_id IN ({marks})",
         samr_ids,
     )
-    return {str(row["samr_id"]): str(row["content_hash"] or "") for row in cursor.fetchall()}
+    return {
+        str(row["samr_id"]): {
+            "content_hash": str(row["content_hash"] or ""),
+            "status": str(row["status"] or ""),
+            "standard_no": str(row["standard_no"] or ""),
+            "name_cn": str(row["name_cn"] or ""),
+        }
+        for row in cursor.fetchall()
+    }
 
 
 def upsert_standards(env_path: str, records: list[dict]) -> dict:
     """幂等写入规范化后的目录行，返回新增/更新/未变计数。"""
     if not records:
-        return {"written": 0, "inserted": 0, "updated": 0, "unchanged": 0}
+        return {"written": 0, "inserted": 0, "updated": 0, "unchanged": 0, "statusChanges": []}
     unique: dict[str, dict] = {}
     for record in records:
         unique[record["samr_id"]] = record
@@ -1197,8 +1401,11 @@ def upsert_standards(env_path: str, records: list[dict]) -> dict:
     with connect(env_path) as conn:
         try:
             with conn.cursor() as cursor:
-                existing = _existing_hashes(cursor, [row["samr_id"] for row in rows])
-                stats = classify_changes(existing, rows)
+                existing = _existing_rows(cursor, [row["samr_id"] for row in rows])
+                stats = classify_changes(
+                    {key: item["content_hash"] for key, item in existing.items()}, rows,
+                )
+                stats["statusChanges"] = collect_status_transitions(existing, rows)
                 cursor.executemany(UPSERT_SQL, [_row_tuple(row) for row in rows])
             conn.commit()
         except Exception:
@@ -1274,6 +1481,7 @@ class GbStandardsSyncer:
         query_loader: Callable[[], dict] | None = None,
         max_pages: int = 0,
         upsert_batch: int = 50,
+        on_sync=None,
     ):
         self.env_path = env_path
         self.client = client
@@ -1281,6 +1489,7 @@ class GbStandardsSyncer:
         self.query_loader = query_loader
         self.max_pages = max(0, int(max_pages))
         self.upsert_batch = max(1, int(upsert_batch))
+        self.on_sync = on_sync
         self._lock = threading.Lock()
         self._schema_ready = False
         self.last_scope: dict = {}
@@ -1305,6 +1514,7 @@ class GbStandardsSyncer:
         for attempt in range(3):
             try:
                 ensure_schema(self.env_path)
+                backfill_standard_no_compact(self.env_path)
                 self._schema_ready = True
                 return
             except Exception as exc:
@@ -1322,6 +1532,7 @@ class GbStandardsSyncer:
         started = _synced_at()
         _state_update(self.env_path, status="running", last_started_at=started, error_message="")
         totals = {"inserted": 0, "updated": 0, "unchanged": 0, "written": 0, "skipped": 0, "fetched": 0}
+        status_changes: list[dict] = []
         seen: set[str] = set()
         family_seen: dict[str, set[str]] = {}
         query_summaries = []
@@ -1339,6 +1550,7 @@ class GbStandardsSyncer:
                     stats = upsert_standards(self.env_path, batch)
                     for key in ("inserted", "updated", "unchanged", "written"):
                         totals[key] += stats[key]
+                    status_changes.extend(stats.get("statusChanges") or [])
                     batch.clear()
 
                 for raw in self.client.iter_rows(query, max_pages=self.max_pages):
@@ -1375,16 +1587,24 @@ class GbStandardsSyncer:
                 last_request_id=";".join(item["label"] for item in query_summaries)[:128],
                 error_message="",
             )
-            return {
+            result = {
                 **totals,
                 "unique": len(seen),
                 "queries": query_summaries,
                 "changed": changed,
+                "statusChanges": status_changes,
                 "unmapped": list(self.last_scope.get("unmapped") or []),
                 "families": {
                     family_id: len(ids) for family_id, ids in family_seen.items()
                 },
             }
+            if self.on_sync:
+                try:
+                    result["alert"] = self.on_sync(result)
+                except Exception as exc:
+                    logger.error("国标变更提醒失败：%s: %s", type(exc).__name__, exc)
+                    result["alert"] = {"failed": True, "reason": f"{type(exc).__name__}: {exc}"}
+            return result
         except Exception as exc:
             _state_update(
                 self.env_path,
@@ -1416,6 +1636,7 @@ class GbStandardsScheduler:
         self.last_run = ""
         self.last_error = ""
         self.last_result: dict = {}
+        self._error_backoff_cap = 900
 
     @staticmethod
     def _parse_time(value) -> tuple[int, int]:
@@ -1445,6 +1666,12 @@ class GbStandardsScheduler:
     def stop(self) -> None:
         self._stop.set()
 
+    def _wait_after_failures(self, failures: int) -> int:
+        """同步失败后的等待秒数：与镜像同步一样 2^n，封顶 900 秒。"""
+        if failures <= 0:
+            return self.poll_seconds
+        return min(self.poll_seconds * (2 ** min(int(failures), 4)), self._error_backoff_cap)
+
     def _already_succeeded_today(self) -> bool:
         today = business_today().isoformat()
         if self.last_run == today:
@@ -1465,25 +1692,38 @@ class GbStandardsScheduler:
     def _loop(self) -> None:
         if self.initial_delay and self._stop.wait(self.initial_delay):
             return
-        while not self._stop.wait(self.poll_seconds):
+        failures = 0
+        wait_seconds = self.poll_seconds
+        while not self._stop.wait(wait_seconds):
             if self._already_succeeded_today():
+                wait_seconds = self.poll_seconds
                 continue
             current = business_now()
             if (current.hour, current.minute) < self.send_time:
+                wait_seconds = self.poll_seconds
                 continue
             try:
-                self.last_result = self.syncer.sync()
+                result = self.syncer.sync()
                 self.last_run = business_today().isoformat()
                 self.last_error = ""
-                print(
-                    "国标目录同步完成："
-                    f"新增 {self.last_result.get('inserted', 0)}，"
-                    f"更新 {self.last_result.get('updated', 0)}，"
-                    f"未变 {self.last_result.get('unchanged', 0)}"
+                failures = 0
+                wait_seconds = self.poll_seconds
+                self.last_result = {
+                    key: value for key, value in result.items() if key != "statusChanges"
+                }
+                self.last_result["statusChangeCount"] = len(result.get("statusChanges") or [])
+                logger.info(
+                    "国标目录同步完成：新增 %s，更新 %s，未变 %s，合同标准跃迁提醒 %s",
+                    result.get("inserted", 0),
+                    result.get("updated", 0),
+                    result.get("unchanged", 0),
+                    self.last_result.get("statusChangeCount", 0),
                 )
             except Exception as exc:
+                failures += 1
+                wait_seconds = self._wait_after_failures(failures)
                 self.last_error = f"{type(exc).__name__}: {exc}"
-                print(f"国标目录同步失败：{self.last_error}")
+                logger.error("国标目录同步失败：%s；%ss 后重试", self.last_error, wait_seconds)
 
 
 def build_gb_sync_from_settings(

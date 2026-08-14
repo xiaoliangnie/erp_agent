@@ -59,12 +59,20 @@ export interface RawPayload {
 
 const O_NO = 0, O_DATE = 1, O_ST = 2, O_BUYER = 3, O_SUP = 4,
   O_WH = 5, O_ADDR = 6, O_PAY = 7, O_EXT = 8, O_AUDIT = 9, O_CREATED = 10;
-const DASHBOARD_ORDER_WIDTH = 11;
+export const DASHBOARD_ORDER_COLUMNS = [
+  "采购单号", "采购日期", "已确认", "采购员", "供应商", "仓储方",
+  "收货地址", "付款方式", "外部单号", "审核日期", "采购单建立时间",
+] as const;
+const DASHBOARD_ORDER_WIDTH = DASHBOARD_ORDER_COLUMNS.length;
 
 const L_O = 0, L_SPU = 1, L_STYLE = 2, L_COLOR = 3, L_SPEC = 4, L_CAT = 5,
   L_SEASON = 6, L_BRAND = 7, L_CHAN = 8, L_QTY = 9, L_IN = 10, L_AMT = 11,
   L_PRICE = 12, L_STYPE = 13, L_SIZE = 14, L_ETA = 15, L_SKU = 16;
-const DASHBOARD_LINE_WIDTH = 17;
+export const DASHBOARD_LINE_COLUMNS = [
+  "采购单下标", "SPU", "款式", "颜色", "规格", "品类", "季节", "品牌",
+  "渠道", "数量", "入库", "金额", "单价", "尺码类型", "尺码", "预计到货", "SKU",
+] as const;
+const DASHBOARD_LINE_WIDTH = DASHBOARD_LINE_COLUMNS.length;
 
 export interface DashboardOrder {
   index: number;
@@ -106,11 +114,18 @@ export interface DashboardLine {
 
 const DO_NO = 0, DO_DATE = 1, DO_ST = 2, DO_BUYER = 3, DO_SUP = 4,
   DO_WH = 5, DO_EXT = 6, DO_AUDIT = 7;
-const DELIVERY_ORDER_WIDTH = 8;
+export const DELIVERY_ORDER_COLUMNS = [
+  "采购单号", "采购日期", "已确认", "采购员", "供应商", "仓储方", "外部单号", "审核日期",
+] as const;
+const DELIVERY_ORDER_WIDTH = DELIVERY_ORDER_COLUMNS.length;
 
 const DL_O = 0, DL_SPU = 1, DL_SKU = 2, DL_COLOR = 3, DL_SPEC = 4, DL_CAT = 5,
   DL_QTY = 6, DL_IN = 7, DL_DELIVERY = 8, DL_ETA = 9, DL_AMT = 10;
-const DELIVERY_LINE_WIDTH = 11;
+export const DELIVERY_LINE_COLUMNS = [
+  "采购单下标", "SPU", "SKU", "颜色", "规格", "品类",
+  "数量", "入库", "交期", "预计到货", "金额",
+] as const;
+const DELIVERY_LINE_WIDTH = DELIVERY_LINE_COLUMNS.length;
 
 export interface DeliveryOrder {
   index: number;

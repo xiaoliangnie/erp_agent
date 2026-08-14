@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { TopBar } from "../../components/TopBar";
 import { agentApi, errorText } from "../../api/client";
 import { useCredentials } from "../../hooks/useCredentials";
+import { newId } from "../../lib/id";
 import { ExecutedCard, PendingCard } from "./ActionCard";
 import type { AgentStatus, ChatReply, ExecutedAction, Message } from "./types";
 import "./chat.css";
@@ -15,8 +16,6 @@ const SAMPLES = [
 
 const GREETING =
   "填好 Token 和姓名后连接。助手只能通过固定工具查库和生成产物；生成合同、登记换货、发钉钉催办这类动作会先给出要点，等你点确认才执行。";
-
-const newId = () => (crypto.randomUUID ? crypto.randomUUID() : String(Date.now() + Math.random()));
 
 function readSessionKey(): string {
   const stored = sessionStorage.getItem("agentSessionKey");
@@ -55,11 +54,12 @@ export default function ChatPage() {
   }, [credentials, filled, remember]);
 
   const bootstrapped = useRef(false);
+  const autoConnectStoredCredentials = useRef(filled);
   useEffect(() => {
-    if (bootstrapped.current || !filled) return;
+    if (bootstrapped.current || !autoConnectStoredCredentials.current) return;
     bootstrapped.current = true;
     connect().catch((error: unknown) => setMessage(errorText(error)));
-  }, [connect, filled]);
+  }, [connect]);
 
   const send = useCallback(
     async (text: string) => {
@@ -126,15 +126,15 @@ export default function ChatPage() {
   }, []);
 
   async function resetSession() {
+    if (!window.confirm("开新话题？助手不再带着这次对话的上文；历史仍留在审计里。")) {
+      return;
+    }
     if (sessionId.current) {
       await agentApi
         .post(`/api/agent/sessions/${sessionId.current}/reset`, {}, credentialsRef.current)
         .catch(() => undefined);
     }
-    sessionKey.current = newId();
-    sessionStorage.setItem("agentSessionKey", sessionKey.current);
-    sessionId.current = "";
-    setMessages([{ id: newId(), role: "system", text: "会话已清空，上下文重新开始。" }]);
+    setMessages([{ id: newId(), role: "system", text: "已开新话题。此前对话仍可追查，助手不再带着上文。" }]);
   }
 
   const agent = status?.agent;
@@ -221,7 +221,7 @@ export default function ChatPage() {
               />
               <input
                 autoComplete="off"
-                placeholder="你的姓名"
+                placeholder="钉钉/采购员姓名"
                 value={credentials.operator}
                 onChange={(event) => update({ operator: event.target.value })}
               />
@@ -234,7 +234,7 @@ export default function ChatPage() {
               </button>
             </div>
             <div className="small" style={{ marginTop: 7 }}>
-              Token 只存在当前标签页 sessionStorage。
+              Token 只存在当前标签页 sessionStorage。生成合同、换货、发催办时姓名须与员工绑定表一致。
             </div>
             <div className="statusline" style={{ marginTop: 12 }}>
               <span className={`dot ${agent?.available ? "online" : "offline"}`} />

@@ -21,8 +21,10 @@ Agent 与钉钉密钥模板见根目录 `.env.example`。
 - 换货页的 Token 只存当前标签页 `sessionStorage`；数据库凭证、ERP Cookie 都不会进入页面。
 - 任务必须明确列出全部 `o_id`，试算必须完整覆盖这些订单，缺单、取消/退款状态、找不到源 SKU
   都会作为跳过原因返回。
-- 真实执行必须经过 dry-run 和创建人确认。执行任务只投递一次，断线不会自动重放 ERP 写操作；
-  需要人工在 ERP 核对后才能决定是否另建任务。
+- 真实执行必须经过 dry-run 和创建人确认。执行任务只投递一次，断线不会自动重放 ERP 写操作。
+  试算 / 订单搜索 / 只读探测领取超过 5 分钟会退回队列，最多回收 3 次后标失败。
+  已经开始改 ERP 的任务超过 15 分钟标为 `stuck`（中断），钉钉告警，由人工核对后再决定是否另建任务；
+  Worker 迟到的执行结果仍可凭原凭证回写，避免页面上丢掉已改过的订单。
 - 多个已登录的 ERP 订单标签页会作为独立 Worker 槽位，同时领取不同订单的任务；同一订单同时只能有
   一个活动换货任务，防止并发重复修改。一个标签页内仍按顺序执行，避免 ERP 页面状态串单。
 - 采购助手可以理解“把订单 A 的 SKU B 换成 SKU C”，以及“这批待发货异常单把 B 换成 C”：
@@ -38,6 +40,7 @@ Agent 与钉钉密钥模板见根目录 `.env.example`。
 登录态读取 `purchaseitem.aspx` 的 `pic300` / `pic160` / `pic100`，不会调用换货写接口。
 任务队列第一阶段使用 `data/exchange_jobs.sqlite3`，后续 Agent 业务 MySQL 到位时只替换
 `backend/exchange/service.py` 的存储实现。
+换货白名单在 `config/exchange-rules.json`，服务按文件修改时间重读，改完不必重启。
 
 ### 页内核心 / Codex 直接调用
 
@@ -106,7 +109,35 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 `server.py` 是唯一入口，`frontend/dist/` 不存在时页面返回 503，接口仍可用。
 
 改前端时用 `npm run dev`（<http://127.0.0.1:5177>），`/api` 由 Vite 代理到 8777，
-所以 `server.py` 要同时开着。提交前跑 `npm run build`，它会先做 `tsc --noEmit` 类型检查。
+所以 `server.py` 要同时开着。提交前跑 `npm run build`，它会先核对 payload 宽度契约
+（`scripts/check_payload_contract.mjs`），再做 `tsc --noEmit` 类型检查。
+
+## 日志与健康巡检
+
+日志走标准库 `logging`，时间固定东八区。`LOG_FILE` 默认 `data/app.log`（不进版本库）；
+留空则只写 stderr，迁移后可直接接 systemd journal。`/api/health` 的访问记录是 DEBUG，
+避免五分钟巡检把 INFO 刷满。
+
+`scripts/health_watch.py` 单独进程拉 `/api/health`，**不 import** `backend.app`，
+不会把催办调度带起来。发现以下情况时发钉钉（同一问题默认 60 分钟内不重复）：
+
+- `ok=false`（库连不上）
+- 实时镜像已启用且滞后超过 `HEALTH_WATCH_LAG_MINUTES`（默认 15），或同步 `lastError` 非空
+- 钉钉 Stream `restartCount` **相对上次巡检增加**（第一次只记基数，避免进程刚起来就告警）
+- 催办 `dingtalk.reminder.lastError` 非空
+
+状态记在 `data/health_watch_state.json`。本机可用 cron / launchd 每 5 分钟跑一次：
+
+```bash
+.venv/bin/python scripts/health_watch.py
+.venv/bin/python scripts/health_watch.py --dry-run   # 只打印，不写状态、不发钉钉
+```
+
+```
+*/5 * * * * cd /path/to/Agent_demo && .venv/bin/python scripts/health_watch.py
+```
+
+发送通道与催办相同（Webhook 或应用机器人）。未配置钉钉时告警打到 stderr 并退出码 1，方便 cron 寄信。
 
 ## 数据源配置
 
@@ -115,7 +146,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 接口会明确报错，不会回退到旧快照，避免员工误把历史数据当成实时数据。
 
 `.env` 在进程导入时只读一次，改完必须重启服务才生效，且进程环境变量优先级高于 `.env`
-（`setting()` 的口径）。启动日志第二行会打印这个进程实际连的库
+（`setting()` 的口径）。启动日志会写出这个进程实际连的库
 （`镜像库：hanli.env → 主机:端口/库名`）；如果某个键被 shell 里残留的 `export` 盖掉，
 下一行会列出被覆盖的键名，用 `unset` 或换个新终端即可。握手阶段就失败时错误里会写明连的是
 哪个地址和哪个 env 文件，与「查询中途断流」区分开——两者在 PyMySQL 里都是 2013。
@@ -169,6 +200,12 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 是否同步、各状态/目录族条数）和 `lookup_gb_standards`（按 SKU / 名称 / 分类 / 标准号给出
 执行标准候选）；助手按分类映射查库，不编造标准号，也不把商品条码当成国家标准。全量国家
 标准目录约 8 万条，用 `--scope all` 或 `GB_SYNC_SCOPE=all`。手工指定分类号用 `--scope filtered`。
+`GB_SYNC_ENABLED=true` 时每天 `GB_SYNC_TIME`（默认 02:30）增量同步；失败按镜像同步同样的
+指数退避，封顶 900 秒，不会每 30 秒打 SAMR。同步成功后若某条标准的状态变成
+**即将实施 → 现行**或**任意 → 废止**，且该标准已写在 `contract_line_gb`（合同页选过），
+会推一条钉钉 markdown（同一标准同一天只发一次）。名称改了但状态没变不推，避免误报。
+合同页候选项旁有现行 / 即将实施 / 废止角标；已选标准被废止时仍会出现在下拉里并标红，
+生成合同时仍会中止。
 
 ```bash
 .venv/bin/python scripts/sync_gb_standards.py
@@ -208,7 +245,9 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 | `backend/dingtalk/` | 钉钉发送、身份映射、Stream 客户端与每日催办推送 |
 | `backend/delivery_reminders.py` | 四波催办口径，台账页 / Agent 工具 / 钉钉推送共用 |
 | `backend/gb_standards.py` | 国标目录同步：std.samr.gov.cn → `gb_standards` 表 |
-| `scripts/` | 快照同步、合同生成、模型训练与 Agent 命令行调试 |
+| `backend/logging_setup.py` | 统一日志：东八区时间 / 级别 / 模块，可选落 `data/app.log` |
+| `backend/health_watch.py` | `/api/health` 评估与告警去重；CLI 在 `scripts/health_watch.py` |
+| `scripts/` | 合同生成、模型训练、Agent 调试、国标同步与健康巡检 |
 | `data/snapshots/` | CSV 数据快照 |
 | `templates/采购合同模板.xlsx` | 用户提供的采购合同母版 |
 | `config/buyers.json` | 需方、仓库、送货与验收信息 |
@@ -222,7 +261,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 
 ## 采购合同生成
 
-访问 `http://127.0.0.1:8777/contract`，可按采购单号、供应商或采购员搜索并选择实时采购单，选择后自动展示单头与商品明细。不开票和普票默认税率为 0%，专票默认 13%，员工仍可手动调整；确认税率、每个 SKU 的合同单价，以及可选的执行标准后，必须先生成真实合同预览，核对后才能下载 Excel。
+访问 `http://127.0.0.1:8777/contract`，可按采购单号、供应商或采购员搜索并选择实时采购单，选择后自动展示单头与商品明细。不开票和普票默认税率为 0%，专票默认 13%，员工仍可手动调整；确认税率、每个 SKU 的合同单价，以及可选的执行标准后，必须先生成真实合同预览，核对后才能下载 Excel。Excel 由服务端 openpyxl 直接写入；预览仍把真实 XLSX 交给办公套件渲染，以便显示嵌入的商品图片。
 
 生成器自动完成：
 
@@ -230,7 +269,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 - 从实时明细表填写款式、SKU、品名、数量和交货日期；多交期时取最晚日期作为整单交货期限。
 - 从 `config/suppliers.json` 按供应商简称补齐供方全称、地址、联系人和票种税率。
 - 从 `config/products.json` 补齐**国标码（商品条码）**、分类、材质工艺、包装、单位、三类价格和商品图片。
-- 按商品表 `realtime_products.category`（缺则用产品配置分类）对照 `config/gb_category_map.json`，从 `gb_standards` 列出该目录族下现行 / 即将实施的**执行标准**（GB/T…）供勾选；未选不阻止生成。选中结果写入镜像库 `contract_line_gb`（按采购明细 `poi_id`），Excel 单独占一列，不覆盖国标码。
+- 按商品表 `realtime_products.category`（缺则用产品配置分类）对照 `config/gb_category_map.json`，从 `gb_standards` 列出该目录族下现行 / 即将实施的**执行标准**（GB/T…）供勾选；未选不阻止生成。选中结果写入镜像库 `contract_line_gb`（按采购明细 `poi_id`），Excel 单独占一列，不覆盖国标码。候选项带状态角标；已废止的已选标准会标出来，但不能再生成进合同。
 - 根据员工选择更新单价表头、合同第 4 条票种/税率、商品小计、总金额及付款方式中的采购单号。
 
 采购看板底部按采购单实际建立时间倒序展示最近 20 单，并提供“生成合同”入口；到货预警和完整交期清单统一放在交期提醒台账，避免两个页面重复。合同入口会携带采购单号打开合同页并自动载入对应订单。合同预览由真实 XLSX 经办公套件渲染，因此与下载文件使用相同数据，并能显示嵌入的商品图片。
@@ -265,7 +304,8 @@ Agent 或命令行也可调用同一能力：
 
 ## 采购助手（Agent）
 
-访问 `http://127.0.0.1:8777/chat`，填入 `AGENT_API_TOKEN` 和姓名即可对话。
+访问 `http://127.0.0.1:8777/chat`，填入 `AGENT_API_TOKEN` 和与 `staff_bindings` 一致的
+钉钉/采购员姓名即可对话。只读查询不校验姓名；生成合同、换货、发催办必须能对上绑定表。
 模型只负责理解意图、补参数、选工具和组织话术；**查库、算数、生成文件、外发消息全部由
 确定性代码完成**，模型不能生成 SQL，也不能改动工具返回的任何数字。
 
@@ -284,6 +324,7 @@ Agent 或命令行也可调用同一能力：
 | `search_products` | L0 只读 | 商品主数据里的 SKU（含分类） |
 | `gb_catalog_status` | L0 只读 | 国标目录库同步状态与条数 |
 | `lookup_gb_standards` | L0 只读 | 按 SKU / 名称 / 分类 / 标准号查执行标准（GB/T…） |
+| `master_data_gaps` | L0 只读 | 近 N 天采购的供应商未维护 / SKU 无图 / 票种缺价 / 分类未映射国标 |
 | `forecast_demand` | L0 只读 | 逐日销量预测 p50 与 p10/p90 区间 |
 | `order_suggestion` | L0 只读 | 订货建议（确定性公式，见下） |
 | `generate_purchase_contract` | **L1 生成产物** | 生成合同 Excel + 预览，先给要点再确认 |
@@ -295,11 +336,14 @@ Agent 或命令行也可调用同一能力：
 
 L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_actions`（默认 30 分钟有效），
 渠道渲染要点，由**发起人本人**确认后以 `pending_action_id` 为幂等键执行且只执行一次。
-重复确认回放已有结果，超时 / 取消后不可再执行。
+重复确认回放已有结果，超时 / 取消后不可再执行。网页 `/chat` 和台账「发送提醒」的
+`operator` 必须能对上 `staff_bindings` 里的钉钉/采购员姓名（花名或「真名（花名）」均可）；
+对不上时只读不拦，L1/L2 拒绝登记和确认。钉钉渠道仍按 userId 识别，不走这道姓名校验。
+对话层另有黄金回放夹具 `tests/fixtures/golden_dialogues.json`，CI 用假 LLM 按脚本跑
+`tests/test_agent.py` 的 `GoldenReplayTests`。
 
-`supplier_scorecard`（供应商绩效）、`price_watch`（价格异常）、`inventory_watch`（库存预警）、
-`create_purchase_draft`（采购单草稿）、`master_data_gaps`（主数据缺口）在
-`backend/agent/tools.py` 的 `RESERVED_TOOLS` 里占位，上线时加一条注册即可，不改 Agent Core。
+`supplier_scorecard`（供应商绩效）在 `RESERVED_TOOLS` 占位，**迁专用机器之后**再注册实现，
+不改 Agent Core。`price_watch` / `inventory_watch` / `create_purchase_draft` 已取消。
 
 ### 接口
 
@@ -313,7 +357,7 @@ L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_action
 | GET | `/api/agent/actions?session_id=` | 当前待确认动作 |
 | GET | `/api/agent/status` | 模型、工具清单、预测工件、钉钉状态 |
 | GET | `/api/agent/reminders?bucket=&buyer=&limit=` | 催办清单（不经模型，可直接给别的系统用） |
-| POST | `/api/agent/reminders/push` | 立即推送一次今天的催办（同一天幂等） |
+| POST | `/api/agent/reminders/push` | 立即推送催办。`{today, buyer, buckets, operator}`；不带 buyer 与定时任务同一日幂等键，带采购员则另开 `-web-{buyer}`。网页操作人须在 `staff_bindings` 中 |
 | GET | `/api/agent/audit/runs`、`/api/agent/audit/tools` | 对话与工具调用审计 |
 | GET | `/api/agent/staff`、POST 同路径 | 采购员 ↔ 钉钉 userId / 手机号绑定 |
 | POST | `/api/forecast/predict` | `{keys, horizonDays}` → 逐日 p50/p10/p90 |
@@ -385,6 +429,8 @@ DINGTALK_GROUP_CONVERSATION_ID=   # 群的 openConversationId，催办 @ 人必�
 ```
 
 `dingtalk-stream` 已在 `requirements.txt`。重启 `server.py` 后日志应出现「钉钉 Stream 已启动」。
+长连断开后监督线程会重建客户端（30 秒起指数退避，封顶 10 分钟），`/api/health` 里
+`dingtalk.stream.restartCount` / `lastError` 能看到重连次数。进程退出时会 `stop()`。
 
 4. 群里 @机器人 发 `绑定 利特`。ERP 里同一人经常还有「真名（花名）」，例如「李佳冬（利特）」：
    绑花名或全称任一即可，催办 @ 会视为同一个人；也可以一次 `绑定 利特、李佳冬（利特）`。
@@ -400,7 +446,8 @@ DINGTALK_GROUP_CONVERSATION_ID=   # 群的 openConversationId，催办 @ 人必�
 手机号反查 userId（应用机器人）：`resolve-mobile --mobile 138...`。种子文件可从
 `config/staff_bindings.example.json` 复制为 `config/staff_bindings.json`（不进版本库）。
 
-未绑定的人可以问只读问题（含国标目录状态、某商品对应执行标准），但 L1/L2 确认对不上网页上的同名操作人。会话按
+未绑定的人可以问只读问题（含国标目录状态、某商品对应执行标准、主数据缺口），但网页 L1/L2
+（生成合同、登记换货、发催办、确认 pending）对不上 `staff_bindings` 就拒绝。会话按
 `conversationId + senderId` 隔离；同一条钉钉消息 ID 只处理一次。确认回复「确认 编号」。
 群里可直接问「国标库同步了吗」「毛绒小熊用什么国标」；机器人走 `gb_catalog_status` /
 `lookup_gb_standards`，不会编造标准号，也不把商品条码当成国家标准。
@@ -409,7 +456,12 @@ DINGTALK_GROUP_CONVERSATION_ID=   # 群的 openConversationId，催办 @ 人必�
 
 - `DINGTALK_REMINDER_ENABLED=true`：每天 `DINGTALK_REMINDER_TIME`（默认 08:30）把四波催办
   清单发到群里并 @ 对应采购员。@ 到人靠 `staff_bindings` 的 userId（应用机器人）或手机号
-  （Webhook 机器人）。
+  （Webhook 机器人）。同一天**成功后**不再重发；失败会按 15 分钟间隔最多再试 3 次，
+  仍失败则等次日，错误出现在 `/api/health` 的 `dingtalk.reminder.lastError`。
+  手动 `POST /api/agent/reminders/push` 只认当日已成功记录，失败后仍可立刻再推。
+  交期台账「发送提醒」走同一接口：确认弹窗后按当前采购员筛选和档位推送；操作人姓名须与
+  `staff_bindings` 一致（与 `/chat` 共用 sessionStorage 里的 Token / 姓名）。全量已推过后
+  会提示「当日已推」；只筛某个采购员时用独立幂等键，早上群发后仍可再催一个人。
 - 只有 Webhook、没有应用机器人时，填 `DINGTALK_WEBHOOK_URL` / `DINGTALK_WEBHOOK_SECRET` 也能发催办，
   但不能 Stream 对话。
 
@@ -467,12 +519,10 @@ AGENT_MODEL=gpt-5.6-sol
 
 数据本身的两个坑，看板里如实呈现、没有抹平：
 
-1. **76% 的待入库数量没有预计到货日期**（34 万件），所以"到货计划"做不成时间轴，
+1. **待入库数量大量没有预计到货日期**，所以"到货计划"做不成时间轴，
    改成了「已逾期 / 排期内 / 未排期」三段构成。
-2. 实时主表提供供应商名称；备用 CSV 快照只有供应商 ID，降级时会显示 ID。
-3. **这份快照里最晚的预计到货日是 2026-08-11**（只比"今天"晚一天），所以「剩 2–10 天 /
-   11–20 天 / 20 天以上」三档现在都是 0 —— 不是算错，是数据里没有排到那么远的到货计划。
-   等新单带上未来的预计到货日，这三档会自己填上。
+2. 供应商名称取实时主表 `seller`。
+3. 预计到货日覆盖率和最远日期随镜像库变化；某档为 0 是数据里没有排到那么远的到货计划，不是算错。
 
 ## 看板结构
 
@@ -534,7 +584,7 @@ AGENT_MODEL=gpt-5.6-sol
 以 2026-08-10 为今天时：逾期 177 单 / T-1 8 单 / T-10 27 单 / T-20 13 单 /
 暂不提醒 39 单 / 未排期 137 单，需催合计 **225 单 · 193,069 件**。
 
-**「今天」可改**。快照没有真实的今天，默认取最后一笔采购日期（2026-08-10）；
+**「今天」可改**。默认取 payload `meta.today`（业务日，东八区）；
 顶栏第一个日期框改一下，四波和整张表立刻跟着重排。
 
 ## 别的
@@ -543,5 +593,27 @@ AGENT_MODEL=gpt-5.6-sol
 - 「按采购员的催办量」每人一条按波次堆叠，右端是需催量（前四波合计）
 - 「导出催办清单」按当前切片导出，多给两列：**交期来源**（交期 / 预计到货）和
   **下次提醒日**，直接拿去发
+- 「发送提醒」把当前采购员/档位的需催清单发到钉钉群（与定时催办同一口径）。需填写
+  `AGENT_API_TOKEN` 和绑定过的姓名；当日已成功推过同一批会提示「当日已推」
 - 点任意一行开抽屉：该单四波排期的具体日期 + 商品明细（颜色、规格、逐行交期与入库）
-- 实时模式显示主表 `seller` 供应商名称；降级到旧快照时显示 `item_supplier_id`
+- 供应商名称取实时主表 `seller`
+
+---
+
+# 品控问题台账
+
+钉钉群里用固定句式登记来货问题，当天 17:30（可配）把**当日登记**整理成 Excel 发回群里。
+网页对话走同一套工具，不另开数据源。默认 `QUALITY_LEDGER_ENABLED=false`。
+
+## 口径
+
+- **字段可空**：供应商、采购单号、SKU 解析不出就留空，**不猜**。描述不能空。
+  单号必须是 6 位以上数字且能在采购主表查到；SKU 必须像款号（字母+数字）；
+  供应商必须是 `config/suppliers.json` 的键。
+- **日报范围**：只含该自然日（东八区）登记、且状态不是「已撤销」的记录。
+  已关闭的当日记录仍进表。历史未关闭问题只在摘要里报一个计数，不进当日 Excel。
+- **指令**：`品控 …` / `品控关闭 <6位hex> [备注]` / `撤销品控 <6位hex>` /
+  `品控查询 [今天|本周|未关闭|供应商]`。同一条钉钉 `message_id` 只登记一次。
+- **发送**：应用机器人优先（markdown + 文件）；否则 webhook 带 7 天有效的签名下载链接
+  （`/api/quality/reports/{YYYYMMDD}/{sig}.xlsx`，无 Bearer）。
+- 空日默认 skip；`QUALITY_REPORT_EMPTY=notice` 才发「今日无登记」。

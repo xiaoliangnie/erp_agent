@@ -3,10 +3,11 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 采购看板 / 交期提醒台账 / 采购合同生成 / 订单换货 / 采购助手对话。一个 Vite + React + TS
-单页应用（五条路由）+ 一个 Python 标准库 HTTP 服务 + 一个 Node 电子表格生成器。数据源是
+单页应用（五条路由）+ 一个 Python 标准库 HTTP 服务。数据源是
 供应链安全代理 API 维护的本地可写 MySQL 镜像。业务术语、文件名、注释和文档一律用中文，改动时保持一致。
 
 `AGENTS.md` 有提交与代码风格约定；`README.md` 记录全部业务口径；
+`docs/README.md` 是文档索引。当前执行文档是 `docs/完善方案v3-整改与Agent演进.md`；
 `docs/PROJECT_DESIGN.md`、`docs/AGENT_ARCHITECTURE.md` 记录架构与后续路线。
 
 ## 常用命令
@@ -27,8 +28,8 @@ npm run typecheck                                # tsc --noEmit，build 里也�
 python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py   # 快速语法检查
 
 # 离线用例。`discover` 用不了：tests/ 不是包，要按模块名列出
-.venv/bin/python -m unittest tests.test_agent tests.test_forecast tests.test_delivery_reminders tests.test_exchange tests.test_order_source tests.test_product_images tests.test_realtime_mirror tests.test_gb_standards tests.test_contract_gb tests.test_dingtalk tests.test_codex_oauth
-.venv/bin/python -m unittest tests.test_contracts   # 需要 hanli.env 真连库
+.venv/bin/python -m unittest tests.test_agent tests.test_forecast tests.test_delivery_reminders tests.test_exchange tests.test_order_source tests.test_product_images tests.test_realtime_mirror tests.test_gb_standards tests.test_contract_gb tests.test_dingtalk tests.test_codex_oauth tests.test_health_watch tests.test_payload_contract tests.test_http_auth tests.test_contracts tests.test_source_cache tests.test_quality
+.venv/bin/python -m unittest tests.test_contracts   # 离线夹具；CONTRACT_LIVE_TESTS=1 才连库
 .venv/bin/python -m unittest tests.test_agent.ConfirmFlowTests   # 单个类
 
 .venv/bin/python scripts/generate_purchase_contract.py \
@@ -37,6 +38,8 @@ python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py   # 快
 .venv/bin/python scripts/run_agent_cli.py --status          # Agent / 预测 / 钉钉 子系统状态
 .venv/bin/python scripts/run_agent_cli.py --operator 张三   # 对话调试，不经 HTTP
 .venv/bin/python scripts/run_dingtalk_cli.py status         # 钉钉 Stream / 发送通道 / 绑定
+.venv/bin/python scripts/health_watch.py                    # 拉 /api/health，异常发钉钉
+.venv/bin/python scripts/health_watch.py --dry-run          # 只评估，不发钉钉
 
 # 训练并落工件到 FORECAST_MODEL_DIR，--forecaster 缺省用仓库里的 Baseline
 .venv/bin/python scripts/train_forecast_model.py --csv 销售明细.csv --forecaster mypkg.model:MyForecaster
@@ -48,9 +51,8 @@ python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py   # 快
 ```
 
 `tests/test_agent.py`、`tests/test_forecast.py`、`tests/test_delivery_reminders.py`、
-`tests/test_exchange.py` 全部离线，不需要任何凭证。只有 `tests/test_contracts.py` 例外：
-`build_contract_model` 会真连 `hanli.env` 指向的实时镜像库，并对真实采购单 604264 断言日期、
-供应商和单价，没有凭证时整个文件跑不起来，也没有离线夹具路径。
+`tests/test_exchange.py` 全部离线，不需要任何凭证。`tests/test_contracts.py` 的合同模型
+离线走夹具；对真实采购单 604264 的 live 断言要设 `CONTRACT_LIVE_TESTS=1` 且有 `hanli.env`。
 
 `scripts/sync_purchase_data.py --env /path/to/test.env` 只用于把 CSV 幂等导入**另一个测试库**，
 `--env` 是必填的，不在生产链路上。
@@ -81,7 +83,7 @@ Agent 链路复用同一份查询和同一份缓存，不另开数据源：
 ```
 
 `server.py` 只是 `backend.app.main` 的入口。服务用标准库 `ThreadingHTTPServer` 手写，
-没有 Web 框架，运行期依赖只有 PyMySQL（钉钉 Stream 才需要 `dingtalk-stream`）；新增接口
+没有 Web 框架，运行期依赖是 PyMySQL、openpyxl、Pillow（钉钉 Stream 才需要 `dingtalk-stream`）；新增接口
 就是在 `Handler.do_GET/do_POST` 里加分支。`source_cache()` 按年度缓存 30 秒，页面和
 Agent 工具（`agent_rows()`）共用这一份，短时间内不会重复压库。
 实时库连不上就直接报错，**不回退旧库**——避免员工把历史快照当成实时数据。
@@ -120,8 +122,8 @@ frontend/index.html · frontend/src/main.tsx     Vite 入口，root 是 frontend
 payload 是 `{meta, dict, orders, lines}`，`orders`/`lines` 是纯位置数组，字典维度只存下标。
 下标常量现在只有两处，改列顺序同步这两处即可：
 
-- `backend/procurement_data.py:76` `build_dashboard_payload` / `:138` `build_delivery_payload`
-- `frontend/src/data/payload.ts` 的 `O_*` / `L_*` 与 `EXPECTED_*` 宽度
+- `backend/procurement_data.py` 的 `DASHBOARD_*_COLUMNS` / `DELIVERY_*_COLUMNS`
+- `frontend/src/data/payload.ts` 的同名列数组；宽度由列名长度得出
 
 `payload.ts` 的 `decodeDashboard` / `decodeDelivery` 会校验数组宽度并把位置数组转成命名字段，
 页面组件拿到的是对象，不再各写一份下标。宽度不符会直接抛错，而不是静默错位。
@@ -151,29 +153,27 @@ payload 是 `{meta, dict, orders, lines}`，`orders`/`lines` 是纯位置数组�
 合同——这是刻意的，不要加兜底默认值。票种只有 `no_invoice` / `normal_invoice` /
 `special_invoice`，默认税率 0 / 0 / 13，员工可覆盖。
 
-模型写成临时 JSON 后交给 Node：
+模型由 `backend/contract_workbook.py`（openpyxl）在进程内写成 `.xlsx`：
 
 ```
-build_contract_model → *.contract-input.json → node scripts/generate_contract.mjs → .xlsx
-                                                    → soffice --convert-to pdf → pdftoppm → .png 预览
+build_contract_model → write_contract_workbook → .xlsx
+                                              → soffice --convert-to pdf → pdftoppm → .png 预览
 ```
 
-`scripts/generate_contract.mjs` 依赖 `@oai/artifact-tool`，根目录 `package.json` 只管前端，
-**没有声明这个包，当前 checkout 里也解析不到**——合同生成需要预置该模块的环境。
-可执行文件可用环境变量覆盖：`CONTRACT_NODE`、`CONTRACT_SOFFICE`、`CONTRACT_PDFTOPPM`、
-`CONTRACT_FONTCONFIG_FILE`。预览必须走真实办公套件渲染，否则嵌入的商品图片不会出现。
+根目录 `package.json` 只管前端。预览必须走真实办公套件渲染，否则嵌入的商品图片不会出现。
+可执行文件可用环境变量覆盖：`CONTRACT_SOFFICE`、`CONTRACT_PDFTOPPM`、`CONTRACT_FONTCONFIG_FILE`。
 
-`generate_contract.mjs` 的整张表都是从 `itemStart = 9` 和明细条数算出来的行号
-（合计行、条款行、签字行、合并区、`=N*L` 与 `=SUM` 公式全跟着偏移）。明细共 16 列 A–P，
-**国标码**（E，商品条码）和 **执行标准**（F，GB/T…）不是同一列。增删表头行必须
-同时改这些偏移量和 `merges` 列表。
+整张表都从 `itemStart = 9` 和明细条数算行号（合计行、条款行、签字行、合并区、
+`=N*L` 与 `=SUM` 公式全跟着偏移）。明细共 16 列 A–P，**国标码**（E，商品条码）和
+**执行标准**（F，GB/T…）不是同一列。增删表头行必须同时改这些偏移量和 `merges` 列表。
 
 ### Agent Core
 
 工具注册表（`backend/agent/tools.py`）是模型唯一能碰到的业务入口：声明名称、入参
 JSON Schema、风险级和 handler。**禁止让模型生成 SQL 或改动工具返回的数字**，
 每项查询对应一个固定参数化工具。新增能力就是加一条 `registry.register(...)`，
-不改 Agent Core；§14 预留的工具位在 `RESERVED_TOOLS` 里只占位、不写实现。
+不改 Agent Core；`RESERVED_TOOLS` 目前只留 `supplier_scorecard` 占位
+（`master_data_gaps` 已注册为 L0；价格盯盘 / 库存预警 / 采购草稿已取消）。
 
 L0 直接执行。**L1/L2 一律不直接执行**：`runner._invoke` 把它转成 `pending_actions`
 一条记录（默认 30 分钟），带上 `preview` 的要点；`PendingActions.execute` 在
@@ -182,7 +182,7 @@ L0 直接执行。**L1/L2 一律不直接执行**：`runner._invoke` 把它转�
 的 `ConfirmFlowTests`。
 
 Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方案 §10 一致，
-连接和建表集中在 `backend/agent/store.py` 一处，迁 MySQL 只换这一层。
+连接和建表集中在 `backend/agent/store.py` 一处。迁 MySQL 只换这一层，**P2、专用机器落地后再做**。
 
 ### 预测子系统的边界
 
@@ -207,12 +207,19 @@ Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方�
 - `.env`：服务、Agent、钉钉配置，在 `backend/app.py` 导入时由 `load_all_env` 读入；
   `setting()` 让进程环境变量优先于 `.env`
 - 页面走 `frontend/dist/` SPA 托管；`STATIC_FILES` 白名单只剩油猴 worker 脚本
-- `/api/contracts/*`、`/api/exchange/*`（页面用）无鉴权；`/api/agent/*`、`/api/forecast/*`
-  用 Bearer `AGENT_API_TOKEN` 常量时间比对，未配置 token 时返回 503 保持关闭
+- `/api/contracts/*` 页面用、无鉴权（资源路径限制在 `outputs/` 下）；`/api/exchange/*`
+  双 token（页面 `EXCHANGE_API_TOKEN` / worker `EXCHANGE_WORKER_TOKEN`）；
+  `/api/agent/*`、`/api/forecast/*` 用 Bearer `AGENT_API_TOKEN` 常量时间比对，
+  未配置 token 时返回 503 保持关闭
 - `AGENT_ENABLED` 默认 `false`；关闭时对话接口返回 503，看板与合同链路不受影响
-- `DINGTALK_ENABLED` 管发送与 Stream 交互，`DINGTALK_REMINDER_ENABLED` 单独管每日定时
-  推送（不依赖大模型，可以只开这一个），默认都是 `false`
-- `GB_SYNC_ENABLED` 管国标目录每日同步，默认 `false`；手工跑 `scripts/sync_gb_standards.py`
+- `DINGTALK_ENABLED` 是总闸：关闭则不装配发送通道，催办/品控日报也发不出去。
+  `DINGTALK_REMINDER_ENABLED` 另管每日定时催办（不依赖大模型）
+- `GB_SYNC_ENABLED` 管国标目录每日同步；失败按指数退避封顶 900 秒。同步成功后若合同已选用
+  的执行标准变成现行或废止，会推钉钉（同一标准同一天只发一次）。手工跑
+  `scripts/sync_gb_standards.py`
+- `LOG_FILE` 默认 `data/app.log`，空则只写 stderr；时间固定东八区，文件用 RotatingFileHandler。
+  `scripts/health_watch.py` 每 5 分钟拉 `/api/health` 发钉钉，不要 import `backend.app`
+  （会把 HTTP 服务、催办调度、品控调度和镜像线程全部装配进来）
 - 网页生成的合同落在 `outputs/generated/`，Agent 生成的落在 `outputs/agent/<24位hex>/`；
   `outputs/` 整个不进版本库
 
@@ -222,6 +229,8 @@ Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方�
 - 前端组件用函数式 + hooks，页面级状态就用 `useState`，没有引入状态库；颜色只从
   `base.css` 的令牌取（`cssVar()`），不要在组件里写死色值
 - 改前端必须能通过 `npm run build`（含 `tsc --noEmit`），`noUnusedLocals` 是开着的
+- 前端业务日期禁止用本地时钟 `new Date()` 运算，「今天」一律取 payload `meta.today`；
+  日历加减用 UTC（`T00:00:00Z` + `getUTC*` / `setUTCDate`），不要 `toISOString()` 去本地午夜
 - 改动日期或数量口径必须同步更新 `README.md` 的口径章节
 - 新增 Agent 工具要同时补 `tests/test_agent.py`；L1/L2 工具必须给出 `preview`
 - 不要提交凭证、供应商真实信息、训练好的模型工件（`data/models/`）或无关的 CSV 导出

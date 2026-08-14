@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { TopBar } from "../../components/TopBar";
 import { LoadFailed, Loading } from "../../components/PageState";
@@ -40,8 +40,8 @@ export default function DashboardPage() {
   const year = params.get("year");
   const { data, error, loading, reload } = usePayload<DashboardData>("/api/dashboard", year, decodeDashboard);
 
-  if (loading && !data) return <Loading />;
-  if (error && !data) return <LoadFailed message={error} onRetry={reload} />;
+  if (loading) return <Loading />;
+  if (error) return <LoadFailed message={error} onRetry={reload} />;
   if (!data) return <LoadFailed message="接口没有返回数据。" onRetry={reload} />;
   return (
     <TooltipProvider>
@@ -66,15 +66,33 @@ function Dashboard({ data, year, onYear }: { data: DashboardData; year: string |
       : [...new Set(orders.map((order) => order.date.slice(0, 4)).filter(Boolean))];
     return available.slice().sort().reverse();
   }, [meta.availableYears, orders]);
-  const activeYear = year && years.includes(year) ? year : (years[0] ?? today.slice(0, 4));
+  const activeYear = year && years.includes(year)
+    ? year
+    : (meta.selectedYear && years.includes(meta.selectedYear)
+      ? meta.selectedYear
+      : (years[0] ?? today.slice(0, 4)));
 
   const [filters, setFilters] = useState<DashFilters>(() => {
     const [from, to] = yearBounds(activeYear, meta.maxDate);
     return { preset: "year", from, to, status: "", cat: "", buyer: "", query: "", eta: "" };
   });
+  const [queryDraft, setQueryDraft] = useState("");
   const [granularity, setGranularity] = useState<"day" | "week" | "month">("month");
   const [sizeMode, setSizeMode] = useState(1);
   const [openedOrder, setOpenedOrder] = useState<number | null>(null);
+
+  useEffect(() => {
+    const [from, to] = yearBounds(activeYear, meta.maxDate);
+    setFilters({ preset: "year", from, to, status: "", cat: "", buyer: "", query: "", eta: "" });
+    setQueryDraft("");
+  }, [activeYear, meta.maxDate]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setFilters((current) => ({ ...current, query: queryDraft }));
+    }, 160);
+    return () => window.clearTimeout(timer);
+  }, [queryDraft]);
 
   const etaDays = useMemo(() => makeEtaDays(today), [today]);
   const slice = useMemo(() => applyFilters(data, filters, activeYear, etaDays), [data, filters, activeYear, etaDays]);
@@ -113,6 +131,7 @@ function Dashboard({ data, year, onYear }: { data: DashboardData; year: string |
   function resetFilters() {
     const [from, to] = yearBounds(activeYear, meta.maxDate);
     setFilters({ preset: "year", from, to, status: "", cat: "", buyer: "", query: "", eta: "" });
+    setQueryDraft("");
   }
 
   const catTotal = cats.reduce((sum, item) => sum + item.amount, 0);
@@ -227,8 +246,8 @@ function Dashboard({ data, year, onYear }: { data: DashboardData; year: string |
             id="f-q"
             type="search"
             placeholder="单号 / 商品 / 编码"
-            value={filters.query}
-            onChange={(event) => patch({ query: event.target.value })}
+            value={queryDraft}
+            onChange={(event) => setQueryDraft(event.target.value)}
           />
         </div>
         <button type="button" className="reset" onClick={resetFilters}>
@@ -370,6 +389,7 @@ function Dashboard({ data, year, onYear }: { data: DashboardData; year: string |
                 {[
                   { m: 1, label: "服装号型" },
                   { m: 2, label: "鞋码" },
+                  { m: 3, label: "字母码" },
                 ].map((option) => (
                   <button
                     key={option.m}
@@ -397,7 +417,7 @@ function Dashboard({ data, year, onYear }: { data: DashboardData; year: string |
             chart={(width) => <SizeHeatmap matrix={sizes} mode={sizeMode} width={width} />}
             table={{
               columns: [
-                { label: sizeMode === 1 ? "商品（号型）" : "商品（鞋码）" },
+                { label: sizeMode === 1 ? "商品（号型）" : sizeMode === 3 ? "商品（字母码）" : "商品（鞋码）" },
                 ...sizes.cols.map((col) => ({ label: col, n: true })),
                 { label: "合计", n: true },
               ],
@@ -433,7 +453,12 @@ function Dashboard({ data, year, onYear }: { data: DashboardData; year: string |
               </div>
               <div className="ctrl">
                 <span className="note">最近 {int(recentOrders.length)} 单</span>
-                <Link className="btn ledger-link" to={ROUTES.ledger}>查看交期台账 →</Link>
+                <Link
+                  className="btn ledger-link"
+                  to={activeYear ? `${ROUTES.ledger}?year=${encodeURIComponent(activeYear)}` : ROUTES.ledger}
+                >
+                  查看交期台账 →
+                </Link>
               </div>
             </div>
             <div className="tbl" style={{ maxHeight: "none" }}>

@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
+import logging
 import mimetypes
 import queue
+import socket
 import ssl
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -25,6 +29,18 @@ except ImportError:  # pragma: no cover - requirements 已显式安装
     certifi = None
 
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where() if certifi else None)
+logger = logging.getLogger(__name__)
+
+_PRIVATE_IMAGE_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
+    ipaddress.ip_network("fe80::/10"),
+)
 
 
 PURCHASE_ORDER_TABLE = "realtime_purchase_orders"
@@ -287,7 +303,51 @@ def _image_url(record: dict) -> str:
     if isinstance(value, dict):
         value = _first(value, "url", "src", "image_url", default="")
     value = _text(value)
-    return value[:2048] if value.startswith(("http://", "https://")) else ""
+    if not value.startswith(("http://", "https://")):
+        return ""
+    host = urllib.parse.urlparse(value).hostname or ""
+    if _blocked_literal_host(host):
+        return ""
+    return value[:2048]
+
+
+def _ip_is_private(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return any(ip in network for network in _PRIVATE_IMAGE_NETWORKS)
+
+
+def _blocked_literal_host(host: str) -> bool:
+    hostname = str(host or "").strip().strip("[]").rstrip(".").lower()
+    if not hostname or hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        return _ip_is_private(ipaddress.ip_address(hostname))
+    except ValueError:
+        return False
+
+
+def blocked_image_url(url: str, *, resolve: bool = False) -> bool:
+    """内网 / localhost 图片地址不可下载。resolve=True 时再解析 DNS，挡住解析到内网的域名。"""
+    parsed = urllib.parse.urlparse(str(url or ""))
+    if parsed.scheme not in {"http", "https"}:
+        return True
+    host = parsed.hostname or ""
+    if _blocked_literal_host(host):
+        return True
+    if not resolve:
+        return False
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return True
+    for info in infos:
+        addr = info[4][0] if info[4] else ""
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if _ip_is_private(ip):
+            return True
+    return False
 
 
 def _items_field(record: dict) -> tuple[list[dict], bool]:
@@ -1090,8 +1150,22 @@ def cache_product_image(directory: Path, sku: str, url: str, *, timeout: int = 1
     existing = next((path for path in directory.glob(f"{safe}.*") if path.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")), None)
     if existing:
         return existing
+    if blocked_image_url(url, resolve=True):
+        raise ValueError("拒绝下载内网或本机商品图片地址")
     request = urllib.request.Request(url, headers={"User-Agent": "AgentDemoRealtimeMirror/1.0"})
-    with urllib.request.urlopen(request, timeout=max(1, int(timeout)), context=SSL_CONTEXT) as response:
+
+    class _GuardedRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if blocked_image_url(newurl, resolve=True):
+                raise ValueError("拒绝跟随到内网图片地址")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=SSL_CONTEXT),
+        urllib.request.HTTPHandler(),
+        _GuardedRedirect(),
+    )
+    with opener.open(request, timeout=max(1, int(timeout))) as response:
         content_type = response.headers.get_content_type().lower()
         data = response.read(10 * 1024 * 1024 + 1)
     if not data or len(data) > 10 * 1024 * 1024:
@@ -1159,7 +1233,7 @@ class MirrorScheduler:
             except Exception as exc:  # 主服务日志不包含请求凭据。
                 failures += 1
                 self._status.update(lastError=str(exc)[:1000])
-                print(f"实时镜像同步失败：{exc}")
+                logger.error("实时镜像同步失败：%s", exc)
             finally:
                 self._status.update(running=False)
             wait_seconds = min(self.interval * (2 ** min(failures, 4)), 900) if failures else self.interval

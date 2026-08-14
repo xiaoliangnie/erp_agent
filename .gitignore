@@ -16,5 +16,7 @@ data/*.sqlite3
 data/*.sqlite3-*
 data/product-images/
 data/models/
+data/*.log
+data/health_watch_state.json
 config/staff_bindings.json
 docs/api.txt

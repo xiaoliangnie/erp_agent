@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """数据库连接、表结构与采购明细查询。"""
+import json
+import os
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -211,9 +213,22 @@ def fetch_realtime_years(env_path="hanli.env"):
         FROM `{REALTIME_MAIN_TABLE}`
         WHERE po_date IS NOT NULL
           AND COALESCE(status, '') NOT IN ('Cancelled', 'Delete', 'Merged')
+          AND po_date < %s
         ORDER BY year DESC
     """
-    return [row["year"] for row in read_query(env_path, sql)]
+    upper = business_today() + timedelta(days=1)
+    years = [row["year"] for row in read_query(env_path, sql, (upper,))]
+    return [year for year in years if str(year).isdigit() and int(year) <= business_today().year]
+
+
+def purchase_window_warning(year) -> str | None:
+    """当前年度明细窗口截到今天时给出提示，与 fetch_realtime_purchase_rows 同一上界。"""
+    year = int(year)
+    natural_end = date(year + 1, 1, 1)
+    end = min(natural_end, business_today() + timedelta(days=1))
+    if end < natural_end:
+        return f"{year} 年明细只读到 {business_today().isoformat()}，之后下的采购单未纳入"
+    return None
 
 
 def fetch_realtime_purchase_rows(year, env_path="hanli.env"):
@@ -297,8 +312,25 @@ def fetch_realtime_purchase_rows(year, env_path="hanli.env"):
     return [{column_map[key]: value for key, value in row.items()} for row in records]
 
 
-def fetch_contract_order(po_id, env_path="hanli.env"):
+def load_contract_order_fixture(path, po_id=None):
+    """从 JSON 夹具读取一张采购单，形状与 `fetch_contract_order` 相同。"""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or "order" not in data or "items" not in data:
+        raise ValueError("合同夹具必须包含 order 和 items")
+    order = data["order"]
+    items = data["items"]
+    if not isinstance(order, dict) or not isinstance(items, list) or not items:
+        raise ValueError("合同夹具 order 必须是对象、items 必须是非空数组")
+    if po_id is not None and str(order.get("po_id") or "") != str(po_id):
+        raise ValueError(f"合同夹具采购单号是 {order.get('po_id')}，不是 {po_id}")
+    return order, items
+
+
+def fetch_contract_order(po_id, env_path="hanli.env", *, fixture_path=None):
     """读取一张采购单及其全部合同明细。"""
+    fixture_path = fixture_path or os.environ.get("CONTRACT_ORDER_FIXTURE", "").strip() or None
+    if fixture_path:
+        return load_contract_order_fixture(fixture_path, po_id)
     main_sql = f"""
         SELECT po_id, po_date, so_id, status, supplier_id, seller,
                purchaser_name, send_address, payment_method, wms_co_name,

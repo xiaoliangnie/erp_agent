@@ -15,7 +15,10 @@
   display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: start;
   padding: 9px 10px; border: 1px solid var(--border); border-radius: 8px; cursor: pointer;
 }
-.exchange-types label:has(input:checked) { border-color: #87a995; background: #f0f7f3; }
+.exchange-types label:has(input:checked) {
+  border-color: color-mix(in srgb, var(--series-1) 55%, var(--border));
+  background: color-mix(in srgb, var(--series-1) 8%, var(--surface-1));
+}
 .exchange-types input { margin-top: 3px; }
 .exchange-types b, .exchange-types small { display: block; }
 .exchange-types b { font-size: 13px; }
@@ -51,17 +54,42 @@
   font-size: 12px; padding: 2px 8px; border-radius: 999px; flex: none;
   background: var(--wash); color: var(--text-secondary); border: 1px solid var(--border);
 }
-.pill.awaiting_confirm { background: #fff1cf; color: #805200; border-color: #f0dcae; }
-.pill.executing, .pill.confirmed { background: #e1f0e8; color: #1e6546; border-color: #c6e2d3; }
-.pill.done { background: #e4f4e9; color: #1f6d47; border-color: #c6e2d3; }
-.pill.failed, .pill.cancelled { background: #fde7e7; color: #963434; border-color: #f2caca; }
+.pill.awaiting_confirm {
+  background: color-mix(in srgb, var(--warning) 22%, var(--surface-1));
+  color: var(--text-secondary);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+.pill.executing, .pill.confirmed {
+  background: color-mix(in srgb, var(--good) 14%, var(--surface-1));
+  color: var(--delta-up);
+  border-color: color-mix(in srgb, var(--good) 32%, var(--border));
+}
+.pill.done {
+  background: color-mix(in srgb, var(--good) 14%, var(--surface-1));
+  color: var(--delta-up);
+  border-color: color-mix(in srgb, var(--good) 32%, var(--border));
+}
+.pill.failed, .pill.cancelled {
+  background: color-mix(in srgb, var(--critical) 12%, var(--surface-1));
+  color: var(--critical);
+  border-color: color-mix(in srgb, var(--critical) 32%, var(--border));
+}
+.pill.stuck {
+  background: color-mix(in srgb, var(--warning) 22%, var(--surface-1));
+  color: var(--text-secondary);
+  border-color: color-mix(in srgb, var(--warning) 45%, var(--border));
+}
+
+.exchange-layout > .exchange-stale,
+.exchange-layout > .exchange-offline { margin: 0 0 4px; grid-column: 1 / -1; }
+.exchange-offline { border-left-color: var(--critical); }
 
 .plan { margin-top: 8px; }
 .plan th, .plan td { vertical-align: top; white-space: normal; }
 .plan .ok { color: var(--good); }
 .plan .skip { color: var(--critical); }
 .exchange-risk.same_style { color: var(--good); }
-.exchange-risk.special_mapping, .risk-warning { color: #9b5b00; }
+.exchange-risk.special_mapping, .risk-warning { color: var(--text-secondary); }
 .exchange-policy { margin-bottom: 16px; }
 .exchange-policy b { display: block; margin-bottom: 4px; }
 

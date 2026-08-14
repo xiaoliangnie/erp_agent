@@ -43,6 +43,32 @@ export interface WaveStamp {
   wave: OrderWave;
 }
 
+/** 单行交期：约定交期优先，空则退到预计到货。与后端 `agreed or expected` 对齐。 */
+export function lineDueDate(line: { deliveryDate?: string; eta?: string }): string {
+  return line.deliveryDate || line.eta || "";
+}
+
+/** 整单交期：待入库行逐行回退后取最早；已入库完则用全部行。 */
+export function earliestDueDate(
+  lines: Array<{ deliveryDate?: string; eta?: string; qty: number; inQty: number }>,
+): { eta: string; etaSource: "" | "交期" | "预计到货"; etaSpread: number } {
+  const pending = lines.filter((line) => line.qty - line.inQty > 0);
+  const pool = pending.length ? pending : lines;
+  let eta = "";
+  let etaSource: "" | "交期" | "预计到货" = "";
+  const dates = new Set<string>();
+  for (const line of pool) {
+    const due = lineDueDate(line);
+    if (!due) continue;
+    dates.add(due);
+    if (!eta || due < eta) {
+      eta = due;
+      etaSource = line.deliveryDate ? "交期" : "预计到货";
+    }
+  }
+  return { eta, etaSource, etaSpread: dates.size };
+}
+
 export function buildOrders(data: DeliveryData): LedgerOrder[] {
   const { dict, orders, lines } = data;
   const built: LedgerOrder[] = orders.map((order) => ({
@@ -82,20 +108,11 @@ export function buildOrders(data: DeliveryData): LedgerOrder[] {
   for (const order of built) {
     if (!order.lines.length) continue;
 
-    // 交期优先看待入库行；整单已入库完的退一步用全部行，好歹显示个日期。
-    const pending = order.lines.filter((line) => line.qty - line.inQty > 0);
-    const pool = pending.length ? pending : order.lines;
-    const agreed = pool.map((line) => line.deliveryDate).filter(Boolean);
-    const expected = pool.map((line) => line.eta).filter(Boolean);
-    if (agreed.length) {
-      order.eta = agreed.reduce((a, b) => (a < b ? a : b));
-      order.etaSource = "交期";
-      order.etaSpread = new Set(agreed).size;
-    } else if (expected.length) {
-      order.eta = expected.reduce((a, b) => (a < b ? a : b));
-      order.etaSource = "预计到货";
-      order.etaSpread = new Set(expected).size;
-    }
+    // 与后端 delivery_reminders 一致：逐行 deliveryDate || eta，再取待入库行里最早的。
+    const due = earliestDueDate(order.lines);
+    order.eta = due.eta;
+    order.etaSource = due.etaSource;
+    order.etaSpread = due.etaSpread;
     order.etaDay = order.eta ? dayNumber(order.eta) : null;
 
     const byProduct = new Map<number, number>();

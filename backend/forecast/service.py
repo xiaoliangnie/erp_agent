@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import math
 from datetime import date, timedelta
+
+from ..business_time import business_today
 from pathlib import Path
 from statistics import NormalDist
 
@@ -25,7 +27,7 @@ from .dataset import (
     load_in_transit,
     load_inventory,
 )
-from .models import ForecastError, sigma_from_interval
+from .models import ForecastError, assert_quantile_order, sigma_from_interval
 from .store import ForecastStore
 
 
@@ -123,6 +125,7 @@ class ForecastService:
         keys = self._clean_keys(keys)
         horizon = max(1, min(int(horizon_days or model.default_horizon_days or self.default_horizon_days), 365))
         points = model.predict(keys, horizon, start_date=start_date)
+        assert_quantile_order(points)
         covered = sorted({point["key"] for point in points})
         missing = [key for key in keys if key not in covered]
         series = {}
@@ -132,7 +135,7 @@ class ForecastService:
             "model": {"name": model.name, "version": model.version,
                       "granularity": model.granularity},
             "horizonDays": horizon,
-            "startDate": (start_date or date.today().isoformat()),
+            "startDate": (start_date or business_today().isoformat()),
             "keys": covered,
             "missingKeys": missing,
             "totals": {key: round(sum(item["p50"] for item in items), 2)
@@ -153,7 +156,7 @@ class ForecastService:
         level = float(service_level if service_level is not None else self.default_service_level)
         if not 0.5 <= level <= 0.99:
             raise ForecastError("服务水平必须在 0.5 到 0.99 之间")
-        first = date.fromisoformat(str(today)) if today else date.today()
+        first = date.fromisoformat(str(today)) if today else business_today()
 
         stock = self._resolve_inventory(keys, inventory)
         pipeline = self._resolve_in_transit(keys, in_transit)

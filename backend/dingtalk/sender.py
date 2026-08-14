@@ -28,6 +28,28 @@ OAPI_BASE = "https://oapi.dingtalk.com"
 TIMEOUT_SECONDS = 15
 
 
+def encode_multipart(fields, files) -> tuple[bytes, str]:
+    """拼 multipart/form-data。fields=(name,value)；files=(name,filename,bytes,content_type)。"""
+    import secrets
+    boundary = secrets.token_hex(16)
+    body = bytearray()
+    for name, value in fields:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.extend(str(value).encode("utf-8"))
+        body.extend(b"\r\n")
+    for name, filename, content, content_type in files:
+        body.extend(f"--{boundary}\r\n".encode("utf-8"))
+        body.extend(
+            f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'.encode("utf-8")
+        )
+        body.extend(f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"))
+        body.extend(content)
+        body.extend(b"\r\n")
+    body.extend(f"--{boundary}--\r\n".encode("utf-8"))
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
 class DingTalkError(RuntimeError):
     """钉钉调用失败；消息可回给员工，但不含密钥。"""
 
@@ -188,6 +210,48 @@ class DingTalkSender:
                        for index, button in enumerate(buttons[:6])},
                     **{f"button_url_{index + 1}": button.get("url", "")
                        for index, button in enumerate(buttons[:6])},
+                }, ensure_ascii=False),
+            },
+            headers={"x-acs-dingtalk-access-token": self.access_token()},
+        )
+
+    def upload_media(self, path, filetype: str = "file") -> dict:
+        """上传文件到钉钉，返回 mediaId。标准库手拼 multipart。"""
+        from pathlib import Path
+        path = Path(path)
+        payload, content_type = encode_multipart(
+            [("type", filetype)],
+            [("media", path.name, path.read_bytes(), "application/octet-stream")],
+        )
+        token = urllib.parse.quote(self.access_token())
+        url = f"{OAPI_BASE}/media/upload?access_token={token}&type={urllib.parse.quote(filetype)}"
+        request = urllib.request.Request(
+            url, data=payload, headers={"Content-Type": content_type}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS, context=_ssl_context()) as response:
+                body = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            raise DingTalkError(f"钉钉上传返回 {exc.code}：{exc.read().decode('utf-8', 'replace')[:300]}") from exc
+        except urllib.error.URLError as exc:
+            raise DingTalkError(f"钉钉上传连接失败：{exc.reason}") from exc
+        if int(body.get("errcode", 0) or 0) != 0:
+            raise DingTalkError(f"钉钉拒绝上传：{body.get('errmsg')}")
+        media_id = str(body.get("media_id") or body.get("mediaId") or "")
+        if not media_id:
+            raise DingTalkError("钉钉没有返回 media_id")
+        return {"mediaId": media_id, "type": body.get("type") or filetype}
+
+    def send_file(self, conversation_id: str, media_id: str, file_name: str,
+                  file_type: str = "xlsx") -> dict:
+        return _post_json(
+            f"{OPEN_API_BASE}/v1.0/robot/groupMessages/send",
+            {
+                "robotCode": self.robot_code,
+                "openConversationId": conversation_id,
+                "msgKey": "sampleFile",
+                "msgParam": json.dumps({
+                    "mediaId": media_id, "fileName": file_name, "fileType": file_type,
                 }, ensure_ascii=False),
             },
             headers={"x-acs-dingtalk-access-token": self.access_token()},

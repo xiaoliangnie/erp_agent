@@ -23,14 +23,17 @@ def build_dingtalk(*, setting, store, audit, flag, root=None):
     返回的 `notifier` 会注入 Agent 工具上下文；未配置发送通道时 `notifier.enabled`
     为 False，`send_delivery_reminder` 工具不会被注册。
     """
-    sender = DingTalkSender(
-        webhook_url=setting("DINGTALK_WEBHOOK_URL", ""),
-        webhook_secret=setting("DINGTALK_WEBHOOK_SECRET", ""),
-        client_id=setting("DINGTALK_CLIENT_ID", ""),
-        client_secret=setting("DINGTALK_CLIENT_SECRET", ""),
-        robot_code=setting("DINGTALK_ROBOT_CODE", ""),
-        group_conversation_id=setting("DINGTALK_GROUP_CONVERSATION_ID", ""),
-    )
+    if not flag(setting("DINGTALK_ENABLED", "false")):
+        sender = DingTalkSender()
+    else:
+        sender = DingTalkSender(
+            webhook_url=setting("DINGTALK_WEBHOOK_URL", ""),
+            webhook_secret=setting("DINGTALK_WEBHOOK_SECRET", ""),
+            client_id=setting("DINGTALK_CLIENT_ID", ""),
+            client_secret=setting("DINGTALK_CLIENT_SECRET", ""),
+            robot_code=setting("DINGTALK_ROBOT_CODE", ""),
+            group_conversation_id=setting("DINGTALK_GROUP_CONVERSATION_ID", ""),
+        )
     directory = StaffDirectory(store)
     if root:
         directory.seed_from_json(Path(root) / "config" / "staff_bindings.json")

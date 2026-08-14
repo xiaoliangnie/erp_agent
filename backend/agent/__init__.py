@@ -9,17 +9,23 @@ from pathlib import Path
 from .actions import ActionError, PendingActions
 from .audit import AuditLog
 from .llm import LLMClient, LLMError
+from .maintenance import MaintenanceScheduler
+from .memories import OperatorMemories
 from .runner import AgentDisabled, AgentRunner
 from .sessions import SessionStore
 from .store import AgentStore
-from .tools import RESERVED_TOOLS, RISK_LEVELS, Tool, ToolContext, ToolError, ToolRegistry, build_registry
+from .tools import (
+    RESERVED_TOOLS, RISK_LEVELS, Tool, ToolContext, ToolError, ToolRegistry,
+    build_registry, declared_arguments,
+)
 
 
 __all__ = [
     "ActionError", "AgentDisabled", "AgentRunner", "AgentStore", "AuditLog", "LLMClient",
     "LLMError", "PendingActions", "RESERVED_TOOLS", "RISK_LEVELS", "SessionStore", "Tool",
     "ToolContext", "ToolError", "ToolRegistry", "agent_database_path", "build_agent",
-    "build_registry", "flag",
+    "build_registry", "declared_arguments", "flag", "MaintenanceScheduler",
+    "OperatorMemories",
 ]
 
 
@@ -38,7 +44,8 @@ def agent_database_path(setting, root):
 
 
 def build_agent(*, setting, root, env_path, fetch_rows, exchange=None, forecast=None,
-                notifier=None, store=None, audit=None):
+                notifier=None, store=None, audit=None, directory=None, quality=None,
+                memories=None):
     """按 `.env` 配置装配 Agent。
 
     `setting(name, default)` 由调用方提供（服务端用 `backend.app.setting`），
@@ -61,21 +68,35 @@ def build_agent(*, setting, root, env_path, fetch_rows, exchange=None, forecast=
         with_forecast=forecast is not None,
         with_exchange=exchange is not None,
         with_notifier=notifier is not None,
+        with_quality=quality is not None,
     )
     context = ToolContext(
         env_path=env_path, root=root, fetch_rows=fetch_rows,
         exchange=exchange, forecast=forecast, notifier=notifier,
-        setting=setting,
+        setting=setting, quality=quality,
     )
     audit = audit or AuditLog(store)
     context.audit = audit
+    memories = memories or OperatorMemories(
+        store, enabled=flag(setting("AGENT_MEMORY_ENABLED", "false")),
+    )
     return AgentRunner(
         registry=registry,
         llm=llm,
-        sessions=SessionStore(store, history_limit=int(setting("AGENT_HISTORY_LIMIT", "20") or 20)),
+        sessions=SessionStore(
+            store,
+            history_limit=int(setting("AGENT_HISTORY_LIMIT", "20") or 20),
+            idle_minutes=int(setting("AGENT_SESSION_IDLE_MINUTES", "120") or 0),
+            char_budget=int(setting("AGENT_CONTEXT_CHAR_BUDGET", "60000") or 60000),
+            tool_result_limit=int(setting("AGENT_TOOL_RESULT_LIMIT", "8000") or 8000),
+        ),
         actions=PendingActions(store, ttl_seconds=int(setting("AGENT_ACTION_TTL_SECONDS", "1800") or 1800)),
         audit=audit,
         context=context,
         max_steps=int(setting("AGENT_MAX_TOOL_STEPS", "8") or 8),
         enabled=flag(setting("AGENT_ENABLED", "false")),
+        directory=directory,
+        memories=memories,
+        summary_enabled=flag(setting("AGENT_SUMMARY_ENABLED", "false")),
+        summary_trigger=int(setting("AGENT_SUMMARY_TRIGGER_MESSAGES", "40") or 40),
     )

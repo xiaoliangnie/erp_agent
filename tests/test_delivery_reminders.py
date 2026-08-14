@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 """交期四波催办口径。不连数据库，行数据直接构造。"""
+import json
 import unittest
+from pathlib import Path
 
 from backend.delivery_reminders import build_reminders, classify, filter_orders, reminder_markdown
+
+WAVE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "delivery_waves.json"
 
 
 def line(order_no, *, qty=10, in_qty=0, delivery="", eta="", buyer="张三",
@@ -122,6 +126,25 @@ class BuildRemindersTests(unittest.TestCase):
         self.assertIn("**李四**", text)
         self.assertIn("逾期 10 天", text)
         self.assertIn("剩 1 天", text)
+
+
+class SharedWaveFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = json.loads(WAVE_FIXTURE.read_text(encoding="utf-8"))
+
+    def test_thresholds_match_classify(self):
+        for row in self.fixture["waveThresholds"]:
+            self.assertEqual(row["bucket"], classify(row["days"]), row)
+
+    def test_mixed_order_uses_per_line_fallback(self):
+        mixed = self.fixture["mixedOrder"]
+        result = build_reminders(mixed["rows"], self.fixture["today"])
+        self.assertEqual(1, len(result["orders"]))
+        order = result["orders"][0]
+        expected = mixed["expected"]
+        self.assertEqual(expected["deliveryDate"], order["deliveryDate"])
+        self.assertEqual(expected["dateSource"], order["dateSource"])
+        self.assertEqual(expected["bucket"], order["bucket"])
 
 
 if __name__ == "__main__":

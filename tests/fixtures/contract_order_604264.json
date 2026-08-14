@@ -1,0 +1,32 @@
+{
+  "order": {
+    "po_id": 604264,
+    "po_date": "2026-06-05 10:00:00",
+    "so_id": "",
+    "status": "Confirmed",
+    "supplier_id": "",
+    "seller": "佰特",
+    "purchaser_name": "张三",
+    "send_address": "湖北省 鄂州市 华容区 唯品会1库1分区",
+    "payment_method": "CurrentSettlement",
+    "wms_co_name": "",
+    "confirm_date": "2026-06-05",
+    "remark": ""
+  },
+  "items": [
+    {
+      "poi_id": 101,
+      "sku_id": "BH25701004-02202",
+      "i_id": "BH25701004",
+      "name": "因公致秃毛绒挂件;骑行",
+      "properties_value": "绒布娃娃;骑行",
+      "qty": 100,
+      "price": 21.7,
+      "amount": 2170,
+      "delivery_date": "2026-07-09",
+      "plan_arrive_qty": 0,
+      "in_qty": 0,
+      "remark": ""
+    }
+  ]
+}

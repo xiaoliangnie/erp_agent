@@ -52,6 +52,7 @@ class PendingActions:
         channel: str = "web",
         session_id: str | None = None,
         run_id: str | None = None,
+        actor_id: str = "",
     ) -> dict:
         action_id = secrets.token_hex(12)
         stamp = now()
@@ -59,11 +60,12 @@ class PendingActions:
             conn.execute(
                 """INSERT INTO pending_actions
                    (id, session_id, run_id, channel, operator, tool, risk, title,
-                    arguments_json, preview_json, status, created_at, updated_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
+                    arguments_json, preview_json, status, created_at, updated_at, expires_at,
+                    actor_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
                 (action_id, session_id, run_id, channel, str(operator or "")[:120], tool, risk,
                  str(title or tool)[:200], dumps(arguments or {}), dumps(preview or {}),
-                 stamp, stamp, later(self.ttl_seconds)),
+                 stamp, stamp, later(self.ttl_seconds), str(actor_id or "")[:80]),
             )
         return self.get(action_id)
 
@@ -99,7 +101,7 @@ class PendingActions:
             )
         return cursor.rowcount or 0
 
-    def execute(self, action_id: str, operator: str, executor) -> dict:
+    def execute(self, action_id: str, operator: str, executor, *, actor_id: str = "") -> dict:
         """确认并执行一次。
 
         `executor(tool_name, arguments, action)` 由调用方提供；状态在事务里先推进到
@@ -122,13 +124,20 @@ class PendingActions:
                     (now(), action_id),
                 )
                 raise ActionError("确认已超时，请重新发起", 409)
-            if row["operator"] and operator != row["operator"] and not buyer_names_equivalent(
+            if not operator:
+                raise ActionError("确认必须填写操作人姓名", 403)
+            stored_actor = str(row["actor_id"] or "") if "actor_id" in row.keys() else ""
+            if stored_actor:
+                if str(actor_id or "") != stored_actor:
+                    raise ActionError("必须由发起该动作的员工确认", 403)
+            elif row["operator"] and operator != row["operator"] and not buyer_names_equivalent(
                 operator, row["operator"],
             ):
                 raise ActionError("必须由发起该动作的员工确认", 403)
             conn.execute(
-                "UPDATE pending_actions SET status='confirmed', confirmed_at=?, updated_at=? WHERE id=?",
-                (now(), now(), action_id),
+                """UPDATE pending_actions
+                   SET status='confirmed', confirmed_at=?, confirmed_by=?, updated_at=? WHERE id=?""",
+                (now(), operator[:120], now(), action_id),
             )
             action = self._row(row)
         try:
@@ -139,7 +148,7 @@ class PendingActions:
         self._mark(action_id, "executed", result=result)
         return self.get(action_id)
 
-    def cancel(self, action_id: str, operator: str = "") -> dict:
+    def cancel(self, action_id: str, operator: str = "", *, actor_id: str = "") -> dict:
         operator = str(operator or "").strip()
         with self.store.write(immediate=True) as conn:
             row = conn.execute("SELECT * FROM pending_actions WHERE id = ?", (action_id,)).fetchone()
@@ -149,7 +158,13 @@ class PendingActions:
                 return self._row(row)
             if row["status"] in FINAL_STATUSES:
                 raise ActionError(f"该动作已{self._status_label(row['status'])}，不能取消", 409)
-            if row["operator"] and operator and operator != row["operator"] and not buyer_names_equivalent(
+            if not operator:
+                raise ActionError("取消必须填写操作人姓名", 403)
+            stored_actor = str(row["actor_id"] or "") if "actor_id" in row.keys() else ""
+            if stored_actor:
+                if str(actor_id or "") != stored_actor:
+                    raise ActionError("必须由发起该动作的员工取消", 403)
+            elif row["operator"] and operator != row["operator"] and not buyer_names_equivalent(
                 operator, row["operator"],
             ):
                 raise ActionError("必须由发起该动作的员工取消", 403)
@@ -192,5 +207,7 @@ class PendingActions:
             "createdAt": row["created_at"],
             "expiresAt": row["expires_at"],
             "confirmedAt": row["confirmed_at"],
+            "confirmedBy": row["confirmed_by"] if "confirmed_by" in row.keys() else "",
+            "actorId": row["actor_id"] if "actor_id" in row.keys() else "",
             "executedAt": row["executed_at"],
         }

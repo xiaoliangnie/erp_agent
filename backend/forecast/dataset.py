@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
 
+from ..business_time import business_today
 from ..database import REALTIME_ITEM_TABLE, REALTIME_MAIN_TABLE, connect
 from ..procurement_data import day, integer, number, text
 
@@ -191,7 +192,7 @@ def _pick(headers, candidates):
 def load_from_database(env_path, config: SalesTableConfig, *, start=None, end=None) -> DemandDataset:
     """从实时库的销售出库表抽逐日需求。表名和列名来自配置，不接受调用方拼 SQL。"""
     config.validate()
-    end_date = day(end) or date.today().isoformat()
+    end_date = day(end) or business_today().isoformat()
     start_date = day(start) or (date.fromisoformat(end_date) - timedelta(days=730)).isoformat()
     where = [f"LEFT(`{config.date_column}`, 10) >= %s", f"LEFT(`{config.date_column}`, 10) <= %s"]
     params = [start_date, end_date]

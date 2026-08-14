@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from pymysql.err import OperationalError
 
@@ -8,6 +10,8 @@ from backend.realtime_mirror import (
     PRODUCT_ROUTE,
     SUPPLIER_ROUTE,
     ProxyAPIError,
+    blocked_image_url,
+    cache_product_image,
     extract_page,
     normalize_order,
     normalize_product,
@@ -140,6 +144,26 @@ class RealtimeMirrorParsingTests(unittest.TestCase):
         self.assertEqual("联系人", supplier[5])
         self.assertEqual("测试银行", supplier[9])
         self.assertEqual("TAX-01", supplier[16])
+
+    def test_rejects_private_image_hosts(self):
+        self.assertTrue(blocked_image_url("http://127.0.0.1/pic.png"))
+        self.assertTrue(blocked_image_url("https://localhost/pic.png"))
+        self.assertTrue(blocked_image_url("http://10.1.2.3/pic.png"))
+        self.assertTrue(blocked_image_url("http://192.168.1.9/pic.png"))
+        self.assertTrue(blocked_image_url("http://172.16.0.8/pic.png"))
+        self.assertTrue(blocked_image_url("http://169.254.1.1/pic.png"))
+        self.assertTrue(blocked_image_url("http://[::1]/pic.png"))
+        self.assertFalse(blocked_image_url("https://img.example/large.jpg"))
+        _, items, _ = normalize_purchase({
+            "po_id": 1,
+            "items": [{"poi_id": 1, "sku_id": "SKU-01", "pic300": "http://127.0.0.1/secret.png"}],
+        }, "2026-08-13 10:00:00")
+        self.assertEqual("", items[0][19])
+
+    def test_cache_product_image_does_not_fetch_private_urls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "内网或本机"):
+                cache_product_image(Path(tmp), "SKU-01", "http://127.0.0.1/pic.png")
 
 
 if __name__ == "__main__":

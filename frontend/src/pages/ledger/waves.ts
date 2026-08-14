@@ -32,6 +32,14 @@ export const WAVES: Wave[] = [
 
 export const WAVE_BY_KEY = new Map<WaveKey, Wave>(WAVES.map((wave) => [wave.k, wave]));
 
+/** 前端档位 → 后端催办 bucket，与 `delivery_reminders.WAVES` 对齐。 */
+export const WAVE_TO_BUCKET: Partial<Record<WaveKey, "overdue" | "t1" | "t10" | "t20">> = {
+  w4: "overdue",
+  w3: "t1",
+  w2: "t10",
+  w1: "t20",
+};
+
 /** 需要发提醒的四波，最急优先。 */
 export const URGENT: WaveKey[] = ["w4", "w3", "w2", "w1"];
 const URGENT_SET = new Set<string>(URGENT);

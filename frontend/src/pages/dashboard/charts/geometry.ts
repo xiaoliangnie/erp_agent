@@ -30,17 +30,17 @@ export function niceTicks(max: number, count = 4): number[] {
   return ticks;
 }
 
-/** 该日期所在周的周一。 */
+/** 该日期所在周的周一。按 UTC 日历算，与机器时区无关。 */
 export function isoMonday(iso: string): string {
-  const date = new Date(`${iso}T00:00:00`);
-  const weekday = (date.getDay() + 6) % 7;
-  date.setDate(date.getDate() - weekday);
+  const date = new Date(`${iso}T00:00:00Z`);
+  const weekday = (date.getUTCDay() + 6) % 7;
+  date.setUTCDate(date.getUTCDate() - weekday);
   return date.toISOString().slice(0, 10);
 }
 
 export function shiftDays(iso: string, days: number): string {
-  const date = new Date(`${iso}T00:00:00`);
-  date.setDate(date.getDate() + days);
+  const date = new Date(`${iso}T00:00:00Z`);
+  date.setUTCDate(date.getUTCDate() + days);
   return date.toISOString().slice(0, 10);
 }
 

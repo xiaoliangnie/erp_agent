@@ -8,15 +8,20 @@ from backend.gb_standards import (
     SamrCatalogClient,
     build_queries,
     classify_changes,
+    collect_status_transitions,
     compact_payload,
     compact_standard_no,
     family_ids_for,
+    gb_change_markdown,
     load_category_map,
     lookup_product_standards,
     looks_like_standard_no,
     match_categories,
+    match_contract_gb_alerts,
     match_families,
     normalize_standard,
+    noteworthy_transition,
+    notify_contract_gb_changes,
     parse_csv_list,
     parse_search_response,
     resolve_product_scope,
@@ -234,6 +239,138 @@ class GbLookupTests(unittest.TestCase):
         self.assertEqual("empty", result["mode"])
         self.assertEqual([], result["standards"])
         self.assertIn("请提供", result["note"])
+
+
+class GbSchedulerBackoffTests(unittest.TestCase):
+    def test_failure_wait_doubles_and_caps(self):
+        from backend.gb_standards import GbStandardsScheduler
+        scheduler = GbStandardsScheduler(None, enabled=False, poll_seconds=30)
+        self.assertEqual(30, scheduler._wait_after_failures(0))
+        self.assertEqual(60, scheduler._wait_after_failures(1))
+        self.assertEqual(120, scheduler._wait_after_failures(2))
+        self.assertEqual(240, scheduler._wait_after_failures(3))
+        self.assertEqual(480, scheduler._wait_after_failures(4))
+        self.assertEqual(480, scheduler._wait_after_failures(8))
+        scheduler.poll_seconds = 60
+        self.assertEqual(900, scheduler._wait_after_failures(4))
+
+    def test_loop_backs_off_after_sync_errors(self):
+        from backend.gb_standards import GbStandardsScheduler
+
+        class Boom:
+            env_path = "/no/such/hanli.env"
+
+            def sync(self):
+                raise RuntimeError("samr down")
+
+        scheduler = GbStandardsScheduler(
+            Boom(), enabled=True, send_time="00:00",
+            poll_seconds=30, initial_delay_seconds=0,
+        )
+        waits = []
+
+        class FakeStop:
+            def is_set(self):
+                return len(waits) >= 4
+
+            def set(self):
+                return None
+
+            def wait(self, timeout=None):
+                waits.append(timeout)
+                return len(waits) >= 4
+
+        scheduler._stop = FakeStop()
+        scheduler._loop()
+        self.assertEqual([30, 60, 120, 240], waits)
+        self.assertIn("samr down", scheduler.last_error)
+
+
+class GbChangeAlertTests(unittest.TestCase):
+    def test_noteworthy_transitions(self):
+        self.assertEqual("即将实施 → 现行", noteworthy_transition("即将实施", "现行"))
+        self.assertEqual("现行 → 废止", noteworthy_transition("现行", "废止"))
+        self.assertEqual("即将实施 → 废止", noteworthy_transition("即将实施", "废止"))
+        self.assertEqual("", noteworthy_transition("现行", "现行"))
+        self.assertEqual("", noteworthy_transition("即将实施", "即将实施"))
+        self.assertEqual("", noteworthy_transition("现行", "即将实施"))
+        self.assertEqual("", noteworthy_transition("", "现行"))
+
+    def test_name_only_change_is_not_a_transition(self):
+        existing = {
+            "a": {"content_hash": "1", "status": "即将实施", "standard_no": "GB/T 1", "name_cn": "旧名"},
+        }
+        records = [{
+            "samr_id": "a", "content_hash": "2", "status": "即将实施",
+            "standard_no": "GB/T 1", "name_cn": "新名",
+        }]
+        self.assertEqual([], collect_status_transitions(existing, records))
+
+    def test_insert_is_not_a_transition(self):
+        records = [{"samr_id": "new", "status": "废止", "standard_no": "X", "name_cn": "n"}]
+        self.assertEqual([], collect_status_transitions({}, records))
+
+    def test_only_contract_used_standards_alert(self):
+        changes = collect_status_transitions(
+            {
+                "a": {"status": "即将实施", "standard_no": "GB/T 9832-2026", "name_cn": "毛绒玩具"},
+                "b": {"status": "现行", "standard_no": "GB/T 1-1993", "name_cn": "已废止示例"},
+            },
+            [
+                {"samr_id": "a", "status": "现行", "standard_no": "GB/T 9832-2026", "name_cn": "毛绒玩具"},
+                {"samr_id": "b", "status": "废止", "standard_no": "GB/T 1-1993", "name_cn": "已废止示例"},
+            ],
+        )
+        self.assertEqual(["a", "b"], [item["samrId"] for item in changes])
+        alerts = match_contract_gb_alerts(changes, [
+            {"po_id": "604264", "poi_id": "1", "sku_id": "SKU-A",
+             "samr_id": "a", "standard_no": "GB/T 9832-2026"},
+        ])
+        self.assertEqual(["a"], [item["samrId"] for item in alerts])
+        text = gb_change_markdown(alerts, today="2026-08-13")
+        self.assertIn("604264", text)
+        self.assertIn("即将实施 → 现行", text)
+        self.assertNotIn("GB/T 1-1993", text)
+
+    def test_notify_is_idempotent_per_standard_per_day(self):
+        import tempfile
+        from pathlib import Path
+        from backend.agent.audit import AuditLog
+        from backend.agent.store import AgentStore
+
+        class FakeSender:
+            configured = True
+
+            def __init__(self):
+                self.calls = []
+
+            def send_markdown(self, title, text, **kwargs):
+                self.calls.append({"title": title, "text": text})
+                return {"channel": "fake"}
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        audit = AuditLog(AgentStore(Path(tmp.name) / "agent.sqlite3"))
+        sender = FakeSender()
+        changes = [{
+            "samrId": "a", "standardNo": "GB/T 9832-2026", "nameCn": "毛绒玩具",
+            "fromStatus": "即将实施", "toStatus": "现行", "label": "即将实施 → 现行",
+        }]
+        usages = [{
+            "po_id": "604264", "poi_id": "1", "sku_id": "SKU-A",
+            "samr_id": "a", "standard_no": "GB/T 9832-2026",
+        }]
+        first = notify_contract_gb_changes(
+            "unused.env", changes, sender=sender, audit=audit, usages=usages, today="2026-08-13",
+        )
+        second = notify_contract_gb_changes(
+            "unused.env", changes, sender=sender, audit=audit, usages=usages, today="2026-08-13",
+        )
+        self.assertTrue(first.get("sent"))
+        self.assertTrue(second.get("skipped"))
+        self.assertEqual("同一批国标变更已经提醒过", second["reason"])
+        self.assertEqual(1, len(sender.calls))
+        self.assertIn("604264", sender.calls[0]["text"])
 
 
 if __name__ == "__main__":

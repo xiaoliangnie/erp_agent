@@ -14,9 +14,9 @@
 |---|---|---|
 | 看板 / 台账 | 实时镜像同步已开，页面可用 | 换年度旧数据不清、图表时区错位（P0-4）；看板预警块是死代码（P1-3） |
 | 合同生成 | 票种 / 单价 / 图片 / 执行标准全链路已实现 | 写入器与预览渲染依赖 codex 缓存（P0-1）；切单竞态（P1-3） |
-| 国标目录 | 1098 条已入库，钉钉 / 网页可查 | 每日同步未开（P1-1）；无变更提醒（P1-6） |
+| 国标目录 | 1098 条已入库，钉钉 / 网页可查 | 每日同步开关见 P1-1；合同已选用标准的状态跃迁提醒已落地（P1-6） |
 | 换货 | dry-run + 二次确认已实现 | 任务无超时会僵死（P1-2）；缺真实 ERP 验收（P0-5） |
-| 采购助手 | Agent 已开（DeepSeek），钉钉 Stream 已连 | Stream 线程死后不自愈（P0-3）；缺黄金回放、operator 校验（P1-5） |
+| 采购助手 | Agent 已开（DeepSeek），钉钉 Stream 已连 | Stream 自愈已做（P0-3）；P1-5 黄金回放 / operator 校验 / 主数据缺口 / 台账推送已落地 |
 | 钉钉催办推送 | 代码就绪、未开 | **失败后当日永远无法重发的幂等缺陷**（P0-2），修完才能开 |
 | 预测 | 接口齐，Baseline 占位 | 销售 / 库存表未进库，MVP 明确不含（P2） |
 
@@ -79,6 +79,10 @@
 2. PO 604264 三种票种各生成一次，与旧渲染 PNG 并排目检（字体、行高、图片位置、合计）。
 3. 把 `~/.cache/codex-runtimes` 改名后，全链路仍可预览 + 下载。
 
+**进度（2026-08-13）**：XLSX 已切到 `backend/contract_workbook.py`（openpyxl + Pillow 内嵌图片），
+`scripts/generate_contract.mjs` 已删除。独立 LibreOffice 本机暂不装，预览继续用现有
+`CONTRACT_SOFFICE`；P0-1 预览去缓存验收延后。
+
 ### P0-2 钉钉催办幂等修复（约 0.5 天）
 
 **问题**（`backend/dingtalk/reminders.py:68`、`147`；`backend/agent/audit.py:88`）：
@@ -100,6 +104,9 @@
 
 **验收**：单测通过；手动断网模拟一次失败，恢复后同日推送成功且不重复。
 
+**进度（2026-08-13）**：幂等键只在 `sent` 后占用；失败写 `-attempt-N` 不挡重试；定时线程
+15 分钟 / 3 次封顶；手动 push 只认当日已成功。旧的 `sending` 占键记录会在下次推送时释放。
+
 ### P0-3 钉钉 Stream 自愈（约 0.5 天）
 
 **问题**（`backend/dingtalk/stream.py:126`）：`_serve` 线程异常退出后永不重启
@@ -110,6 +117,9 @@
 `status()` 增加 `restartCount` / `lastError`；`app.py` 停机钩子补 `DINGTALK_STREAM.stop()`。
 
 **验收**：注入异常杀掉内部连接后 1 分钟内自动恢复；`/api/health` 可见重启计数。
+
+**进度（2026-08-13）**：`start()` 改为监督循环；`_serve` 异常或退出后指数退避重连并重建客户端；
+`status()` 含 `restartCount`；`app.py` 停机调用 `DINGTALK_STREAM.stop()`。
 
 ### P0-4 前端数据可信度：旧数据 + 时区（约 0.5 天）
 
@@ -133,6 +143,10 @@
 **验收**：机器时区分别设为 UTC-4 与 UTC+8 各跑一次页面，近 30 天窗口、按周聚合、
 四波分档结果一致。
 
+**进度（2026-08-13）**：`usePayload` 换参/失败立即清 `data`；看板/台账 loading 优先于旧数据；
+`isoMonday` / `shiftDays` 改为 UTC 日历运算。双时区目检取消：运行机器统一 `Asia/Shanghai`，
+与业务口径一致；前端「今天」仍只认 payload `meta.today`，不读浏览器时区。
+
 ### P0-5 三条链路真人验收（半天，需采购员配合）
 
 1. **合同**：搜单 → 选执行标准（验证「现行 / 即将实施」分组、同 SKU 记忆）→ 预览 →
@@ -151,6 +165,10 @@
 - `GB_SYNC_ENABLED=true`（每天 02:30 增量同步目录）。
 - 顺带修（`backend/gb_standards.py` 调度循环）：同步失败后现在每 30 秒重打 SAMR
   外站，加指数退避封顶 900 秒（对齐镜像同步的策略）。
+
+**进度（2026-08-13）**：失败退避已落地。本机 `.env` 已打开 `DINGTALK_REMINDER_ENABLED`
+与 `GB_SYNC_ENABLED`，**需重启 server.py 才生效**。今天下午重启会立刻推今日催办
+（已过 08:30），国标同步若今日水位已成功则跳过。
 
 ### P1-2 任务队列可靠性：超时回收（1 天）
 
@@ -195,42 +213,41 @@
   169.254/16、localhost），防供应链 API 被污染时的 SSRF（`realtime_mirror.py:281`）。
 - 无鉴权接口按【决策点 3】在迁移时落地。
 
-### P1-5 对话硬化 + 台账按钮接线（1–2 天）
+### P1-5 对话硬化 + 台账按钮接线（已落地）
 
-1. **黄金回放集**：采购员提供 ~20 条真实问句，落 `tests/` 回放夹具
-   （原话 → 期望工具 + 入参 / 期望追问），上线前跑通。
-2. **operator 校验**：网页 `/chat` 的 `operator` 对 `staff_bindings` 校验，
-   对不上时 L1/L2 拒绝确认（只读不拦）。
-3. **`master_data_gaps` L0 工具**：汇总「供应商未维护 / 近 N 天采购 SKU 无图 /
-   所选票种缺价 / 分类未映射国标目录族」，输出复用催办 markdown 模板，
-   钉钉可直接问；同时补 `tests/test_agent.py`。
-4. **台账「发送提醒」**按【决策点 2】接线。
+1. **黄金回放集**：`tests/fixtures/golden_dialogues.json`（22 条），CI 假 LLM 回放。
+2. **operator 校验**：网页 `/chat` 与台账推送的 `operator` 对 `staff_bindings` 校验，
+   对不上时 L1/L2 拒绝（只读不拦）；钉钉渠道按 userId，不走这道。
+3. **`master_data_gaps` L0 工具**：供应商未维护 / 近 N 天 SKU 无图 / 票种缺价 /
+   分类未映射国标；markdown 对齐催办模板。
+4. **台账「发送提醒」**接 `/api/agent/reminders/push`（采购员 + 档位 + 确认弹窗 + 当日已推）。
 
-### P1-6 国标变更提醒（0.5 天）
+### P1-6 国标变更提醒（已落地）
 
-每日 GB 同步成功后 diff：`gb_standards.last_changed_at` 落在本批次、且
-`samr_id` / `standard_no` 出现在 `contract_line_gb`（合同已选用）的行，
-状态跃迁（即将实施 → 现行、任意 → 废止）生成 markdown 推钉钉群
-（复用现有发送通道）；合同页对应候选项加状态角标。
-离线用例模拟一次跃迁；真库跑一轮验证无误报。
+每日 GB 同步成功后 diff：本轮 `status` 跃迁（即将实施 → 现行、任意 → 废止），且
+`samr_id` / `standard_no` 出现在 `contract_line_gb` 的，推钉钉 markdown
+（`gb-contract-change-{today}-{samr_id}` 幂等）。合同页候选项加状态角标。
+离线用例覆盖跃迁过滤、只用合同已选用的标准、同日不重发。
 
-### P1-7 日志与轻监控（1 天）
+### P1-7 日志与轻监控（已落地）
 
-- 全库 `print` 换 `logging`：模块级 logger、统一格式（时间 / 模块 / 级别），
-  `server.py` 配根 handler 落文件（迁移后接 systemd journal）。
+- 后端 `print` 换成模块级 `logging`；`configure_logging` 在 `app.main` 里挂 stderr + 可选
+  `LOG_FILE`（默认 `data/app.log`），时间固定东八区。CLI 脚本仍用 `print` 给人看。
 - `scripts/health_watch.py`：cron / launchd 每 5 分钟拉 `/api/health`，
-  `ok=false`、镜像同步滞后超阈值、Stream `restartCount` 增长、催办 `last_error`
-  非空时发钉钉告警。不引入监控系统。
+  `ok=false`、镜像滞后超阈值 / 同步 `lastError`、Stream `restartCount` 增长、催办
+  `lastError` 非空时发钉钉。同一问题默认 60 分钟内不重复。不引入监控系统。
+  巡检进程不 import `backend.app`。离线评估在 `tests/test_health_watch.py`。
 
-### P1-8 测试补强（1–2 天）
+### P1-8 测试补强（已落地）
 
-- **payload 契约测试**：`procurement_data` 编码输出的宽度 / 下标 ↔
-  `frontend/src/data/payload.ts` 的 `EXPECTED_*` 常量。Python 侧生成夹具 JSON，
-  前端用轻量 node 断言脚本挂进 `npm run build` 前置（两边下标常量是最易错位的契约）。
-- **HTTP 鉴权矩阵**：测试里起 `ThreadingHTTPServer` 临时端口，断言各路由
-  401 / 200 / 503（Agent 关闭时）行为。
-- **`test_contracts` 去生产依赖**：`fetch_contract_order` 加可注入夹具路径，
-  离线跑合同模型断言；对 604264 的 live 断言保留、用环境变量开关跳过。
+- **payload 契约**：`tests/fixtures/payload_contract.json` 是宽度唯一来源。
+  Python `tests.test_payload_contract` 断言编码器输出；`scripts/check_payload_contract.mjs`
+  核对 `payload.ts` 的 `DASHBOARD_*` / `DELIVERY_*` WIDTH，挂在 `npm run build` 前置。
+- **HTTP 鉴权矩阵**：`tests.test_http_auth` 起临时端口，断言 Agent / 预测 / 换货
+  401 / 200 / 503，看板与合同接口无鉴权（不是 401）。
+- **`test_contracts` 去生产依赖**：`fetch_contract_order(..., fixture_path=)`；
+  离线夹具 `tests/fixtures/contract_order_604264.json`。Live 断言保留，
+  `CONTRACT_LIVE_TESTS=1` 才连 `hanli.env`。
 - 催办幂等用例在 P0-2 内完成。
 
 ---
@@ -245,31 +262,33 @@
 | 配置 | 拷贝 `.env`、`hanli.env`、`config/staff_bindings.json`（如有）；核对 `CONTRACT_SOFFICE` 等路径 |
 | 数据 | 拷贝 `data/*.sqlite3`、`data/product-images/` |
 | 前端 | `npm install && npm run build` |
-| 常驻 | systemd unit 托管 `server.py`（`Restart=always`），日志落 journal 或文件 |
+| 常驻 | systemd unit 托管 `server.py`（`Restart=always`），日志落 journal 或文件；cron / systemd timer 每 5 分钟跑 `scripts/health_watch.py` |
 | 鉴权 | 按【决策点 3】落地反代 + 内网 ACL（或代码 token） |
-| 时区 | 机器时区任意；跑一遍 P0-4 的双时区验收确认页面口径不受影响 |
+| 时区 | 机器时区设 `Asia/Shanghai`；应用层业务日已固定东八区，不跟浏览器走 |
 | 验收 | P0-1 §验收 + P0-5 全套重跑 |
+| 之后 | P2（合同历史、供应商绩效、主数据兜底、Agent 库迁 MySQL），见下一节 |
 
 （git 与备份按当前约束不在本方案内，迁移后如需再议。）
 
 ---
 
-## P2（MVP 之后）
+## P2（迁到专用机器之后再做）
 
-- **合同历史**：落一张表（谁 / 何时 / 哪单 / 什么票种 / 文件路径），
-  列表接口 + 合同页历史块；顺带解决 `outputs/generated/` 只是文件堆的问题。
-- **供应商绩效 `supplier_scorecard`**：交期达成率 / 逾期率 / 入库速度，
-  数据全在现有采购明细，L0 工具 + 看板卡片；口径先写进 README。
-- **批量合同**：同一供应商多张单一次生成多份 Excel（先向采购员确认真实需求）。
-- **预测接入**：等销售 / 库存表进实时库，填 `FORECAST_SALES_*` /
-  `FORECAST_INVENTORY_*`，按 `docs/预测模型接入.md` 换真模型。
-  顺带修两处：在途缺 SKU 时静默取 0 改为与库存一致的显式报错；
-  `FORECAST_*_TABLE` 表名加标识符白名单校验再拼 SQL。
-- **主数据迁移**：`config/products.json` 的分类 / 包装 / 单位逐步换
-  `realtime_products` 兜底（价格仍只认配置或 ERP）。
-- **Agent 业务库迁 MySQL**：只换 `backend/agent/store.py` 一层。
-- 其余预留工具（`price_watch` / `inventory_watch` / `create_purchase_draft`）按
-  RESERVED_TOOLS 注册，不改 Agent Core。
+本机不再做这些。MVP 代码与验收（P0-1 预览 / P0-5）在新机器落地后，再按下面做。
+预测模型继续占位，不换真实现。
+
+| 事项 | 做什么 | 口径 |
+|---|---|---|
+| 合同历史 | 落表：谁 / 何时 / 哪单 / 票种 / 文件路径；合同页可翻历史 | 现在 `outputs/generated/` 只是文件堆 |
+| 供应商绩效 | L0 工具 `supplier_scorecard` + 看板卡片 | 交期达成 / 逾期 / 入库速度，数据已在采购明细；口径先写 README。`RESERVED_TOOLS` 已占位 |
+| 主数据迁移 | 合同补全：分类 / 包装 / 单位改读 `realtime_products` 兜底，少维护 `config/products.json` | **单价仍只认 products.json 或供应商 ERP 价模式，不从商品主数据取价**。国标码、合同图路径仍可留在 JSON |
+| Agent 业务库迁 MySQL | 只改 `backend/agent/store.py`：会话 / 待确认 / 审计从 `data/agent.sqlite3` 换到独立 MySQL schema | 表名和 `sessions` / `actions` / `audit` 调用面不变。单机 SQLite 能跑；迁机器后为了和镜像库同一套备份再换 |
+
+**明确不做 / 不改口径**
+
+- **批量合同**：一张采购单 → 一份合同；单内多种商品是明细行（几个实例），不是多张采购单一键出多份 Excel。
+- **预测**：销售 / 库存表进库之前 Baseline 占位，不换真模型。
+- **`price_watch` / `inventory_watch` / `create_purchase_draft`**：已从 `RESERVED_TOOLS` 删除。
 
 ---
 
@@ -285,10 +304,11 @@
 | 6 | P1-2 任务超时回收 | 1 天 |
 | 7 | P1-3 合同竞态 + 五页一致性 + 死代码 | 1 天 |
 | 8 | P1-4 安全清理 | 0.5 天 |
-| 9 | P1-5 对话硬化 + 台账按钮 | 1–2 天 |
-| 10 | P1-6 国标变更提醒 | 0.5 天 |
-| 11 | P1-7 日志与轻监控 | 1 天 |
-| 12 | P1-8 测试补强 | 1–2 天 |
-| — | 迁移 | 按清单执行 |
+| 9 | P1-5 对话硬化 + 台账按钮 | **已落地** |
+| 10 | P1-6 国标变更提醒 | **已落地** |
+| 11 | P1-7 日志与轻监控 | **已落地** |
+| 12 | P1-8 测试补强 | **已落地** |
+| — | 迁移 | 按清单执行（专用机器、东八区、LibreOffice、health_watch cron） |
+| — | P2 | **迁专用机器之后**：合同历史、供应商绩效、主数据 JSON 兜底、Agent 库迁 MySQL。预测继续占位；无批量合同；三个预留工具已删 |
 
 P0 合计约 3 天；P1 合计约 6–8 天。

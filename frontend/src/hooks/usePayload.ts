@@ -27,6 +27,7 @@ export function usePayload<T>(path: string, year: string | null, decode: (payloa
     let cancelled = false;
     setLoading(true);
     setError("");
+    setData(null);
     const url = year ? `${path}?year=${encodeURIComponent(year)}` : path;
     publicApi
       .get<RawPayload>(url, { signal: controller.signal })
@@ -36,6 +37,7 @@ export function usePayload<T>(path: string, year: string | null, decode: (payloa
       })
       .catch((caught: unknown) => {
         if (cancelled || controller.signal.aborted) return;
+        setData(null);
         setError(errorText(caught));
       })
       .finally(() => {

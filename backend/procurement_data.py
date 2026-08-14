@@ -9,6 +9,25 @@ from .business_time import business_now
 
 SIZE_NONE, SIZE_HT, SIZE_SHOE, SIZE_ALPHA = 0, 1, 2, 3
 ALPHA_SIZE = re.compile(r"^(X{0,3}[SML]|[2-6]XL|均码)$")
+DASHBOARD_ORDER_COLUMNS = (
+    "采购单号", "采购日期", "已确认", "采购员", "供应商", "仓储方",
+    "收货地址", "付款方式", "外部单号", "审核日期", "采购单建立时间",
+)
+DASHBOARD_LINE_COLUMNS = (
+    "采购单下标", "SPU", "款式", "颜色", "规格", "品类", "季节", "品牌",
+    "渠道", "数量", "入库", "金额", "单价", "尺码类型", "尺码", "预计到货", "SKU",
+)
+DELIVERY_ORDER_COLUMNS = (
+    "采购单号", "采购日期", "已确认", "采购员", "供应商", "仓储方", "外部单号", "审核日期",
+)
+DELIVERY_LINE_COLUMNS = (
+    "采购单下标", "SPU", "SKU", "颜色", "规格", "品类",
+    "数量", "入库", "交期", "预计到货", "金额",
+)
+DASHBOARD_ORDER_WIDTH = len(DASHBOARD_ORDER_COLUMNS)
+DASHBOARD_LINE_WIDTH = len(DASHBOARD_LINE_COLUMNS)
+DELIVERY_ORDER_WIDTH = len(DELIVERY_ORDER_COLUMNS)
+DELIVERY_LINE_WIDTH = len(DELIVERY_LINE_COLUMNS)
 
 
 def text(value):

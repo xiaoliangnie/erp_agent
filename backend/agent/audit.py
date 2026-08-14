@@ -43,13 +43,15 @@ class AuditLog:
         return run_id
 
     def finish_run(self, run_id: str, *, status: str, reply: str = "", steps: int = 0,
-                   duration_ms: int = 0, error: str | None = None) -> None:
+                   duration_ms: int = 0, error: str | None = None,
+                   prompt_tokens: int = 0, completion_tokens: int = 0) -> None:
         with self.store.write() as conn:
             conn.execute(
                 """UPDATE agent_runs SET status=?, reply=?, steps=?, duration_ms=?,
-                   error=?, finished_at=? WHERE id=?""",
+                   error=?, finished_at=?, prompt_tokens=?, completion_tokens=? WHERE id=?""",
                 (status, str(reply or "")[:8000], int(steps), int(duration_ms),
-                 str(error)[:1000] if error else None, now(), run_id),
+                 str(error)[:1000] if error else None, now(),
+                 int(prompt_tokens or 0), int(completion_tokens or 0), run_id),
             )
 
     def record_tool(self, *, tool: str, risk: str = "L0", status: str = "ok",
@@ -88,7 +90,11 @@ class AuditLog:
     def record_delivery(self, *, channel: str, target: str, kind: str, status: str,
                         detail: dict | None = None, idempotency_key: str | None = None,
                         error: str | None = None) -> bool:
-        """记录一次外发通知；同一 `idempotency_key` 只允许成功登记一次。"""
+        """记录一次外发通知；同一 `idempotency_key` 只允许登记一次。
+
+        钉钉入站消息用这个方法立刻占键去重。催办出站不要在发送前用业务键调用它，
+        改走 `has_successful_delivery` / 成功后再写入，否则失败会把当天锁死。
+        """
         with self.store.write(immediate=True) as conn:
             if idempotency_key:
                 existing = conn.execute(
@@ -105,6 +111,63 @@ class AuditLog:
                  dumps(detail or {})[:20000], str(error)[:1000] if error else None, now()),
             )
         return True
+
+    def has_successful_delivery(self, idempotency_key: str) -> bool:
+        """只认带该键且 status=sent 的记录；sending/failed 不算已送达。"""
+        if not idempotency_key:
+            return False
+        with self.store.read() as conn:
+            row = conn.execute(
+                """SELECT id FROM notification_deliveries
+                   WHERE idempotency_key = ? AND status = 'sent'""",
+                (idempotency_key,),
+            ).fetchone()
+        return row is not None
+
+    def release_unsuccessful_key(self, idempotency_key: str) -> int:
+        """清掉占用该键但未发送成功的记录，让失败后的重试能再写 sent。"""
+        if not idempotency_key:
+            return 0
+        with self.store.write(immediate=True) as conn:
+            cursor = conn.execute(
+                """UPDATE notification_deliveries
+                   SET idempotency_key = NULL
+                   WHERE idempotency_key = ? AND status != 'sent'""",
+                (idempotency_key,),
+            )
+            return cursor.rowcount or 0
+
+    def next_attempt_key(self, base_key: str) -> str:
+        rows = self.list_deliveries(key_prefix=f"{base_key}-attempt-")
+        return f"{base_key}-attempt-{len(rows) + 1}"
+
+    def list_deliveries(self, *, key_prefix: str = "", kind: str = "",
+                        status: str = "", limit: int = 50) -> list[dict]:
+        clauses: list[str] = []
+        params: list = []
+        if key_prefix:
+            clauses.append("idempotency_key LIKE ?")
+            params.append(f"{key_prefix}%")
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, min(int(limit), 500)))
+        with self.store.read() as conn:
+            rows = conn.execute(
+                f"""SELECT * FROM notification_deliveries {where}
+                    ORDER BY created_at ASC, id ASC LIMIT ?""",
+                params,
+            ).fetchall()
+        return [{
+            "id": row["id"], "channel": row["channel"], "target": row["target"],
+            "kind": row["kind"], "idempotencyKey": row["idempotency_key"],
+            "status": row["status"], "detail": loads(row["detail_json"], {}),
+            "error": row["error"], "createdAt": row["created_at"],
+        } for row in rows]
 
     def recent_runs(self, limit: int = 20) -> list[dict]:
         with self.store.read() as conn:

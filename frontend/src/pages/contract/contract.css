@@ -15,6 +15,26 @@
 .notice-actions { margin-top: 8px; }
 .gb-select { width: 100%; min-width: 220px; max-width: 320px; font-size: 12px; }
 .gb-empty { color: var(--text-muted); font-size: 12px; }
+.gb-pick { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.gb-badge {
+  flex: none;
+  font-size: 10px;
+  font-weight: 650;
+  letter-spacing: .04em;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  background: var(--wash);
+  white-space: nowrap;
+}
+.gb-badge.good { color: var(--good); border-color: color-mix(in srgb, var(--good) 40%, var(--border)); }
+.gb-badge.warning {
+  color: var(--text-primary);
+  border-color: color-mix(in srgb, var(--warning) 55%, var(--border));
+  background: color-mix(in srgb, var(--warning) 18%, var(--surface-1));
+}
+.gb-badge.critical { color: var(--critical); border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); background: color-mix(in srgb, var(--critical) 10%, var(--surface-1)); }
 
 .preview-frame {
   margin-top: 16px; max-height: 780px; overflow: auto;

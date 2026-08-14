@@ -11,8 +11,12 @@ DeepSeek / 通义 / Kimi / 内网模型只改这两项和 `AGENT_MODEL`。
 from __future__ import annotations
 
 import json
+import logging
+import time
 import urllib.error
 import urllib.request
+
+logger = logging.getLogger(__name__)
 
 from .codex_oauth import (
     DEFAULT_BASE_URL as CODEX_BASE_URL,
@@ -193,13 +197,21 @@ class LLMClient:
         return parsed
 
     def _post(self, request, label: str) -> dict:
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout, context=ssl_context()) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:400]
-            raise LLMError(f"{label}返回 {exc.code}：{detail}") from exc
-        except urllib.error.URLError as exc:
-            raise LLMError(f"{label}连接失败：{exc.reason}") from exc
-        except json.JSONDecodeError as exc:
-            raise LLMError(f"{label}返回的不是合法 JSON") from exc
+        last_error = None
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout, context=ssl_context()) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:400]
+                logger.warning("%s HTTP %s: %s", label, exc.code, detail)
+                last_error = LLMError(f"{label}返回 {exc.code}")
+                if exc.code in (429, 500, 502, 503, 504) and attempt == 0:
+                    time.sleep(0.8)
+                    continue
+                raise last_error from exc
+            except urllib.error.URLError as exc:
+                raise LLMError(f"{label}连接失败：{exc.reason}") from exc
+            except json.JSONDecodeError as exc:
+                raise LLMError(f"{label}返回的不是合法 JSON") from exc
+        raise last_error or LLMError(f"{label}调用失败")

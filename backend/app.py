@@ -2,7 +2,9 @@
 """采购数据 API 与安全的静态页面服务。"""
 import argparse
 import gzip
+import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
@@ -26,6 +28,7 @@ from .database import (
     fetch_realtime_sync_state,
     fetch_realtime_years,
     load_all_env,
+    purchase_window_warning,
 )
 from .procurement_data import build_dashboard_payload, build_delivery_payload
 from .contracts import generate_contract, get_contract_options
@@ -38,21 +41,27 @@ from .agent import (
     AgentStore,
     AuditLog,
     LLMError,
+    MaintenanceScheduler,
+    OperatorMemories,
     ToolError,
     agent_database_path,
     build_agent,
     flag,
 )
+from .quality import QualityError, build_quality, report_link_valid
 from .delivery_reminders import build_reminders, filter_orders
 from .dingtalk import DailyReminderScheduler, DingTalkError, DingTalkStreamChannel, build_dingtalk
 from .forecast import ForecastError, ForecastService, ForecastUnavailable
 from .business_time import business_today
+from .staff_names import WEB_OPERATOR_UNBOUND
 from .product_images import ProductImageError, ProductImageService
 from .order_source import OrderSourceError, fetch_exchange_order_items, fetch_exchange_orders
 from .realtime_mirror import build_mirror_from_settings
-from .gb_standards import build_gb_sync_from_settings
+from .gb_standards import build_gb_sync_from_settings, notify_contract_gb_changes
+from .logging_setup import configure_logging
 
 
+logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 # React 单页应用的构建产物，由 `npm run build` 生成；没有构建过就只有接口可用。
@@ -86,6 +95,12 @@ def setting(name, default=""):
     return os.environ.get(name, PROJECT_ENV.get(name, default))
 
 
+def _tokens_equal(left: str, right: str) -> bool:
+    """定长 SHA-256 后再比较，避免长度不等时 compare_digest 抛 ValueError。"""
+    digest = lambda value: hashlib.sha256(str(value or "").encode("utf-8")).digest()
+    return secrets.compare_digest(digest(left), digest(right))
+
+
 def shadowed_settings():
     """列出被进程环境变量盖掉的 .env 键；终端里残留一个 export 就够让服务连错库。"""
     return [
@@ -111,9 +126,16 @@ GB_STANDARDS_SYNCER, GB_STANDARDS_SCHEDULER = build_gb_sync_from_settings(
     setting, env_path=REALTIME_ENV_PATH,
 )
 CACHE_TTL_SECONDS = 30
+CACHE_YEAR_LIMIT = 3
 _cache = {}
 _source_state = {"source": None, "warning": None, "year": None}
 _cache_lock = threading.Lock()
+_year_locks = {}
+
+
+def _year_lock(year: str):
+    with _cache_lock:
+        return _year_locks.setdefault(year, threading.Lock())
 
 
 def snapshot_years(rows):
@@ -121,26 +143,58 @@ def snapshot_years(rows):
                    if re.match(r"^\d{4}", str(row.get("采购日期") or ""))}, reverse=True)
 
 
+def resolve_source_year(requested_year, years, current_year=None):
+    """把请求年份收成镜像库里真实存在的一年；垃圾值回退到今年或最新年。"""
+    if not years:
+        raise RuntimeError("实时采购库没有有效年份")
+    current_year = str(current_year if current_year is not None else business_today().year)
+    requested = str(requested_year).strip() if requested_year not in (None, "") else ""
+    if requested in years:
+        return requested
+    if current_year in years:
+        return current_year
+    return years[0]
+
+
+def trim_source_cache(cache, now, *, keep_key=None, limit=CACHE_YEAR_LIMIT):
+    """先丢掉过期条目，再按过期时间从旧到新逐出，最多留 limit 个年份。"""
+    for key in [item for item, value in cache.items()
+                if value.get("expires", 0) <= now and item != keep_key]:
+        cache.pop(key, None)
+    while len(cache) > limit:
+        candidates = [key for key in cache if key != keep_key]
+        if not candidates:
+            break
+        oldest = min(candidates, key=lambda key: cache[key].get("expires", 0))
+        cache.pop(oldest, None)
+
+
 def source_rows(requested_year=None):
     """只读取聚水潭实时采购库，不再回退旧数据库。"""
     years = fetch_realtime_years(REALTIME_ENV_PATH)
-    if not years:
-        raise RuntimeError("实时采购库没有有效年份")
-    current_year = str(business_today().year)
-    year = requested_year if requested_year in years else (current_year if current_year in years else years[0])
+    year = resolve_source_year(requested_year, years)
     rows = fetch_realtime_purchase_rows(year, REALTIME_ENV_PATH)
     return rows, "供应链 API 本地实时镜像", years, year, None
 
 
 def source_cache(requested_year=None):
     """短时缓存原始明细行和两个页面的数据，避免同一批明细重复压库。"""
+    years = fetch_realtime_years(REALTIME_ENV_PATH)
+    year = resolve_source_year(requested_year, years)
     now = time.monotonic()
-    cache_key = requested_year or "latest"
     with _cache_lock:
-        cached = _cache.get(cache_key)
+        cached = _cache.get(year)
         if cached and cached["expires"] > now:
             return cached
-        rows, source, years, year, warning = source_rows(requested_year)
+    with _year_lock(year):
+        now = time.monotonic()
+        with _cache_lock:
+            cached = _cache.get(year)
+            if cached and cached["expires"] > now:
+                return cached
+        rows = fetch_realtime_purchase_rows(year, REALTIME_ENV_PATH)
+        source = "供应链 API 本地实时镜像"
+        warning = None
         sync_state = fetch_realtime_sync_state(REALTIME_ENV_PATH)
         if not sync_state["fresh"]:
             warning = (
@@ -150,6 +204,9 @@ def source_cache(requested_year=None):
         if "purchase:failed" in sync_state.get("sourceStatus", ""):
             failure_warning = "API 增量同步当前失败，请检查 Client 路由授权"
             warning = f"{warning}；{failure_warning}" if warning else failure_warning
+        window_warning = purchase_window_warning(year)
+        if window_warning:
+            warning = f"{warning}；{window_warning}" if warning else window_warning
         dashboard = build_dashboard_payload(rows, source)
         delivery = build_delivery_payload(rows, source)
         for value in (dashboard, delivery):
@@ -163,17 +220,19 @@ def source_cache(requested_year=None):
         today = business_today().isoformat()
         dashboard["meta"]["today"] = today
         delivery["meta"]["today"] = today
-        _cache[cache_key] = {
-            # 年度明细从远程镜像读取可能耗时较长，TTL 应从构建完成时开始计算。
-            "expires": time.monotonic() + CACHE_TTL_SECONDS,
-            "rows": rows,
-            "meta": {"source": source, "year": year, "availableYears": years,
-                     "warning": warning, "today": today, "rows": len(rows)},
-            "dashboard": dashboard,
-            "delivery": delivery,
-        }
-        _source_state.update(source=source, warning=warning, year=year)
-        return _cache[cache_key]
+        with _cache_lock:
+            _cache[year] = {
+                # 年度明细从远程镜像读取可能耗时较长，TTL 应从构建完成时开始计算。
+                "expires": time.monotonic() + CACHE_TTL_SECONDS,
+                "rows": rows,
+                "meta": {"source": source, "year": year, "availableYears": years,
+                         "warning": warning, "today": today, "rows": len(rows)},
+                "dashboard": dashboard,
+                "delivery": delivery,
+            }
+            trim_source_cache(_cache, now, keep_key=year)
+            _source_state.update(source=source, warning=warning, year=year)
+            return _cache[year]
 
 
 def payloads(requested_year=None):
@@ -194,11 +253,19 @@ AUDIT = AuditLog(AGENT_STORE)
 DINGTALK_SENDER, STAFF_DIRECTORY, REMINDER_NOTIFIER = build_dingtalk(
     setting=setting, store=AGENT_STORE, audit=AUDIT, flag=flag, root=ROOT,
 )
+QUALITY, QUALITY_SCHEDULER = build_quality(
+    setting=setting, store=AGENT_STORE, sender=DINGTALK_SENDER, root=ROOT,
+    env_path=REALTIME_ENV_PATH, audit=AUDIT, flag=flag,
+)
+MEMORIES = OperatorMemories(
+    AGENT_STORE, enabled=flag(setting("AGENT_MEMORY_ENABLED", "false")),
+)
 AGENT = build_agent(
     setting=setting, root=ROOT, env_path=REALTIME_ENV_PATH, fetch_rows=agent_rows,
     exchange=EXCHANGE, forecast=FORECAST,
     notifier=REMINDER_NOTIFIER if REMINDER_NOTIFIER.enabled else None,
-    store=AGENT_STORE, audit=AUDIT,
+    store=AGENT_STORE, audit=AUDIT, directory=STAFF_DIRECTORY,
+    quality=QUALITY if QUALITY.enabled else None, memories=MEMORIES,
 )
 REMINDER_SCHEDULER = DailyReminderScheduler(
     notifier=REMINDER_NOTIFIER, fetch_rows=agent_rows,
@@ -210,12 +277,76 @@ DINGTALK_STREAM = DingTalkStreamChannel(
     client_id=setting("DINGTALK_CLIENT_ID", ""),
     client_secret=setting("DINGTALK_CLIENT_SECRET", ""),
     audit=AUDIT, enabled=flag(setting("DINGTALK_ENABLED", "false")),
-    directory=STAFF_DIRECTORY,
+    directory=STAFF_DIRECTORY, quality=QUALITY, memories=MEMORIES,
 )
+MAINTENANCE = MaintenanceScheduler(
+    store=AGENT_STORE, root=ROOT,
+    retention_days=int(setting("AGENT_RETENTION_DAYS", "90") or 90),
+)
+
+
+def _notify_gb_contract_changes(sync_result: dict) -> dict:
+    """每日国标同步成功后：合同已选用标准的状态跃迁推钉钉群。"""
+    return notify_contract_gb_changes(
+        REALTIME_ENV_PATH,
+        sync_result.get("statusChanges") or [],
+        sender=DINGTALK_SENDER if DINGTALK_SENDER.configured else None,
+        audit=AUDIT,
+    )
+
+
+if GB_STANDARDS_SYNCER is not None:
+    GB_STANDARDS_SYNCER.on_sync = _notify_gb_contract_changes
+
+
+def _notify_stuck_exchange(job: dict) -> None:
+    """执行超时的换货任务不重投，只告警，避免 ERP 双写。"""
+    job_id = str(job.get("id") or "")
+    operator = str(job.get("operator") or "")
+    oids = (job.get("targets") or {}).get("o_ids") or []
+    shown = ", ".join(str(item) for item in oids[:10])
+    suffix = "…" if len(oids) > 10 else ""
+    text = (
+        f"换货任务 `{job_id}` 执行超时，已标为中断（stuck），**未自动重投**，"
+        f"避免对 ERP 重复写入。\n\n"
+        f"- 操作人：{operator or '未知'}\n"
+        f"- 订单：{shown}{suffix or ('（无）' if not oids else '')}\n\n"
+        "请人工核对 ERP 后再决定是否另建任务。"
+    )
+    logger.warning("Exchange job stuck: %s", job_id)
+    if not flag(setting("DINGTALK_ENABLED", "false")) or not DINGTALK_SENDER.configured:
+        return
+    try:
+        DINGTALK_SENDER.send_markdown("换货任务执行中断", text)
+    except Exception as exc:
+        logger.error("Stuck exchange alert failed: %s", exc)
+
+
+EXCHANGE.on_stuck = _notify_stuck_exchange
+
+
+def _valid_po_id(value) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.isascii() and text.isdecimal()
+
+
+def _reject_json_constant(value):
+    raise ValueError(f"JSON 不能包含 {value}")
+
+
+def _safe_status(getter):
+    try:
+        payload = getter()
+    except Exception as exc:
+        return {"error": type(exc).__name__}
+    if isinstance(payload, dict) and payload.get("lastError"):
+        payload = {**payload, "lastError": str(payload["lastError"]).split(":")[0][:80]}
+    return payload
 
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ProcurementDashboard/1.0"
+    timeout = 30
 
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -224,6 +355,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect(LEGACY_PAGES.get(path, HOME))
         if path == "/api/health":
             return self.health()
+        quality_file = re.fullmatch(r"/api/quality/reports/(\d{8})/([a-f0-9]{16})\.xlsx", path)
+        if quality_file:
+            return self.quality_report_file(quality_file.group(1), quality_file.group(2))
         if path.startswith("/api/exchange/"):
             return self.exchange_get(path, parsed)
         if path == "/api/contracts/options":
@@ -276,11 +410,17 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > 1024 * 1024:
                 raise ValueError("请求内容大小不正确")
-            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            body = json.loads(
+                self.rfile.read(length).decode("utf-8"),
+                parse_constant=_reject_json_constant,
+            )
             po_id = str(body.get("poId") or "")
-            if not po_id.isdigit():
+            if not _valid_po_id(po_id):
                 raise ValueError("采购单号格式不正确")
             invoice_type = str(body.get("invoiceType") or "")
+            from .contracts import INVOICE_LABELS
+            if invoice_type not in INVOICE_LABELS:
+                raise ValueError("票种只能是 no_invoice、normal_invoice 或 special_invoice")
             stamp = time.time_ns()
             output = ROOT / "outputs" / "generated" / f"采购合同-{po_id}-{invoice_type}-{stamp}.xlsx"
             preview = output.with_suffix(".png") if path.endswith("preview") else None
@@ -299,14 +439,17 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             self.json_response({"ok": False, "error": str(exc)}, 400)
         except Exception as exc:
-            print(f"Contract generation error: {type(exc).__name__}: {exc}")
+            logger.exception("Contract generation error")
             self.json_response({"ok": False, "error": "采购合同生成失败"}, 500)
 
     def read_json_body(self, max_size=1024 * 1024):
         length = int(self.headers.get("Content-Length", "0"))
         if length <= 0 or length > max_size:
             raise ValueError("请求内容大小不正确")
-        return json.loads(self.rfile.read(length).decode("utf-8"))
+        return json.loads(
+            self.rfile.read(length).decode("utf-8"),
+            parse_constant=_reject_json_constant,
+        )
 
     def require_agent_token(self):
         expected = setting("AGENT_API_TOKEN", "").strip()
@@ -316,7 +459,7 @@ class Handler(BaseHTTPRequestHandler):
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer "):
             supplied = supplied[7:]
-        if not secrets.compare_digest(supplied, expected):
+        if not _tokens_equal(supplied, expected):
             self.json_response({"ok": False, "error": "Agent 接口认证失败"}, 401)
             return False
         return True
@@ -328,13 +471,13 @@ class Handler(BaseHTTPRequestHandler):
         if not expected:
             self.json_response({"ok": False, "error": f"换货接口尚未配置 {name}"}, 503)
             return False
-        if other and secrets.compare_digest(expected, other):
+        if other and _tokens_equal(expected, other):
             self.json_response({"ok": False, "error": "换货页面与 ERP Worker 必须使用不同 Token"}, 503)
             return False
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer "):
             supplied = supplied[7:]
-        if not secrets.compare_digest(supplied, expected):
+        if not _tokens_equal(supplied, expected):
             self.json_response({"ok": False, "error": "换货接口认证失败"}, 401)
             return False
         return True
@@ -410,7 +553,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ExchangeError, ProductImageError, OrderSourceError) as exc:
             self.json_response({"ok": False, "error": str(exc)}, getattr(exc, "status", 400))
         except Exception as exc:
-            print(f"Exchange GET error: {type(exc).__name__}: {exc}")
+            logger.exception("Exchange GET error")
             self.json_response({"ok": False, "error": "换货接口暂时不可用"}, 500)
 
     def exchange_post(self, path):
@@ -434,7 +577,7 @@ class Handler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/exchange/jobs/([a-f0-9]{24})/(confirm|cancel)", path)
             if match:
                 job = (EXCHANGE.confirm(match.group(1), operator) if match.group(2) == "confirm"
-                       else EXCHANGE.cancel(match.group(1)))
+                       else EXCHANGE.cancel(match.group(1), operator))
                 return self.json_response(job)
             if path == "/api/exchange/worker/heartbeat":
                 return self.json_response(EXCHANGE.heartbeat(str(body.get("workerId") or ""), body))
@@ -480,7 +623,7 @@ class Handler(BaseHTTPRequestHandler):
             status = exc.status if isinstance(exc, (ExchangeError, ProductImageError)) else 400
             self.json_response({"ok": False, "error": str(exc)}, status)
         except Exception as exc:
-            print(f"Exchange POST error: {type(exc).__name__}: {exc}")
+            logger.exception("Exchange POST error")
             self.json_response({"ok": False, "error": "换货接口暂时不可用"}, 500)
 
     def agent_operator(self, body=None):
@@ -496,12 +639,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.json_response({"ok": False, "error": str(exc)}, 503)
         if isinstance(exc, (LLMError, DingTalkError)):
             return self.json_response({"ok": False, "error": str(exc)}, 502)
-        if isinstance(exc, (ToolError, ForecastError, ValueError, json.JSONDecodeError)):
+        if isinstance(exc, (ToolError, ForecastError, QualityError, ValueError, json.JSONDecodeError)):
             return self.json_response({"ok": False, "error": str(exc)}, 400)
         if type(exc).__module__.split(".")[0] == "pymysql":
-            print(f"Agent API database error: {type(exc).__name__}: {exc}")
+            logger.exception("Agent API database error")
             return self.json_response({"ok": False, "error": "实时数据库暂时不可用"}, 503)
-        print(f"Agent API error: {type(exc).__name__}: {exc}")
+        logger.exception("Agent API error")
         return self.json_response({"ok": False, "error": "Agent 接口暂时不可用"}, 500)
 
     def agent_get(self, path, parsed):
@@ -591,8 +734,22 @@ class Handler(BaseHTTPRequestHandler):
                     note=body.get("note") or "",
                     aliases=body.get("aliases") or (),
                 ), 201)
+            if path == "/api/agent/quality/report":
+                if not STAFF_DIRECTORY.known_operator(operator):
+                    raise ActionError(WEB_OPERATOR_UNBOUND, 403)
+                return self.json_response(QUALITY_SCHEDULER.run_once(operator=operator or "web"))
             if path == "/api/agent/reminders/push":
-                return self.json_response(REMINDER_SCHEDULER.run_once(today=body.get("today")))
+                if not STAFF_DIRECTORY.known_operator(operator):
+                    raise ActionError(WEB_OPERATOR_UNBOUND, 403)
+                buckets = body.get("buckets")
+                if buckets is not None and not isinstance(buckets, list):
+                    raise ValueError("buckets 必须是数组")
+                return self.json_response(REMINDER_SCHEDULER.run_once(
+                    today=body.get("today"),
+                    buyer=str(body.get("buyer") or "").strip(),
+                    buckets=buckets,
+                    operator=operator or "web",
+                ))
             if path == "/api/forecast/predict":
                 return self.json_response(FORECAST.predict(
                     body.get("keys") or body.get("skus") or [],
@@ -618,9 +775,12 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = self.read_json_body()
             po_id = str(body.get("purchaseOrderNo") or body.get("poId") or "")
-            if not po_id.isdigit():
+            if not _valid_po_id(po_id):
                 raise ValueError("采购单号格式不正确")
             invoice_type = str(body.get("invoiceType") or "special_invoice")
+            from .contracts import INVOICE_LABELS
+            if invoice_type not in INVOICE_LABELS:
+                raise ValueError("票种只能是 no_invoice、normal_invoice 或 special_invoice")
             contract_id = secrets.token_hex(12)
             output_dir = ROOT / "outputs" / "agent" / contract_id
             output = output_dir / "contract.xlsx"
@@ -645,7 +805,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, RuntimeError, subprocess.SubprocessError) as exc:
             self.json_response({"ok": False, "error": str(exc)}, 400)
         except Exception as exc:
-            print(f"Agent contract generation error: {type(exc).__name__}: {exc}")
+            logger.exception("Agent contract generation error")
             self.json_response({"ok": False, "error": "Agent 生成采购合同失败"}, 500)
 
     def agent_contract_file(self, contract_id, kind):
@@ -662,7 +822,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def contract_options(self, po_id):
         try:
-            if not po_id.isdigit():
+            if not _valid_po_id(po_id):
                 raise ValueError("采购单号格式不正确")
             self.json_response(get_contract_options(po_id, REALTIME_ENV_PATH))
         except ValueError as exc:
@@ -672,7 +832,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             self.json_response({"orders": fetch_contract_order_choices(REALTIME_ENV_PATH, query=query)})
         except Exception as exc:
-            print(f"Contract order list error: {type(exc).__name__}: {exc}")
+            logger.exception("Contract order list error")
             self.json_response({"ok": False, "error": "采购单列表暂时不可用"}, 503)
 
     def file_response(self, path, content_type):
@@ -700,33 +860,55 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with connect(REALTIME_ENV_PATH, autocommit=True) as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(f"SELECT COUNT(*) AS total, MAX(api_synced_at) AS synced FROM `{REALTIME_ITEM_TABLE}`")
+                    cursor.execute(f"SELECT COUNT(*) AS total FROM `{REALTIME_ITEM_TABLE}`")
                     status = cursor.fetchone()
             payload["rows"] = status["total"]
         except Exception as exc:
             payload.update({"ok": False, "database": "unavailable", "error": type(exc).__name__})
+        else:
+            try:
+                sync = fetch_realtime_sync_state(REALTIME_ENV_PATH)
+                payload["syncedAt"] = sync.get("syncedAt") or ""
+                payload["syncLagMinutes"] = sync.get("syncLagMinutes")
+            except Exception:
+                payload["syncedAt"] = ""
+                payload["syncLagMinutes"] = None
         payload.update({
             "activeSource": _source_state["source"] or "供应链 API 本地实时镜像",
             "activeYear": _source_state["year"],
             "warning": _source_state["warning"],
-            "realtimeMirror": REALTIME_MIRROR_SCHEDULER.status(),
-            "gbStandards": GB_STANDARDS_SCHEDULER.status(),
-            "exchange": EXCHANGE.status(),
-            "agent": {"enabled": AGENT.enabled, "available": AGENT.available,
-                      "llm": AGENT.llm.status(), "tools": len(AGENT.registry.names())},
-            "forecast": FORECAST.status()["artifact"],
-            "dingtalk": {"stream": DINGTALK_STREAM.status(),
-                         "reminder": REMINDER_SCHEDULER.status(),
-                         "sender": DINGTALK_SENDER.status()},
+            "realtimeMirror": _safe_status(REALTIME_MIRROR_SCHEDULER.status),
+            "gbStandards": _safe_status(GB_STANDARDS_SCHEDULER.status),
+            "exchange": _safe_status(EXCHANGE.status),
+            "agent": _safe_status(lambda: {
+                "enabled": AGENT.enabled, "available": AGENT.available,
+                "llm": AGENT.llm.status(), "tools": len(AGENT.registry.names()),
+            }),
+            "forecast": _safe_status(lambda: FORECAST.status()["artifact"]),
+            "dingtalk": {
+                "stream": _safe_status(DINGTALK_STREAM.status),
+                "reminder": _safe_status(REMINDER_SCHEDULER.status),
+                "sender": _safe_status(DINGTALK_SENDER.status),
+            },
+            "quality": _safe_status(QUALITY_SCHEDULER.status),
         })
         self.json_response(payload, 200 if payload["ok"] else 503)
+
+    def quality_report_file(self, compact_date, sig):
+        secret = setting("QUALITY_REPORT_LINK_SECRET", "")
+        if not report_link_valid(secret, compact_date, sig):
+            return self.json_response({"ok": False, "error": "链接无效或已过期"}, 404)
+        path = ROOT / "outputs" / "quality" / f"品控台账-{compact_date}.xlsx"
+        if not path.exists():
+            return self.json_response({"ok": False, "error": "日报文件不存在"}, 404)
+        return self.xlsx_response(path, path.name)
 
     def api(self, path, year):
         try:
             dashboard, delivery = payloads(year)
             self.json_response(dashboard if path.endswith("dashboard") else delivery)
         except Exception as exc:
-            print(f"API error: {type(exc).__name__}: {exc}")
+            logger.exception("API error")
             self.json_response({"ok": False, "error": "采购数据暂时不可用"}, 503)
 
     def json_response(self, value, status=200):
@@ -767,12 +949,15 @@ class Handler(BaseHTTPRequestHandler):
     @staticmethod
     def resolve_asset(path):
         """把 URL 路径映射到 dist 里的文件，越界或不存在都返回 None。"""
-        candidate = (DIST / path.lstrip("/")).resolve()
-        if not candidate.is_file():
+        try:
+            candidate = (DIST / path.lstrip("/")).resolve()
+            if not candidate.is_file():
+                return None
+            if DIST.resolve() not in candidate.parents:
+                return None
+            return candidate
+        except (ValueError, OSError):
             return None
-        if DIST.resolve() not in candidate.parents:
-            return None
-        return candidate
 
     def static(self, file_path, cache="no-cache"):
         body = file_path.read_bytes()
@@ -794,7 +979,11 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def log_message(self, fmt, *args):
-        print("%s - %s" % (self.address_string(), fmt % args))
+        message = "%s - %s" % (self.address_string(), fmt % args)
+        if "/api/health" in message:
+            logger.debug(message)
+        else:
+            logger.info(message)
 
 
 def main():
@@ -802,42 +991,50 @@ def main():
     parser.add_argument("--host", default=setting("APP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(setting("APP_PORT", "8777")))
     args = parser.parse_args()
+    configure_logging(level=setting("LOG_LEVEL", "INFO"), log_file=setting("LOG_FILE", "data/app.log"))
     server = ThreadingHTTPServer((args.host, args.port), Handler)
-    print(f"采购看板已启动：http://{args.host}:{args.port}{HOME}")
+    logger.info("采购看板已启动：http://%s:%s%s", args.host, args.port, HOME)
     # .env 在导入时读一次，改了配置不重启就不生效；把实际连的库打出来，免得对着旧连接排查。
     try:
-        print(f"镜像库：{Path(REALTIME_ENV_PATH).name} → {describe_target(REALTIME_ENV_PATH)}")
+        logger.info("镜像库：%s → %s", Path(REALTIME_ENV_PATH).name, describe_target(REALTIME_ENV_PATH))
     except (OSError, ValueError) as exc:
-        print(f"镜像库配置不可用（{Path(REALTIME_ENV_PATH).name}）：{exc}")
+        logger.warning("镜像库配置不可用（%s）：%s", Path(REALTIME_ENV_PATH).name, exc)
     shadowed = shadowed_settings()
     if shadowed:
-        print(f"注意：{'、'.join(shadowed)} 被进程环境变量覆盖，.env 里的值没有生效")
+        logger.warning("注意：%s 被进程环境变量覆盖，.env 里的值没有生效", "、".join(shadowed))
     if not INDEX_HTML.exists():
-        print("前端未构建：frontend/dist 不存在，页面返回 503（npm install && npm run build），接口仍可用")
+        logger.warning("前端未构建：frontend/dist 不存在，页面返回 503（npm install && npm run build），接口仍可用")
     if AGENT.available:
-        print(f"Agent 已启用：{AGENT.llm.provider} / {AGENT.llm.model} · {len(AGENT.registry.names())} 个工具")
+        logger.info(
+            "Agent 已启用：%s / %s · %s 个工具",
+            AGENT.llm.provider, AGENT.llm.model, len(AGENT.registry.names()),
+        )
     else:
-        print("Agent 未启用（AGENT_ENABLED 或模型凭证未就绪），/api/agent/chat 返回 503")
+        logger.info("Agent 未启用（AGENT_ENABLED 或模型凭证未就绪），/api/agent/chat 返回 503")
     stream_status = DINGTALK_STREAM.start()
     if stream_status.get("running"):
-        print("钉钉 Stream 已启动（企业内部应用机器人长连）")
+        logger.info("钉钉 Stream 已启动（企业内部应用机器人长连）")
     elif flag(setting("DINGTALK_ENABLED", "false")):
         reason = stream_status.get("lastError") or "缺少 DINGTALK_CLIENT_ID / DINGTALK_CLIENT_SECRET"
-        print(f"钉钉 Stream 未启动：{reason}")
+        logger.warning("钉钉 Stream 未启动：%s", reason)
     else:
-        print("钉钉 Stream 未启用（DINGTALK_ENABLED=false）")
+        logger.info("钉钉 Stream 未启用（DINGTALK_ENABLED=false）")
     REALTIME_MIRROR_SCHEDULER.start()
     if REALTIME_MIRROR_SCHEDULER.enabled:
-        print("订单/采购单/商品/供应商 API 实时镜像同步已启用")
+        logger.info("订单/采购单/商品/供应商 API 实时镜像同步已启用")
     GB_STANDARDS_SCHEDULER.start()
     if GB_STANDARDS_SCHEDULER.enabled:
-        print(f"国标目录同步已启用：每天 {GB_STANDARDS_SCHEDULER.status()['sendTime']}")
+        logger.info("国标目录同步已启用：每天 %s", GB_STANDARDS_SCHEDULER.status()["sendTime"])
     reminder_on = flag(setting("DINGTALK_REMINDER_ENABLED", "false"))
     if reminder_on and REMINDER_NOTIFIER.enabled:
         REMINDER_SCHEDULER.start()
-        print(f"每日交期催办推送已启用：{REMINDER_SCHEDULER.status()['sendTime']}")
+        logger.info("每日交期催办推送已启用：%s", REMINDER_SCHEDULER.status()["sendTime"])
     elif reminder_on:
-        print("每日催办已开但发送通道未配置（需要 Webhook 或 应用机器人+群会话 ID）")
+        logger.warning("每日催办已开但发送通道未配置（需要 Webhook 或 应用机器人+群会话 ID）")
+    if flag(setting("QUALITY_REPORT_ENABLED", "false")) and REMINDER_NOTIFIER.enabled:
+        QUALITY_SCHEDULER.start()
+        logger.info("每日品控日报已启用：%s", QUALITY_SCHEDULER.status()["sendTime"])
+    MAINTENANCE.start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -846,6 +1043,9 @@ def main():
         REALTIME_MIRROR_SCHEDULER.stop()
         GB_STANDARDS_SCHEDULER.stop()
         REMINDER_SCHEDULER.stop()
+        QUALITY_SCHEDULER.stop()
+        MAINTENANCE.stop()
+        DINGTALK_STREAM.stop()
         server.server_close()
 
 
