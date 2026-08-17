@@ -14,6 +14,13 @@ WEB_OPERATOR_UNBOUND = (
     "请填写与钉钉/采购员一致的姓名，或先在钉钉回复「绑定 姓名」。"
 )
 
+VIEWER_WRITE_DENIED = "当前角色是 viewer，只能查询，不能生成合同、换货或外发。"
+
+SELF_SCOPE_UNBOUND = (
+    "还没绑定采购员姓名，无法按「我名下」过滤。"
+    "网页请署名已绑定的采购员，钉钉回复「绑定 姓名」。"
+)
+
 
 _PAREN_TAIL = re.compile(r"^(.*?)[\(（]([^）\)]+)[\)）]\s*$")
 _NAME_SPLIT = re.compile(r"[,，、/;；]+")

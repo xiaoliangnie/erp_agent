@@ -10,12 +10,165 @@
 .contract-meta span { display: block; color: var(--text-muted); font-size: 11px; }
 .contract-meta b { display: block; margin-top: 3px; font-size: 14px; overflow-wrap: anywhere; }
 
+.payment-field select { min-width: 180px; }
+.payment-manual { margin-top: 14px; }
+.payment-manual label { display: block; color: var(--text-muted); font-size: 11px; margin-bottom: 4px; }
+.payment-manual textarea {
+  width: 100%;
+  resize: vertical;
+  font: inherit;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-1);
+  color: var(--text-primary);
+}
+.payment-preview { margin-top: 12px; color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.payment-preview .hint { color: var(--text-muted); font-style: normal; }
+.payment-preview pre {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  font: inherit;
+}
+.contract-extras {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+  margin-top: 14px;
+}
+@media (max-width: 900px) {
+  .contract-extras { grid-template-columns: 1fr; }
+}
+.inspection-default { margin-top: 6px; color: var(--text-muted); font-size: 11px; }
+
+.price-history {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  align-items: baseline;
+}
+.price-history.muted { opacity: .7; }
+.link-btn {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--text-secondary);
+  cursor: pointer;
+  text-decoration: underline;
+}
+.link-btn:disabled { color: var(--text-muted); cursor: default; text-decoration: none; }
+
+.sku-extra { margin-top: 3px; color: var(--text-muted); font-size: 11px; }
+.unit-missing { color: var(--critical); font-weight: 650; }
 .table-wrap { overflow: auto; margin-top: 16px; }
 .price-input { width: 110px; text-align: right; }
 .notice-actions { margin-top: 8px; }
-.gb-select { width: 100%; min-width: 220px; max-width: 320px; font-size: 12px; }
-.gb-empty { color: var(--text-muted); font-size: 12px; }
-.gb-pick { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.gb-empty { color: var(--text-muted); font-size: 12px; padding: 8px; }
+.gb-cell { min-width: 260px; max-width: 340px; }
+.gb-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-1);
+  padding: 0 4px 0 8px;
+}
+.gb-control.open { border-color: color-mix(in srgb, var(--series-1) 45%, var(--border)); }
+.gb-value,
+.gb-combobox {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  padding: 5px 0;
+  text-align: left;
+}
+.gb-value {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.gb-value b,
+.gb-option-main b { font-weight: 650; flex: none; }
+.gb-name,
+.gb-option-main span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+.gb-placeholder { color: var(--text-muted); }
+.gb-clear {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  line-height: 1;
+}
+.gb-clear:hover { background: var(--wash); color: var(--text-primary); }
+.gb-menu {
+  position: fixed;
+  z-index: 40;
+  max-height: 280px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-1);
+  box-shadow: 0 8px 24px color-mix(in srgb, var(--text-primary) 12%, transparent);
+  padding: 4px;
+}
+.gb-menu-head {
+  padding: 6px 8px 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.gb-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.gb-option-main {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.gb-option:hover,
+.gb-option.active { background: var(--wash); }
+.gb-rec {
+  font-style: normal;
+  font-size: 10px;
+  font-weight: 650;
+  color: var(--good);
+  padding: 0 5px;
+  border: 1px solid color-mix(in srgb, var(--good) 40%, var(--border));
+  border-radius: 999px;
+}
 .gb-badge {
   flex: none;
   font-size: 10px;

@@ -56,9 +56,8 @@ class ForecastService:
 
     @classmethod
     def from_settings(cls, setting, *, root, env_path):
-        directory = Path(setting("FORECAST_MODEL_DIR", "data/models"))
-        if not directory.is_absolute():
-            directory = Path(root) / directory
+        from ..paths import resolve_repo_path
+        directory = resolve_repo_path(setting("FORECAST_MODEL_DIR", "files/data/models"), root=root)
         return cls(
             store=ForecastStore(directory),
             env_path=env_path,

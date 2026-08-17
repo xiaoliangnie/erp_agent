@@ -23,7 +23,8 @@ def main():
     parser.add_argument("--output", help="输出 xlsx 路径")
     parser.add_argument("--preview", help="可选的预览 PNG 路径")
     args = parser.parse_args()
-    output = args.output or str(ROOT / "outputs" / f"采购合同-{args.po_id}-{args.invoice_type}.xlsx")
+    from backend.paths import OUTPUTS_DIR
+    output = args.output or str(OUTPUTS_DIR / f"采购合同-{args.po_id}-{args.invoice_type}.xlsx")
     path = generate_contract(
         args.po_id, args.invoice_type, output,
         tax_rate=args.tax_rate, preview_path=args.preview,

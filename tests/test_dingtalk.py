@@ -40,8 +40,14 @@ class FakeRunner:
         self.confirms.append({"id": action_id, "operator": operator, "channel": channel, **kwargs})
         return {"title": "生成合同", "result": {"file": "ok.xlsx"}}
 
+    def confirm_latest(self, operator, channel="dingtalk", **kwargs):
+        return self.confirm("latest", operator, channel=channel, **kwargs)
+
     def cancel(self, action_id, operator, **kwargs):
         return {"title": "生成合同", "status": "cancelled"}
+
+    def cancel_latest(self, operator, **kwargs):
+        return self.cancel("latest", operator, **kwargs)
 
 
 class StreamTests(unittest.TestCase):
@@ -68,6 +74,7 @@ class StreamTests(unittest.TestCase):
     def test_help_and_bind_then_chat_uses_buyer_name(self):
         help_text = self.handle("帮助", message_id="h1")
         self.assertIn("绑定", help_text)
+        self.assertIn("换鞋垫", help_text)
         bound = self.handle("绑定 张三", message_id="b1")
         self.assertIn("张三", bound)
         self.assertEqual("张三", self.directory.get_by_dingtalk_user_id("u1")["buyerName"])
@@ -87,6 +94,43 @@ class StreamTests(unittest.TestCase):
         self.assertIn("已执行", reply)
         self.assertEqual("李四", self.runner.confirms[-1]["operator"])
 
+    def test_handle_async_leaves_the_event_loop(self):
+        import asyncio
+        import threading
+
+        seen = {}
+        original = self.channel.handle
+
+        def wrapped(**kwargs):
+            seen["handle_thread"] = threading.current_thread().name
+            return original(**kwargs)
+
+        self.channel.handle = wrapped
+
+        async def go():
+            seen["loop_thread"] = threading.current_thread().name
+            return await self.channel.handle_async(
+                text="帮助", message_id="async-1", conversation_id="cid",
+                sender_id="u1", sender_name="小钉",
+            )
+
+        reply = asyncio.run(go())
+        self.assertIn("绑定", reply)
+        self.assertNotEqual(seen["loop_thread"], seen["handle_thread"])
+
+    def test_bare_confirm_uses_latest_pending(self):
+        self.directory.upsert("李四", dingtalk_user_id="u9")
+        reply = self.handle("确认", sender_id="u9", sender_name="别名", message_id="cf0")
+        self.assertIn("已执行", reply)
+        self.assertEqual("latest", self.runner.confirms[-1]["id"])
+        self.assertEqual("李四", self.runner.confirms[-1]["operator"])
+
+    def test_confirm_with_trailing_note_still_confirms(self):
+        self.directory.upsert("李四", dingtalk_user_id="u9")
+        reply = self.handle("确认，并返回处理结果", sender_id="u9", sender_name="别名", message_id="cf2")
+        self.assertIn("已执行", reply)
+        self.assertEqual("latest", self.runner.confirms[-1]["id"])
+
     def test_duplicate_message_id_is_ignored(self):
         first = self.handle("帮助", message_id="dup")
         second = self.handle("帮助", message_id="dup")
@@ -98,6 +142,7 @@ class StreamTests(unittest.TestCase):
         path.write_text('{"王五": {"dingtalk_user_id": "u5", "mobile": "139"}}', encoding="utf-8")
         self.assertEqual(1, self.directory.seed_from_json(path))
         self.assertEqual("u5", self.directory.get("王五")["dingtalkUserId"])
+        self.assertEqual("operator", self.directory.get("王五")["role"])
 
     def test_bind_multiple_names_share_user_id(self):
         reply = self.handle("绑定 利特、李佳冬（利特）", message_id="b-alias")

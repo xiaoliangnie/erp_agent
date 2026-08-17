@@ -46,18 +46,18 @@ def main():
         if not secret_path.is_absolute():
             secret_path = ROOT / secret_path
         try:
-            client_secret = secret_path.read_text(encoding="utf-8").strip()
+            client_secret = secret_path.read_text(encoding="utf-8").strip() or client_secret
         except OSError as exc:
-            raise SystemExit(f"无法读取供应链 API Secret 文件：{secret_path}") from exc
+            if not client_secret:
+                raise SystemExit(f"无法读取供应链 API Secret 文件：{secret_path}") from exc
     client = SupplyProxyClient(
         setting(values, "SUPPLY_API_BASE", "https://api.wjyfek.com"),
         setting(values, "SUPPLY_API_CLIENT_ID"),
         client_secret,
         timeout=int(setting(values, "REALTIME_SYNC_TIMEOUT_SECONDS", "45") or 45),
     )
-    image_dir = Path(setting(values, "PRODUCT_IMAGE_CACHE_DIR", "data/product-images"))
-    if not image_dir.is_absolute():
-        image_dir = ROOT / image_dir
+    from backend.paths import resolve_repo_path
+    image_dir = resolve_repo_path(setting(values, "PRODUCT_IMAGE_CACHE_DIR", "files/data/product-images"))
     mirror = RealtimeMirror(
         args.env, client,
         page_size=int(setting(values, "REALTIME_SYNC_PAGE_SIZE", "50") or 50),

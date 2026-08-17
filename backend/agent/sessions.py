@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import secrets
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,6 +19,20 @@ class SessionStore:
         self.idle_minutes = max(0, int(idle_minutes))
         self.char_budget = max(4000, int(char_budget))
         self.tool_result_limit = max(500, int(tool_result_limit))
+        self._session_locks: dict[str, threading.Lock] = {}
+        self._session_locks_guard = threading.Lock()
+
+    def lock_for(self, session_id: str) -> threading.Lock:
+        """同一会话的对话 / 确认串行，避免并发消息交叉写入上下文。"""
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return threading.Lock()
+        with self._session_locks_guard:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[session_id] = lock
+            return lock
 
     def ensure(self, channel: str, session_key: str, operator: str = "") -> dict:
         """按渠道和会话键取会话；空闲超时则 epoch+1，不删消息。"""
@@ -267,6 +282,17 @@ def drop_dangling_tool_calls(messages: list[dict]) -> list[dict]:
 
 
 def encode_tool_result(result, *, limit: int = 8000) -> str:
+    if isinstance(result, dict) and "ok" in result and "summary" in result:
+        text = dumps(result)
+        if len(text) <= limit:
+            return text
+        return dumps({
+            "ok": result.get("ok"),
+            "summary": result.get("summary"),
+            "data": None,
+            "truncated": True,
+            "hint": result.get("hint") or "结果过长已截断，请用更精确的参数重查",
+        })
     text = dumps(result) if not isinstance(result, str) else result
     if len(text) <= limit:
         return text

@@ -419,7 +419,7 @@
 
   async function executeJob(job, options) {
     options = options || {};
-    const plans = (job.plan && job.plan.plans) || options.plans || [];
+    const plans = (job.plan && job.plan.plans) || job.plans || options.plans || [];
     return execute({
       plans: plans,
       confirm: options.confirm === true,

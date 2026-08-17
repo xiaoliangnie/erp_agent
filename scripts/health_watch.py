@@ -61,14 +61,15 @@ def build_sender() -> DingTalkSender:
 
 def resolve_path(value: str, default: str) -> Path:
     text = str(value or default).strip() or default
+    from backend.paths import resolve_repo_path
     path = Path(text)
-    return path if path.is_absolute() else ROOT / path
+    return path if path.is_absolute() else resolve_repo_path(text)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="拉 /api/health，异常时发钉钉告警")
     parser.add_argument("--url", default="", help="健康检查 URL，默认 APP_BASE_URL/api/health")
-    parser.add_argument("--state", default="", help="巡检状态文件，默认 data/health_watch_state.json")
+    parser.add_argument("--state", default="", help="巡检状态文件，默认 files/data/health_watch_state.json")
     parser.add_argument("--lag-minutes", type=int, default=None, help="镜像滞后阈值（分钟）")
     parser.add_argument("--repeat-minutes", type=int, default=None, help="同一问题重复告警间隔")
     parser.add_argument("--timeout", type=int, default=None, help="HTTP 超时秒数")
@@ -80,7 +81,7 @@ def main() -> int:
     base = setting("APP_BASE_URL", "http://127.0.0.1:8777").rstrip("/")
     url = args.url or setting("HEALTH_WATCH_URL", "") or f"{base}/api/health"
     state_path = resolve_path(args.state or setting("HEALTH_WATCH_STATE_PATH", ""),
-                              "data/health_watch_state.json")
+                              "files/data/health_watch_state.json")
     lag_minutes = args.lag_minutes if args.lag_minutes is not None else _int_setting(
         "HEALTH_WATCH_LAG_MINUTES", DEFAULT_LAG_MINUTES,
     )

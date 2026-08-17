@@ -6,6 +6,7 @@ from backend.order_source import (
     _mirror_state,
     fetch_exchange_order_items,
     fetch_exchange_orders,
+    resolve_status_filter,
     source_status,
 )
 
@@ -52,6 +53,65 @@ class OrderSourceTests(unittest.TestCase):
             status = _mirror_state("unused.env", "realtime_orders")
         self.assertFalse(status["configured"])
         self.assertIn("首次同步", status["message"])
+
+    def test_status_defaults_to_pending_for_sku_search(self):
+        self.assertEqual(["待发货"], resolve_status_filter(None, source_sku="SKU1"))
+        self.assertEqual([], resolve_status_filter(None, query="11530151"))
+        self.assertEqual([], resolve_status_filter("all", source_sku="SKU1"))
+        self.assertEqual(["待发货"], resolve_status_filter("待发货", query="11530151"))
+
+    def test_sku_search_sql_includes_default_status(self):
+        captured = {}
+
+        def fake_connect(*_args, **_kwargs):
+            cursor = MagicMock()
+            cursor.__enter__.return_value = cursor
+            cursor.fetchall.return_value = []
+
+            def execute(sql, params=None):
+                captured["sql"] = sql
+                captured["params"] = list(params or [])
+
+            cursor.execute.side_effect = execute
+            connection = MagicMock()
+            connection.__enter__.return_value = connection
+            connection.cursor.return_value = cursor
+            return connection
+
+        setting = settings({
+            "EXCHANGE_ORDER_TABLE": "realtime_orders",
+            "EXCHANGE_ORDER_ITEM_TABLE": "realtime_order_items",
+        })
+        with patch("backend.order_source.connect", fake_connect):
+            with patch("backend.order_source._mirror_state", return_value={}):
+                result = fetch_exchange_orders(setting, "unused.env", source_sku="XZ1", shop="抖店")
+        self.assertIn("待发货", captured["params"])
+        self.assertIn("XZ1", captured["params"])
+        self.assertIn("%抖店%", captured["params"])
+        self.assertEqual(["待发货"], result["filters"]["status"])
+
+    def test_explicit_order_id_does_not_force_status(self):
+        captured = {}
+
+        def fake_connect(*_args, **_kwargs):
+            cursor = MagicMock()
+            cursor.__enter__.return_value = cursor
+            cursor.fetchall.return_value = []
+
+            def execute(sql, params=None):
+                captured["params"] = list(params or [])
+
+            cursor.execute.side_effect = execute
+            connection = MagicMock()
+            connection.__enter__.return_value = connection
+            connection.cursor.return_value = cursor
+            return connection
+
+        setting = settings({"EXCHANGE_ORDER_TABLE": "realtime_orders"})
+        with patch("backend.order_source.connect", fake_connect):
+            with patch("backend.order_source._mirror_state", return_value={}):
+                fetch_exchange_orders(setting, "unused.env", query="11530151")
+        self.assertNotIn("待发货", captured["params"])
 
 
 if __name__ == "__main__":

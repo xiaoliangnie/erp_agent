@@ -8,23 +8,28 @@ from pathlib import Path
 
 from .actions import ActionError, PendingActions
 from .audit import AuditLog
+from .context import RequestContext, resolve_request_context, resolve_user_id
 from .llm import LLMClient, LLMError
 from .maintenance import MaintenanceScheduler
 from .memories import OperatorMemories
 from .runner import AgentDisabled, AgentRunner
 from .sessions import SessionStore
 from .store import AgentStore
+from .intents import classify_intent
 from .tools import (
-    RESERVED_TOOLS, RISK_LEVELS, Tool, ToolContext, ToolError, ToolRegistry,
-    build_registry, declared_arguments,
+    RESERVED_TOOLS, RISK_LEVELS, PermissionDenied, Tool, ToolContext, ToolError,
+    ToolRegistry, build_registry, declared_arguments, scoped_buyers,
 )
 
 
 __all__ = [
     "ActionError", "AgentDisabled", "AgentRunner", "AgentStore", "AuditLog", "LLMClient",
+    "RequestContext", "resolve_request_context", "resolve_user_id",
     "LLMError", "PendingActions", "RESERVED_TOOLS", "RISK_LEVELS", "SessionStore", "Tool",
-    "ToolContext", "ToolError", "ToolRegistry", "agent_database_path", "build_agent",
+    "PermissionDenied", "ToolContext", "ToolError", "ToolRegistry",
+    "agent_database_path", "build_agent",
     "build_registry", "declared_arguments", "flag", "MaintenanceScheduler",
+    "scoped_buyers",
     "OperatorMemories",
 ]
 
@@ -39,13 +44,13 @@ def flag(value, default=False):
 
 def agent_database_path(setting, root):
     """Agent 业务库位置；相对路径按仓库根目录解析。"""
-    path = Path(setting("AGENT_DATABASE_PATH", "data/agent.sqlite3"))
-    return path if path.is_absolute() else Path(root) / path
+    from ..paths import resolve_repo_path
+    return resolve_repo_path(setting("AGENT_DATABASE_PATH", "files/data/agent.sqlite3"), root=root)
 
 
-def build_agent(*, setting, root, env_path, fetch_rows, exchange=None, forecast=None,
-                notifier=None, store=None, audit=None, directory=None, quality=None,
-                memories=None):
+def build_agent(*, setting, root, env_path, fetch_rows, exchange=None, erp=None,
+                forecast=None, notifier=None, store=None, audit=None, directory=None,
+                quality=None, memories=None, mirror=None):
     """按 `.env` 配置装配 Agent。
 
     `setting(name, default)` 由调用方提供（服务端用 `backend.app.setting`），
@@ -72,8 +77,8 @@ def build_agent(*, setting, root, env_path, fetch_rows, exchange=None, forecast=
     )
     context = ToolContext(
         env_path=env_path, root=root, fetch_rows=fetch_rows,
-        exchange=exchange, forecast=forecast, notifier=notifier,
-        setting=setting, quality=quality,
+        exchange=exchange, erp=erp, forecast=forecast, notifier=notifier,
+        setting=setting, quality=quality, mirror=mirror,
     )
     audit = audit or AuditLog(store)
     context.audit = audit

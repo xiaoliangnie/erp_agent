@@ -2,9 +2,8 @@
 
 采购数据服务、五个业务页面与采购助手 Agent。系统统一读取 `hanli.env` 指向的本地 MySQL
 镜像库，由供应链安全代理 API 增量维护订单和采购单数据。
-完整架构和后续路线见 `docs/PROJECT_DESIGN.md`。
-采购 Agent、局域网部署与钉钉机器人方案见 `docs/AGENT_ARCHITECTURE.md`，
-自训练预测模型的接入步骤见 `docs/预测模型接入.md`；
+当前执行文档见 `docs/开发.md`。Agent 完成度见 `docs/Agent进度.md`。数据链路 / Agent / 钉钉见 `docs/architecture/`。
+自训练预测模型的接入步骤见 `docs/预测.md`。
 Agent 与钉钉密钥模板见根目录 `.env.example`。
 
 ## 订单 SKU 换货
@@ -30,6 +29,14 @@ Agent 与钉钉密钥模板见根目录 `.env.example`。
 - 采购助手可以理解“把订单 A 的 SKU B 换成 SKU C”，以及“这批待发货异常单把 B 换成 C”：
   先按订单镜像收成明确 `o_id` 再生成待确认 dry-run。Agent 确认只登记试算，真实 ERP 写入
   仍需在换货页核对试算清单后二次确认。
+- 抖音换鞋垫是单独一条固定流程：钉钉或对话里说「查询一下现在抖音需要更换的鞋垫订单」，
+  会列出内部单号、平台单号、状态、店铺、鞋码和目标 SKU；加上「进行处理」会生成待确认动作。
+  钉钉直接回复「确认」（不用带编号、不用去换货页）后，由后端 Playwright **串行**写入；
+  先回「已开始写入」，写完再发一条【任务完成】结果日志（清单和结果都只展开 5 条：单号、状态、鞋码、目标鞋垫）。
+  浏览器只打开一次订单页，后续按尺码试算/写入复用同一页，速度与本地批量脚本同一量级。半码按码数舍去小数再换算毫米（`40.5` → `40` → `250mm` → `09906`）；
+  发货中只列出不写。写入成功后立刻按内部单号回写镜像，并把这批单记进已写入台账；增量同步还没跟上时，再查不会把同一批再列出来。
+  同一会话重复「进行处理」会复用已有待确认，不另开一条。
+  钉钉写操作必须已绑定；权限表尚未落地，先按 `viewer` / 绑定拦截，后续在同一检查点加 capabilities。
 - 「异常订单」第一期只处理 SKU 替换（同款换规格 / 指定源→目标 / 已维护白名单跨款）。
   备注异常、超卖、地址错误没有规则，不会由 AI 自行定义。采购逾期走催办，不走换货。
 
@@ -38,9 +45,9 @@ Agent 与钉钉密钥模板见根目录 `.env.example`。
 然后保持 `/app/order/order/list.aspx` 标签页登录且打开。换货页顶端显示 Worker 在线后即可试算。
 同一个 Worker 也负责合同商品图片的只读同步：合同页点击“从 ERP 同步图片”后，它会用浏览器
 登录态读取 `purchaseitem.aspx` 的 `pic300` / `pic160` / `pic100`，不会调用换货写接口。
-任务队列第一阶段使用 `data/exchange_jobs.sqlite3`，后续 Agent 业务 MySQL 到位时只替换
+任务队列第一阶段使用 `files/data/exchange_jobs.sqlite3`，后续 Agent 业务 MySQL 到位时只替换
 `backend/exchange/service.py` 的存储实现。
-换货白名单在 `config/exchange-rules.json`，服务按文件修改时间重读，改完不必重启。
+换货白名单在 `files/config/exchange-rules.json`，服务按文件修改时间重读，改完不必重启。
 
 ### 页内核心 / Codex 直接调用
 
@@ -114,7 +121,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 
 ## 日志与健康巡检
 
-日志走标准库 `logging`，时间固定东八区。`LOG_FILE` 默认 `data/app.log`（不进版本库）；
+日志走标准库 `logging`，时间固定东八区。`LOG_FILE` 默认 `files/data/app.log`（不进版本库）；
 留空则只写 stderr，迁移后可直接接 systemd journal。`/api/health` 的访问记录是 DEBUG，
 避免五分钟巡检把 INFO 刷满。
 
@@ -126,7 +133,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 - 钉钉 Stream `restartCount` **相对上次巡检增加**（第一次只记基数，避免进程刚起来就告警）
 - 催办 `dingtalk.reminder.lastError` 非空
 
-状态记在 `data/health_watch_state.json`。本机可用 cron / launchd 每 5 分钟跑一次：
+状态记在 `files/data/health_watch_state.json`。本机可用 cron / launchd 每 5 分钟跑一次：
 
 ```bash
 .venv/bin/python scripts/health_watch.py
@@ -164,7 +171,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 
 商品接口首次接入会优先批量补齐订单/采购明细引用过的 SKU，再按修改时间持续增量；接口未返回的
 历史已删除/停用 SKU 仍由订单和采购明细兜底。供应商首次全量分页，后续按修改时间增量。
-商品图片在主数据表保存 URL，并继续缓存到 `data/product-images/`；原始大图不作为 BLOB 写进高频业务表。
+商品图片在主数据表保存 URL，并继续缓存到 `files/data/product-images/`；原始大图不作为 BLOB 写进高频业务表。
 
 换货页订单选择器读取：
 
@@ -193,7 +200,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 `last_changed_at`。水位写在 `realtime_sync_state.source_name = gb_standards`。
 
 默认范围由 **商品表 `realtime_products.category`** 决定：分类先映射到
-`config/gb_category_map.json` 里的目录族（服装 Y76/Y75/W63、鞋类 Y78、玩具 Y57 等），再对
+`files/config/gb_category_map.json` 里的目录族（服装 Y76/Y75/W63、鞋类 Y78、玩具 Y57 等），再对
 这些族的 CCS/ICS/关键字做并集。空分类、`其他`、一件代发、线下订单会忽略。未映射的分类会
 打日志并跳过，不按分类名模糊检索（「毛绒」会误中毛纺纤维标准）。合同选国标时按目录族关联
 表 `gb_standard_families` 过滤。钉钉机器人和网页助手共用只读工具 `gb_catalog_status`（目录
@@ -219,7 +226,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 后无需修改代码，常驻服务会自动重试。
 
 订单镜像从 `orders.search` 的嵌套 `items` 同步商品明细和 `pic` 图片地址，并把有效图片缓存
-到 `data/product-images/`。该接口当前不包含淘系和拼多多订单；如需覆盖这两类平台，需要代理
+到 `files/data/product-images/`。该接口当前不包含淘系和拼多多订单；如需覆盖这两类平台，需要代理
 侧另行开放相应订单接口。
 
 首次打开默认查询本年度 1 月 1 日至服务器当天，排除取消、删除和合并单；切换年度时才查询历史年度。
@@ -245,17 +252,21 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 | `backend/dingtalk/` | 钉钉发送、身份映射、Stream 客户端与每日催办推送 |
 | `backend/delivery_reminders.py` | 四波催办口径，台账页 / Agent 工具 / 钉钉推送共用 |
 | `backend/gb_standards.py` | 国标目录同步：std.samr.gov.cn → `gb_standards` 表 |
-| `backend/logging_setup.py` | 统一日志：东八区时间 / 级别 / 模块，可选落 `data/app.log` |
+| `backend/logging_setup.py` | 统一日志：东八区时间 / 级别 / 模块，可选落 `files/data/app.log` |
 | `backend/health_watch.py` | `/api/health` 评估与告警去重；CLI 在 `scripts/health_watch.py` |
 | `scripts/` | 合同生成、模型训练、Agent 调试、国标同步与健康巡检 |
-| `data/snapshots/` | CSV 数据快照 |
-| `templates/采购合同模板.xlsx` | 用户提供的采购合同母版 |
-| `config/buyers.json` | 需方、仓库、送货与验收信息 |
-| `config/suppliers.json` | 供应商简称到完整信息、票种税率的映射 |
-| `config/gb_category_map.json` | 商品分类到国标目录族（CCS/ICS/关键字）的映射 |
-| `docs/` | 架构、数据接口记录与视觉参考 |
+| `files/` | 本地文件根：config 主数据、templates 合同母版、data 运行时、outputs 生成物 |
+| `files/data/snapshots/` | CSV 数据快照 |
+| `files/templates/采购合同模板.xlsx` | 固定栏空白母版（需方 / 收货信息 / 包装 / 检验 / 条款） |
+| `files/config/buyers.json` | 需方、仓库、送货与验收信息 |
+| `files/config/供应商管理.xlsx` | 本机维护的供应商主数据（不上库，不进版本库）；合同按 ERP 简称匹配 |
+| `files/config/internal_suppliers.json` | 公司内部户名单；合同不列收付款信息 |
+| `files/config/contract_mappings.json` | 合同映射表：发票类型、付款方式条款与 ERP 预选 |
+| `files/config/suppliers.json` | 没有供应商管理表时的回退；离线用例仍用它 |
+| `files/config/gb_category_map.json` | 商品分类到国标目录族（CCS/ICS/关键字）的映射 |
+| `docs/` | 架构、路线与外部接口参考；索引见 `docs/README.md` |
 | `tests/fixtures/` | 聚焦测试夹具 |
-| `outputs/` | 生成的合同文件，不提交版本库 |
+| `files/outputs/` | 生成的合同文件，不提交版本库 |
 | `hanli.env` | 本地可写实时镜像数据库配置（已忽略，不提交） |
 | `legacy/` | 已下线的旧 HTML 页面与离线数据生成器，仅供对照，可删 |
 
@@ -265,20 +276,25 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 
 生成器自动完成：
 
-- 从实时 ERP 主表填写下单日期、采购单号、供应商简称、采购员和送货信息。
-- 从实时明细表填写款式、SKU、品名、数量和交货日期；多交期时取最晚日期作为整单交货期限。
-- 从 `config/suppliers.json` 按供应商简称补齐供方全称、地址、联系人和票种税率。
-- 从 `config/products.json` 补齐**国标码（商品条码）**、分类、材质工艺、包装、单位、三类价格和商品图片。
-- 按商品表 `realtime_products.category`（缺则用产品配置分类）对照 `config/gb_category_map.json`，从 `gb_standards` 列出该目录族下现行 / 即将实施的**执行标准**（GB/T…）供勾选；未选不阻止生成。选中结果写入镜像库 `contract_line_gb`（按采购明细 `poi_id`），Excel 单独占一列，不覆盖国标码。候选项带状态角标；已废止的已选标准会标出来，但不能再生成进合同。
+- 从实时 ERP 主表填写下单日期、采购单号、供应商简称、采购员；表头日期、需方、供方、收货信息居中。需方侧 A6:A7 合并为「收货信息」，B6:H7 默认「鄂州仓：湖北省鄂州市华容区葛店镇电商大道8号蓝库电子商务有限公司1库1号4号门，收货人：蜀黍家收货组，13385711803」，合同页可手改；同一段文字写入第 14 行「送货地址」（一条明细时正好是 14A:14P）。
+- 从实时明细表填写款式、SKU、品名、数量和交货日期；多交期时取最晚日期作为整单交货期限。Excel 列序是国标码 → 品名 → 执行标准。明细备注写在 Q 列（P 列表头保留但不写内容）；预览打印区仍是 A–P。
+- 单价优先用员工手填，其次解析备注里**第一个数字**（如「包体32+2个魔术贴标3.45」→ 32），再才是 `products.json` 该票种价或 ERP 价（票种匹配 / 内部户）。
+- 从本机 `files/config/供应商管理.xlsx`（`backend/supplier_master.py`）按供应商简称补齐供方全称、地址、联系人、票种税率和收款账户（付款账户名 / 开户行 / 账户）。同一简称多行时只留**创建时间最近**的一条。这张表是 ERP「供应商管理」导出，**不写入镜像库**；员工覆盖文件即可，服务按修改时间重读。没有该文件时回退 `files/config/suppliers.json`。冻结供应商、缺全称/地址/联系人电话时中止。发票类型只认「专用发票 / 普通发票 / 不开发票」等已映射原文，`(0%)` 不猜票种。
+- 公司内部户（`files/config/internal_suppliers.json`，现为蜀黍家 / 蜀黍家毛绒组装加工 / 蜀黍家辅料供应商）单独一类：不要求 Excel 全称和收付款账户，合同付款方式写「内部往来，不列收付款信息」，单价可用 ERP 价。要增删内部户只改这份 JSON。
+- 合同页给两处历史参考：每行商品显示**这家供应商这颗 SKU 的上次采购价 / 日期 / 单号**（取自镜像库采购明细，不含本单，点「采用」直接填进单价框）；付款方式按**这家供应商上次用过的条款**预选并标注来源。上次选择记在本机 `files/config/payment_history.json`（不进库、不进版本库），预览和下载都会更新。
+- 付款方式（合同「付款方式」栏）由员工在合同页选，条款正文维护在 `files/config/contract_mappings.json` 的 `payment_options`：3/7、发货前付款、到仓后付款、月度结算，另有「手动输入」可自己写（上限 500 字）。**下拉里的括号标签只用于选择，写进合同的只有条款正文**，后面再跟采购单号，以及映射表里的付款账户名 / 开户行 / 账户（内部户不列）。ERP 单头 `payment_method` 只决定默认预选（`MonthlyStatement` → 月度结算，`CurrentSettlement` / `CashOnDelivery` → 到仓后付款），该字段为空时不预选，必须自己选一条才能预览。同一份文件还维护「发票类型」原文到票种的映射，改完不必重启。
+- 检验标准默认两条（到仓无破损、数量一致）；合同页可加行，从 3 起编号，已带序号的不再加前缀。空白母版见 `files/templates/采购合同模板.xlsx`（只含固定栏，不含采购单内容）。
+- 从 `files/config/products.json` 补齐**国标码（商品条码）**、分类、材质工艺、包装、单位、三类价格和商品图片。该文件没维护到的 SKU，**单位、分类、名称、国标码、虚拟分类**退到镜像库 `realtime_products`（条码取接口 `sku_code`，虚拟分类取 `vc_name`）；**单价不从商品主数据兜底**，顺序是手填 → 备注首个数字 → 配置价 → ERP 价，都没有就中止。单位在两处都查不到、或商品资料行在但单位为空时才报错。合同页会直接显示单位和条码，不必点预览才发现缺单位。
+- 按商品表 `realtime_products.category`（缺则用产品配置分类）对照 `files/config/gb_category_map.json`，从 `gb_standards` 列出该目录族下现行 / 即将实施的**执行标准**（GB/T…）。合同页是一个合并输入框：点开下列出按商品信息排好的推荐（分类排序，配置了模型则再由 LLM 从候选里挑，**不能编造目录外编号**，也不自动选定）；输入 `GB/T 36` / `9832` 按标准号前缀查 `/api/contracts/gb/search`，输入「毛绒」按名称查。未选不阻止生成。选中结果写入镜像库 `contract_line_gb`（按采购明细 `poi_id`），Excel 单独占一列，不覆盖国标码。候选项带状态角标；已废止的已选标准会标出来，但不能再生成进合同。`CONTRACT_GB_AI` 默认开（复用 `AGENT_*` 模型配置，不依赖 `AGENT_ENABLED`）；`CONTRACT_GB_WEBSEARCH` 默认关，打开后会向国标平台按品名补检索，命中仍必须落在本地目录里。
 - 根据员工选择更新单价表头、合同第 4 条票种/税率、商品小计、总金额及付款方式中的采购单号。
 
 采购看板底部按采购单实际建立时间倒序展示最近 20 单，并提供“生成合同”入口；到货预警和完整交期清单统一放在交期提醒台账，避免两个页面重复。合同入口会携带采购单号打开合同页并自动载入对应订单。合同预览由真实 XLSX 经办公套件渲染，因此与下载文件使用相同数据，并能显示嵌入的商品图片。
 
-系统先使用 `config/products.json` 的 `image_path`；API 采购/订单明细如果返回 `pic300` /
+系统先使用 `files/config/products.json` 的 `image_path`；API 采购/订单明细如果返回 `pic300` /
 `pic160` / `pic100` / `pic` 等图片 URL，同步器会校验文件类型并按 SKU 缓存到
-`data/product-images/`。如果代理接口没有返回图片字段，仍可在合同页创建图片同步任务，
+`files/data/product-images/`。如果代理接口没有返回图片字段，仍可在合同页创建图片同步任务，
 由已登录聚水潭页面的 Worker 取图。ERP Cookie 始终留在浏览器，后端和合同文件都不会保存
-Cookie；后续合同直接使用本地缓存。缺少供应商完整映射、税率或所选票种价格时，系统会
+Cookie；后续合同直接使用本地缓存。缺少供应商完整映射（含本机表未命中、已冻结、缺地址/联系人）、税率或所选票种价格时，系统会
 阻止生成，避免带占位信息的合同流出。执行标准未选可以生成；填了目录里不存在或已废止的标准号
 则会中止。国标码（商品条码）和执行标准（GB/T…）是两列，不要混用。
 
@@ -299,7 +315,7 @@ Agent 或命令行也可调用同一能力：
 .venv/bin/python scripts/generate_purchase_contract.py \
   --po-id 604264 \
   --invoice-type special_invoice \
-  --output outputs/采购合同-604264.xlsx
+  --output files/outputs/采购合同-604264.xlsx
 ```
 
 ## 采购助手（Agent）
@@ -329,6 +345,8 @@ Agent 或命令行也可调用同一能力：
 | `order_suggestion` | L0 只读 | 订货建议（确定性公式，见下） |
 | `generate_purchase_contract` | **L1 生成产物** | 生成合同 Excel + 预览，先给要点再确认 |
 | `submit_exchange_dry_run` | **L1 生成产物** | 登记换货 dry-run 任务（真实换货仍需在换货页二次确认） |
+| `locate_insole_orders` | L0 只读 | 定位抖音旧鞋垫订单；半码按码数舍去小数后映射目标 SKU |
+| `process_insole_orders` | **L2 对外动作** | 按清单串行换鞋垫；确认前必须展示订单信息 |
 | `send_delivery_reminder` | **L2 对外动作** | 催办清单发到钉钉群并 @ 采购员 |
 
 `send_delivery_reminder` 只在钉钉发送可用时注册，所以关掉钉钉时 `/api/agent/status`
@@ -376,7 +394,7 @@ L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_action
 ### 审计
 
 每轮对话、每次工具调用、每条待确认动作、每次订货建议、每次外发通知都落在 Agent 业务库
-（`AGENT_DATABASE_PATH`，默认 `data/agent.sqlite3`，已 gitignore）：
+（`AGENT_DATABASE_PATH`，默认 `files/data/agent.sqlite3`，已 gitignore）：
 `agent_sessions` / `agent_messages` / `agent_runs` / `tool_executions` / `pending_actions` /
 `forecast_runs` / `staff_bindings` / `notification_deliveries`。
 
@@ -408,7 +426,7 @@ L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_action
 
 **接入自己训练好的模型**：继承 `Forecaster` 实现 `fit` / `predict`，训练时加
 `--forecaster 模块:类名`。工件的 `metadata.json` 会记下这个引用，服务端据此加载，
-调用方一行都不用改。完整说明和约束见 `docs/预测模型接入.md`。
+调用方一行都不用改。完整说明和约束见 `docs/预测.md`。
 
 ## 钉钉机器人
 
@@ -444,7 +462,7 @@ DINGTALK_GROUP_CONVERSATION_ID=   # 群的 openConversationId，催办 @ 人必�
 ```
 
 手机号反查 userId（应用机器人）：`resolve-mobile --mobile 138...`。种子文件可从
-`config/staff_bindings.example.json` 复制为 `config/staff_bindings.json`（不进版本库）。
+`files/config/staff_bindings.example.json` 复制为 `files/config/staff_bindings.json`（不进版本库）。
 
 未绑定的人可以问只读问题（含国标目录状态、某商品对应执行标准、主数据缺口），但网页 L1/L2
 （生成合同、登记换货、发催办、确认 pending）对不上 `staff_bindings` 就拒绝。会话按
@@ -609,7 +627,7 @@ AGENT_MODEL=gpt-5.6-sol
 
 - **字段可空**：供应商、采购单号、SKU 解析不出就留空，**不猜**。描述不能空。
   单号必须是 6 位以上数字且能在采购主表查到；SKU 必须像款号（字母+数字）；
-  供应商必须是 `config/suppliers.json` 的键。
+  供应商必须是 `files/config/suppliers.json` 的键。
 - **日报范围**：只含该自然日（东八区）登记、且状态不是「已撤销」的记录。
   已关闭的当日记录仍进表。历史未关闭问题只在摘要里报一个计数，不进当日 Excel。
 - **指令**：`品控 …` / `品控关闭 <6位hex> [备注]` / `撤销品控 <6位hex>` /

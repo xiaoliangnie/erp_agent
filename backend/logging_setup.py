@@ -12,11 +12,11 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .business_time import BUSINESS_TIMEZONE
+from .paths import ROOT, resolve_repo_path
 
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-ROOT = Path(__file__).resolve().parents[1]
 _configured = False
 
 
@@ -35,7 +35,7 @@ def resolve_log_path(log_file: str | None, *, root: Path | None = None) -> Path 
     path = Path(text)
     if path.is_absolute():
         return path
-    return (root or ROOT) / path
+    return resolve_repo_path(text, root=root or ROOT)
 
 
 def configure_logging(*, level: str | None = None, log_file: str | None = None,

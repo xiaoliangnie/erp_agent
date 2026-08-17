@@ -53,18 +53,20 @@ class PendingActions:
         session_id: str | None = None,
         run_id: str | None = None,
         actor_id: str = "",
+        user_id: str = "",
     ) -> dict:
         action_id = secrets.token_hex(12)
         stamp = now()
         with self.store.write() as conn:
             conn.execute(
                 """INSERT INTO pending_actions
-                   (id, session_id, run_id, channel, operator, tool, risk, title,
+                   (id, session_id, run_id, channel, operator, user_id, tool, risk, title,
                     arguments_json, preview_json, status, created_at, updated_at, expires_at,
                     actor_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
-                (action_id, session_id, run_id, channel, str(operator or "")[:120], tool, risk,
-                 str(title or tool)[:200], dumps(arguments or {}), dumps(preview or {}),
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                (action_id, session_id, run_id, channel, str(operator or "")[:120],
+                 str(user_id or "")[:80], tool, risk, str(title or tool)[:200],
+                 dumps(arguments or {}), dumps(preview or {}),
                  stamp, stamp, later(self.ttl_seconds), str(actor_id or "")[:80]),
             )
         return self.get(action_id)
@@ -78,6 +80,26 @@ class PendingActions:
             self._mark(action_id, "expired", error="确认超时")
             return self.get(action_id)
         return self._row(row)
+
+    def latest_open(self, *, session_id: str | None = None, actor_id: str = "",
+                    tool: str = "") -> dict | None:
+        """当前会话里最近一条待确认动作。钉钉回「确认」时用。"""
+        self.expire_due()
+        sql = "SELECT * FROM pending_actions WHERE status = 'pending'"
+        params: list = []
+        if session_id:
+            sql += " AND session_id = ?"
+            params.append(session_id)
+        if actor_id:
+            sql += " AND actor_id = ?"
+            params.append(str(actor_id))
+        if tool:
+            sql += " AND tool = ?"
+            params.append(tool)
+        sql += " ORDER BY created_at DESC LIMIT 1"
+        with self.store.read() as conn:
+            row = conn.execute(sql, params).fetchone()
+        return self._row(row) if row else None
 
     def list(self, *, session_id: str | None = None, status: str = "pending", limit: int = 20) -> list[dict]:
         self.expire_due()
@@ -196,6 +218,7 @@ class PendingActions:
             "runId": row["run_id"],
             "channel": row["channel"],
             "operator": row["operator"],
+            "userId": row["user_id"] if "user_id" in row.keys() else "",
             "tool": row["tool"],
             "risk": row["risk"],
             "title": row["title"],

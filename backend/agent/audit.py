@@ -30,15 +30,16 @@ class AuditLog:
     def __init__(self, store: AgentStore):
         self.store = store
 
-    def start_run(self, *, session_id: str, channel: str, operator: str, request: str, model: str = "") -> str:
+    def start_run(self, *, session_id: str, channel: str, operator: str, request: str,
+                  model: str = "", user_id: str = "") -> str:
         run_id = secrets.token_hex(12)
         with self.store.write() as conn:
             conn.execute(
                 """INSERT INTO agent_runs
-                   (id, session_id, channel, operator, request, status, model, started_at)
-                   VALUES (?, ?, ?, ?, ?, 'running', ?, ?)""",
+                   (id, session_id, channel, operator, user_id, request, status, model, started_at)
+                   VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
                 (run_id, session_id, channel, str(operator or "")[:120],
-                 str(request or "")[:4000], model, now()),
+                 str(user_id or "")[:80], str(request or "")[:4000], model, now()),
             )
         return run_id
 
@@ -57,20 +58,21 @@ class AuditLog:
     def record_tool(self, *, tool: str, risk: str = "L0", status: str = "ok",
                     arguments: dict | None = None, result=None, error: str | None = None,
                     duration_ms: int = 0, run_id: str | None = None, session_id: str | None = None,
-                    pending_action_id: str | None = None, operator: str = "", channel: str = "") -> None:
+                    pending_action_id: str | None = None, operator: str = "",
+                    user_id: str = "", channel: str = "") -> None:
         with self.store.write() as conn:
             conn.execute(
                 """INSERT INTO tool_executions
-                   (run_id, session_id, pending_action_id, tool, risk, operator, channel,
+                   (run_id, session_id, pending_action_id, tool, risk, operator, user_id, channel,
                     arguments_json, status, result_summary, error, duration_ms, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (run_id, session_id, pending_action_id, tool, risk, str(operator or "")[:120],
-                 channel, dumps(arguments or {})[:4000], status, summarize(result),
-                 str(error)[:1000] if error else None, int(duration_ms), now()),
+                 str(user_id or "")[:80], channel, dumps(arguments or {})[:4000], status,
+                 summarize(result), str(error)[:1000] if error else None, int(duration_ms), now()),
             )
 
     def record_forecast(self, *, model_name: str, model_version: str, keys: list,
-                        inputs: dict, output: dict, operator: str = "",
+                        inputs: dict, output: dict, operator: str = "", user_id: str = "",
                         session_id: str | None = None, run_id: str | None = None,
                         pending_action_id: str | None = None) -> str:
         """记录一次订货建议引用的模型版本与输入快照，事后可复现。"""
@@ -78,12 +80,12 @@ class AuditLog:
         with self.store.write() as conn:
             conn.execute(
                 """INSERT INTO forecast_runs
-                   (id, session_id, run_id, pending_action_id, operator, model_name,
+                   (id, session_id, run_id, pending_action_id, operator, user_id, model_name,
                     model_version, keys_json, input_json, output_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (forecast_id, session_id, run_id, pending_action_id, str(operator or "")[:120],
-                 model_name, model_version, dumps(list(keys)), dumps(inputs),
-                 dumps(output)[:200000], now()),
+                 str(user_id or "")[:80], model_name, model_version, dumps(list(keys)),
+                 dumps(inputs), dumps(output)[:200000], now()),
             )
         return forecast_id
 
@@ -177,7 +179,9 @@ class AuditLog:
             ).fetchall()
         return [{
             "id": row["id"], "sessionId": row["session_id"], "channel": row["channel"],
-            "operator": row["operator"], "request": row["request"], "reply": row["reply"],
+            "operator": row["operator"],
+            "userId": row["user_id"] if "user_id" in row.keys() else "",
+            "request": row["request"], "reply": row["reply"],
             "status": row["status"], "steps": row["steps"], "model": row["model"],
             "error": row["error"], "startedAt": row["started_at"],
             "durationMs": row["duration_ms"],
@@ -191,7 +195,9 @@ class AuditLog:
             ).fetchall()
         return [{
             "tool": row["tool"], "risk": row["risk"], "status": row["status"],
-            "operator": row["operator"], "channel": row["channel"],
+            "operator": row["operator"],
+            "userId": row["user_id"] if "user_id" in row.keys() else "",
+            "channel": row["channel"],
             "arguments": loads(row["arguments_json"], {}), "resultSummary": row["result_summary"],
             "error": row["error"], "durationMs": row["duration_ms"], "createdAt": row["created_at"],
         } for row in rows]

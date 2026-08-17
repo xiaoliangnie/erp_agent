@@ -8,6 +8,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 from ..business_time import business_today
+from ..paths import local_dir
 from .parse import parse_quality_command, parse_quality_fields
 from .report import build_quality_workbook, quality_report_markdown
 from .scheduler import DailyQualityReportScheduler
@@ -64,7 +65,7 @@ def build_quality(*, setting, store, sender, root, env_path, audit, flag):
         ledger=ledger,
         sender=sender,
         audit=audit,
-        output_dir=root / "outputs" / "quality",
+        output_dir=local_dir("outputs", root=root) / "quality",
         send_time=setting("QUALITY_REPORT_TIME", "17:30"),
         empty_mode=setting("QUALITY_REPORT_EMPTY", "skip"),
         link_secret=setting("QUALITY_REPORT_LINK_SECRET", ""),

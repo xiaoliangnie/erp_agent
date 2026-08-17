@@ -56,13 +56,23 @@ from .business_time import business_today
 from .staff_names import WEB_OPERATOR_UNBOUND
 from .product_images import ProductImageError, ProductImageService
 from .order_source import OrderSourceError, fetch_exchange_order_items, fetch_exchange_orders
+from .erp import DigitalRuntime, DigitalWorkerLoop
 from .realtime_mirror import build_mirror_from_settings
-from .gb_standards import build_gb_sync_from_settings, notify_contract_gb_changes
+from .gb_standards import (
+    build_gb_sync_from_settings,
+    expand_recommend_candidates,
+    gb_recommend_prompt,
+    mark_recommended_options,
+    notify_contract_gb_changes,
+    parse_recommended_nos,
+    search_contract_standards,
+    search_samr_catalog_hits,
+)
 from .logging_setup import configure_logging
+from .paths import OUTPUTS_DIR, ROOT, resolve_repo_path
 
 
 logger = logging.getLogger(__name__)
-ROOT = Path(__file__).resolve().parents[1]
 FRONTEND = ROOT / "frontend"
 # React 单页应用的构建产物，由 `npm run build` 生成；没有构建过就只有接口可用。
 DIST = FRONTEND / "dist"
@@ -110,14 +120,18 @@ def shadowed_settings():
 
 
 REALTIME_ENV_PATH = str(ROOT / setting("REALTIME_DATABASE_ENV_FILE", "hanli.env"))
-_exchange_db_setting = setting("EXCHANGE_DATABASE_PATH", "data/exchange_jobs.sqlite3")
-EXCHANGE_DATABASE_PATH = Path(_exchange_db_setting)
-if not EXCHANGE_DATABASE_PATH.is_absolute():
-    EXCHANGE_DATABASE_PATH = ROOT / EXCHANGE_DATABASE_PATH
+EXCHANGE_DATABASE_PATH = resolve_repo_path(
+    setting("EXCHANGE_DATABASE_PATH", "files/data/exchange_jobs.sqlite3"),
+)
 EXCHANGE = ExchangeService(EXCHANGE_DATABASE_PATH)
+DIGITAL_WORKER = DigitalWorkerLoop(
+    DigitalRuntime.from_settings(setting, root=ROOT),
+    EXCHANGE,
+    poll_seconds=float(setting("ERP_AI_POLL_SECONDS", "3") or 3),
+)
 PRODUCT_IMAGES = ProductImageService(
-    ROOT / setting("PRODUCT_IMAGE_DATABASE_PATH", "data/product_image_jobs.sqlite3"),
-    ROOT / setting("PRODUCT_IMAGE_CACHE_DIR", "data/product-images"),
+    resolve_repo_path(setting("PRODUCT_IMAGE_DATABASE_PATH", "files/data/product_image_jobs.sqlite3")),
+    resolve_repo_path(setting("PRODUCT_IMAGE_CACHE_DIR", "files/data/product-images")),
 )
 REALTIME_MIRROR, REALTIME_MIRROR_SCHEDULER = build_mirror_from_settings(
     setting, root=ROOT, env_path=REALTIME_ENV_PATH,
@@ -262,10 +276,11 @@ MEMORIES = OperatorMemories(
 )
 AGENT = build_agent(
     setting=setting, root=ROOT, env_path=REALTIME_ENV_PATH, fetch_rows=agent_rows,
-    exchange=EXCHANGE, forecast=FORECAST,
+    exchange=EXCHANGE, erp=DIGITAL_WORKER.runtime, forecast=FORECAST,
     notifier=REMINDER_NOTIFIER if REMINDER_NOTIFIER.enabled else None,
     store=AGENT_STORE, audit=AUDIT, directory=STAFF_DIRECTORY,
     quality=QUALITY if QUALITY.enabled else None, memories=MEMORIES,
+    mirror=REALTIME_MIRROR,
 )
 REMINDER_SCHEDULER = DailyReminderScheduler(
     notifier=REMINDER_NOTIFIER, fetch_rows=agent_rows,
@@ -366,6 +381,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/contracts/orders":
             query = parse_qs(parsed.query).get("q", [""])[0]
             return self.contract_orders(query)
+        if path == "/api/contracts/gb/search":
+            query = parse_qs(parsed.query).get("q", [""])[0]
+            name = parse_qs(parsed.query).get("name", [""])[0]
+            category = parse_qs(parsed.query).get("category", [""])[0]
+            return self.contract_gb_search(query, name=name, category=category)
         image_job = re.fullmatch(r"/api/contracts/images/jobs/([a-f0-9]{24})", path)
         if image_job:
             return self.json_response(PRODUCT_IMAGES.get(image_job.group(1)))
@@ -403,6 +423,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.agent_contract_generate()
         if path.startswith("/api/agent/") or path.startswith("/api/forecast/"):
             return self.agent_post(path)
+        if path == "/api/contracts/gb/recommend":
+            return self.contract_gb_recommend()
         if path not in ("/api/contracts/generate", "/api/contracts/preview"):
             self.send_error(404, "Not Found")
             return
@@ -422,13 +444,17 @@ class Handler(BaseHTTPRequestHandler):
             if invoice_type not in INVOICE_LABELS:
                 raise ValueError("票种只能是 no_invoice、normal_invoice 或 special_invoice")
             stamp = time.time_ns()
-            output = ROOT / "outputs" / "generated" / f"采购合同-{po_id}-{invoice_type}-{stamp}.xlsx"
+            output = OUTPUTS_DIR / "generated" / f"采购合同-{po_id}-{invoice_type}-{stamp}.xlsx"
             preview = output.with_suffix(".png") if path.endswith("preview") else None
             generate_contract(
                 po_id, invoice_type, output,
                 tax_rate=body.get("taxRate"),
                 price_overrides=body.get("priceOverrides") or {},
                 gb_overrides=body.get("gbOverrides") or body.get("gb_overrides") or {},
+                payment_option=body.get("paymentOption"),
+                payment_text=body.get("paymentText"),
+                receiving_info=body.get("receivingInfo"),
+                inspection_extra=body.get("inspectionExtra"),
                 preview_path=preview,
                 env_path=REALTIME_ENV_PATH,
             )
@@ -514,6 +540,10 @@ class Handler(BaseHTTPRequestHandler):
                     REALTIME_ENV_PATH,
                     query=query.get("q", [""])[0],
                     source_sku=query.get("source_sku", [""])[0],
+                    shop=query.get("shop", [""])[0],
+                    status=query.get("status", [None])[0],
+                    date_from=query.get("date_from", [""])[0],
+                    date_to=query.get("date_to", [""])[0],
                     limit=query.get("limit", ["50"])[0],
                 ))
             if path == "/api/exchange/order-items":
@@ -535,6 +565,8 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 return self.json_response(EXCHANGE.get_job(match.group(1)))
             if path == "/api/exchange/worker/jobs/next":
+                if DIGITAL_WORKER.claims_jobs:
+                    return self.json_response({"job": None, "executor": "backend"})
                 worker_id = query.get("worker_id", [""])[0]
                 return self.json_response({"job": EXCHANGE.next_job(worker_id)})
             if path == "/api/exchange/worker/searches/next":
@@ -782,7 +814,7 @@ class Handler(BaseHTTPRequestHandler):
             if invoice_type not in INVOICE_LABELS:
                 raise ValueError("票种只能是 no_invoice、normal_invoice 或 special_invoice")
             contract_id = secrets.token_hex(12)
-            output_dir = ROOT / "outputs" / "agent" / contract_id
+            output_dir = OUTPUTS_DIR / "agent" / contract_id
             output = output_dir / "contract.xlsx"
             preview = output_dir / "preview.png"
             generate_contract(
@@ -790,6 +822,10 @@ class Handler(BaseHTTPRequestHandler):
                 tax_rate=body.get("taxRate"),
                 price_overrides=body.get("priceOverrides") or {},
                 gb_overrides=body.get("gbOverrides") or body.get("gb_overrides") or {},
+                payment_option=body.get("paymentOption"),
+                payment_text=body.get("paymentText"),
+                receiving_info=body.get("receivingInfo"),
+                inspection_extra=body.get("inspectionExtra"),
                 preview_path=preview,
                 env_path=REALTIME_ENV_PATH,
             )
@@ -809,7 +845,7 @@ class Handler(BaseHTTPRequestHandler):
             self.json_response({"ok": False, "error": "Agent 生成采购合同失败"}, 500)
 
     def agent_contract_file(self, contract_id, kind):
-        output_dir = ROOT / "outputs" / "agent" / contract_id
+        output_dir = OUTPUTS_DIR / "agent" / contract_id
         if kind == "file":
             path = output_dir / "contract.xlsx"
             if path.exists():
@@ -834,6 +870,99 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.exception("Contract order list error")
             self.json_response({"ok": False, "error": "采购单列表暂时不可用"}, 503)
+
+    def contract_gb_search(self, query="", name="", category=""):
+        """合同页按标准号前缀或名称找执行标准，只读目录，不改任何选择。"""
+        query = str(query or "").strip()[:64]
+        try:
+            standards = search_contract_standards(
+                REALTIME_ENV_PATH, query, limit=12,
+                product_name=str(name or "").strip()[:80],
+                category=str(category or "").strip()[:80],
+            )
+            self.json_response({"query": query, "standards": standards})
+        except Exception:
+            logger.exception("Contract GB search error")
+            self.json_response({"ok": False, "error": "国标目录暂时不可用"}, 503)
+
+    def contract_gb_recommend(self):
+        """用商品信息给执行标准排序；模型只能从候选里挑，不能编造标准号。"""
+        try:
+            body = self.read_json_body(max_size=64 * 1024)
+        except ValueError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        candidates = body.get("candidates") or []
+        if not isinstance(candidates, list):
+            return self.json_response({"ok": False, "error": "candidates 必须是数组"}, 400)
+        options = []
+        for raw in candidates[:40]:
+            if not isinstance(raw, dict):
+                continue
+            number = str(raw.get("standardNo") or raw.get("standard_no") or "").strip()
+            if not number:
+                continue
+            options.append({
+                "samrId": str(raw.get("samrId") or raw.get("samr_id") or ""),
+                "standardNo": number,
+                "nameCn": str(raw.get("nameCn") or raw.get("name_cn") or ""),
+                "status": str(raw.get("status") or ""),
+                "nature": str(raw.get("nature") or ""),
+                "stdType": str(raw.get("stdType") or raw.get("std_type") or ""),
+                "recommended": False,
+                "recommendReason": "",
+            })
+        product = {
+            "name": str(body.get("name") or "").strip()[:80],
+            "category": str(body.get("category") or "").strip()[:80],
+            "specification": str(body.get("specification") or "").strip()[:120],
+            "remark": str(body.get("remark") or "").strip()[:120],
+        }
+        picked = []
+        source = "catalog"
+        if product["name"] or product["category"]:
+            try:
+                extras = expand_recommend_candidates(
+                    REALTIME_ENV_PATH, product, options, limit=12,
+                )
+                if extras:
+                    options.extend(extras)
+                    source = "catalog+search"
+            except Exception:
+                logger.exception("Contract GB catalog expand failed")
+        if flag(setting("CONTRACT_GB_WEBSEARCH", "false")) and product["name"]:
+            try:
+                extras = search_samr_catalog_hits(
+                    REALTIME_ENV_PATH, product["name"], limit=8,
+                )
+                known = {item["standardNo"] for item in options}
+                added = False
+                for extra in extras:
+                    if extra["standardNo"] not in known:
+                        options.append(extra)
+                        known.add(extra["standardNo"])
+                        added = True
+                if added:
+                    source = "catalog+websearch"
+            except Exception:
+                logger.exception("Contract GB websearch fallback failed")
+        if flag(setting("CONTRACT_GB_AI", "true")) and AGENT.llm.configured and options:
+            try:
+                answer = AGENT.llm.chat(gb_recommend_prompt(product, options))
+                picked = parse_recommended_nos(
+                    answer.get("content"),
+                    [item["standardNo"] for item in options],
+                )
+                if picked:
+                    source = "ai"
+            except Exception:
+                logger.exception("Contract GB AI recommend failed")
+        standards = mark_recommended_options(options, picked)
+        self.json_response({
+            "ok": True,
+            "source": source,
+            "standards": standards,
+            "recommended": [item for item in standards if item.get("recommended")],
+        })
 
     def file_response(self, path, content_type):
         body = Path(path).read_bytes()
@@ -880,6 +1009,7 @@ class Handler(BaseHTTPRequestHandler):
             "realtimeMirror": _safe_status(REALTIME_MIRROR_SCHEDULER.status),
             "gbStandards": _safe_status(GB_STANDARDS_SCHEDULER.status),
             "exchange": _safe_status(EXCHANGE.status),
+            "erpWorker": _safe_status(DIGITAL_WORKER.status),
             "agent": _safe_status(lambda: {
                 "enabled": AGENT.enabled, "available": AGENT.available,
                 "llm": AGENT.llm.status(), "tools": len(AGENT.registry.names()),
@@ -898,7 +1028,7 @@ class Handler(BaseHTTPRequestHandler):
         secret = setting("QUALITY_REPORT_LINK_SECRET", "")
         if not report_link_valid(secret, compact_date, sig):
             return self.json_response({"ok": False, "error": "链接无效或已过期"}, 404)
-        path = ROOT / "outputs" / "quality" / f"品控台账-{compact_date}.xlsx"
+        path = OUTPUTS_DIR / "quality" / f"品控台账-{compact_date}.xlsx"
         if not path.exists():
             return self.json_response({"ok": False, "error": "日报文件不存在"}, 404)
         return self.xlsx_response(path, path.name)
@@ -991,7 +1121,7 @@ def main():
     parser.add_argument("--host", default=setting("APP_HOST", "127.0.0.1"))
     parser.add_argument("--port", type=int, default=int(setting("APP_PORT", "8777")))
     args = parser.parse_args()
-    configure_logging(level=setting("LOG_LEVEL", "INFO"), log_file=setting("LOG_FILE", "data/app.log"))
+    configure_logging(level=setting("LOG_LEVEL", "INFO"), log_file=setting("LOG_FILE", "files/data/app.log"))
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     logger.info("采购看板已启动：http://%s:%s%s", args.host, args.port, HOME)
     # .env 在导入时读一次，改了配置不重启就不生效；把实际连的库打出来，免得对着旧连接排查。
@@ -1035,6 +1165,11 @@ def main():
         QUALITY_SCHEDULER.start()
         logger.info("每日品控日报已启用：%s", QUALITY_SCHEDULER.status()["sendTime"])
     MAINTENANCE.start()
+    erp_status = DIGITAL_WORKER.start()
+    if erp_status.get("running"):
+        logger.info("ERP Digital Worker 已启用：换货执行走后端 Playwright")
+    elif flag(setting("ERP_AI_ENABLED", "false")):
+        logger.warning("ERP Digital Worker 未启动：%s", erp_status.get("lastError") or "未知原因")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1046,6 +1181,7 @@ def main():
         QUALITY_SCHEDULER.stop()
         MAINTENANCE.stop()
         DINGTALK_STREAM.stop()
+        DIGITAL_WORKER.stop()
         server.server_close()
 
 

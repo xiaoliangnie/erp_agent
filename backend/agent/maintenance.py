@@ -87,7 +87,8 @@ class MaintenanceScheduler:
             deleted["forecast_runs_cleared"] = cursor.rowcount or 0
         removed_files = 0
         for folder in ("generated", "agent", "quality"):
-            removed_files += _purge_dir(self.root / "outputs" / folder, self.output_days)
+            from ..paths import local_dir
+            removed_files += _purge_dir(local_dir("outputs", root=self.root) / folder, self.output_days)
         return {"ok": True, "deleted": deleted, "files": removed_files, "ranAt": now()}
 
 

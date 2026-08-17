@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     session_id TEXT NOT NULL REFERENCES agent_sessions(id),
     channel TEXT NOT NULL,
     operator TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
     request TEXT NOT NULL DEFAULT '',
     reply TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL,
@@ -63,6 +64,7 @@ CREATE TABLE IF NOT EXISTS tool_executions (
     tool TEXT NOT NULL,
     risk TEXT NOT NULL DEFAULT 'L0',
     operator TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
     channel TEXT NOT NULL DEFAULT '',
     arguments_json TEXT NOT NULL DEFAULT '{}',
     status TEXT NOT NULL,
@@ -78,6 +80,7 @@ CREATE TABLE IF NOT EXISTS pending_actions (
     run_id TEXT,
     channel TEXT NOT NULL DEFAULT '',
     operator TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
     tool TEXT NOT NULL,
     risk TEXT NOT NULL DEFAULT 'L1',
     title TEXT NOT NULL DEFAULT '',
@@ -99,6 +102,7 @@ CREATE TABLE IF NOT EXISTS staff_bindings (
     dingtalk_user_id TEXT NOT NULL DEFAULT '',
     mobile TEXT NOT NULL DEFAULT '',
     note TEXT NOT NULL DEFAULT '',
+    role TEXT NOT NULL DEFAULT 'operator',
     updated_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS forecast_runs (
@@ -107,6 +111,7 @@ CREATE TABLE IF NOT EXISTS forecast_runs (
     run_id TEXT,
     pending_action_id TEXT,
     operator TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
     model_name TEXT NOT NULL DEFAULT '',
     model_version TEXT NOT NULL DEFAULT '',
     keys_json TEXT NOT NULL DEFAULT '[]',
@@ -174,6 +179,11 @@ COLUMN_MIGRATIONS = (
     ("pending_actions", "confirmed_by", "TEXT NOT NULL DEFAULT ''"),
     ("agent_runs", "prompt_tokens", "INTEGER"),
     ("agent_runs", "completion_tokens", "INTEGER"),
+    ("agent_runs", "user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("tool_executions", "user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("pending_actions", "user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("forecast_runs", "user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("staff_bindings", "role", "TEXT NOT NULL DEFAULT 'operator'"),
 )
 
 

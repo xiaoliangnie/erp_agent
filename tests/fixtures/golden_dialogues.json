@@ -78,7 +78,7 @@
       "utterance": "哪些待发货订单里还有 XZ25401308-101？",
       "expect": {
         "kind": "tools",
-        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101" } }],
+        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101", "status": "待发货" } }],
         "must_not": ["delivery_reminders", "submit_exchange_dry_run"]
       }
     },
@@ -88,7 +88,7 @@
       "utterance": "XZ25401308-101 要换成 09906 的异常单现在有多少张？先别改。",
       "expect": {
         "kind": "tools",
-        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101" } }],
+        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101", "status": "待发货" } }],
         "must_not": ["submit_exchange_dry_run", "delivery_reminders"]
       }
     },
@@ -129,7 +129,7 @@
       "utterance": "把 XZ25401308-101 都换成 XZ25401308-09906。",
       "expect": {
         "kind": "tools",
-        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101" } }],
+        "tools": [{ "name": "search_sales_orders", "arguments": { "source_sku": "XZ25401308-101", "status": "待发货" } }],
         "must_not": ["submit_exchange_dry_run"],
         "note": "没有明确 o_id 时先收候选清单，不能直接登记换货。"
       }

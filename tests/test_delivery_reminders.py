@@ -113,6 +113,8 @@ class BuildRemindersTests(unittest.TestCase):
         self.assertEqual("J", orders[0]["purchaseOrderNo"])
         orders, _ = filter_orders(result, buyer="李四")
         self.assertEqual([], orders)
+        orders, _ = filter_orders(result, buyer=["张三", "不存在"])
+        self.assertEqual(["I"], [item["purchaseOrderNo"] for item in orders])
         with self.assertRaisesRegex(ValueError, "催办档位"):
             filter_orders(result, buckets=["不存在"])
 

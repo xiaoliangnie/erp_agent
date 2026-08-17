@@ -7,9 +7,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from .service import ExchangeError
+from ..paths import CONFIG_DIR
 
-
-RULE_PATH = Path(__file__).resolve().parents[2] / "config" / "exchange-rules.json"
+RULE_PATH = CONFIG_DIR / "exchange-rules.json"
 
 
 @lru_cache(maxsize=4)

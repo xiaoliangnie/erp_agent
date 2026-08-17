@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .business_time import BUSINESS_TIMEZONE, business_now, business_today
+from .paths import CONFIG_DIR, resolve_repo_path
 from .database import (
     REALTIME_PRODUCT_TABLE,
     connect,
@@ -42,8 +43,7 @@ GB_STANDARDS_TABLE = "gb_standards"
 GB_FAMILY_TABLE = "gb_standard_families"
 SYNC_STATE_TABLE = "realtime_sync_state"
 SYNC_SOURCE_NAME = "gb_standards"
-ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CATEGORY_MAP = ROOT / "config" / "gb_category_map.json"
+DEFAULT_CATEGORY_MAP = CONFIG_DIR / "gb_category_map.json"
 
 SAMR_ORIGIN = "https://std.samr.gov.cn"
 SEARCH_PATH = "/gb/search/gbAdvancedSearchPage"
@@ -281,6 +281,8 @@ def serialize_gb_option(row: dict) -> dict:
         "status": str(row.get("status") or ""),
         "nature": str(row.get("nature") or ""),
         "stdType": str(row.get("std_type") or ""),
+        "recommended": bool(row.get("recommended")),
+        "recommendReason": str(row.get("recommend_reason") or ""),
     }
 
 
@@ -571,18 +573,22 @@ def search_standards_by_no(env_path: str, code: str, *, limit: int = 12) -> list
     if not code:
         return []
     compact = compact_standard_no(code)
+    # 纯中文关键词紧凑化后为空，`LIKE '%%'` 会命中整张表，这里直接不带这两个条件。
+    conditions = ["standard_no = %s", "standard_no LIKE %s"]
+    params = [code, f"%{code}%"]
+    if compact:
+        conditions.extend(["standard_no_compact = %s", "standard_no_compact LIKE %s"])
+        params.extend([compact, f"%{compact}%"])
     sql = (
         f"SELECT samr_id, standard_no, name_cn, status, nature, std_type, "
         f"issue_date, implement_date FROM `{GB_STANDARDS_TABLE}` "
-        "WHERE standard_no = %s OR standard_no_compact = %s "
-        "OR standard_no LIKE %s OR standard_no_compact LIKE %s "
+        f"WHERE {' OR '.join(conditions)} "
         "ORDER BY CASE status WHEN '现行' THEN 0 WHEN '即将实施' THEN 1 ELSE 2 END, "
         "issue_date DESC LIMIT %s"
     )
+    params.append(limit)
     try:
-        rows = list(read_query(
-            env_path, sql, (code, compact, f"%{code}%", f"%{compact}%", limit),
-        ) or [])
+        rows = list(read_query(env_path, sql, tuple(params)) or [])
     except Exception as exc:
         if _is_missing_relation(exc):
             return []
@@ -611,6 +617,225 @@ def search_standards_by_name(env_path: str, query: str, *, limit: int = 12) -> l
             return []
         raise
     return _attach_families(env_path, rows)
+
+
+def loose_standard_no(value: str) -> str:
+    """紧凑化但保留连字符，避免「9832」跨过年份边界命中 21198.3-2007。"""
+    return re.sub(r"[^0-9A-Za-z-]", "", str(value or "")).upper()
+
+
+def query_is_standard_prefix(query: str) -> bool:
+    """「GB/T 36」「9832」走标准号前缀；「毛绒」走名称检索。"""
+    text = str(query or "").strip()
+    if not text:
+        return False
+    if looks_like_standard_no(text):
+        return True
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return False
+    return bool(re.search(r"\d", text))
+
+
+def standard_starts_with(standard_no, query) -> bool:
+    """「GB/T 36」命中 GB/T 369-2008；「9832」命中 GB/T 9832-2026。"""
+    needle = loose_standard_no(query)
+    compact_q = compact_standard_no(query)
+    if not needle and not compact_q:
+        return False
+    number = str(standard_no or "")
+    loose_n = loose_standard_no(number)
+    if needle and loose_n.startswith(needle):
+        return True
+    if compact_q and compact_standard_no(number).startswith(compact_q):
+        return True
+    core_q = re.sub(r"^GB/?T?", "", needle)
+    core_n = re.sub(r"^GB/?T?", "", loose_n)
+    return bool(core_q and core_q[:1].isdigit() and core_n.startswith(core_q))
+
+
+def sort_standard_hits(rows: list[dict], query: str, *, product_name: str = "",
+                       category: str = "") -> list[dict]:
+    """前缀命中优先，再按现行/品名分类词排序。"""
+    return sorted(
+        rows,
+        key=lambda row: (
+            1 if standard_starts_with(row.get("standard_no"), query) else 0,
+            standard_rank_score(row, product_name=product_name, category=category),
+        ),
+        reverse=True,
+    )
+
+
+def parse_recommended_nos(text, allowed) -> list[str]:
+    """只收模型从候选里挑出的标准号，不认编造的编号。"""
+    allowed_set = {str(item).strip() for item in (allowed or []) if str(item).strip()}
+    blob = str(text or "")
+    match = re.search(r"\[[\s\S]*?\]", blob)
+    if not match:
+        return []
+    try:
+        data = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    picked = []
+    for item in data:
+        if isinstance(item, str):
+            number = item.strip()
+        elif isinstance(item, dict):
+            number = str(item.get("standardNo") or item.get("standard_no") or "").strip()
+        else:
+            number = ""
+        if number in allowed_set and number not in picked:
+            picked.append(number)
+    return picked
+
+
+def mark_recommended_options(options: list[dict], picked_nos: list[str] | None = None,
+                             *, top: int = 3) -> list[dict]:
+    """推荐只来自已有候选。有模型挑选就按挑选顺序；否则取现行/即将实施前几条。"""
+    cloned = [dict(option) for option in options]
+    order = [str(item).strip() for item in (picked_nos or []) if str(item).strip()]
+    ai_picked = bool(order)
+    if not order:
+        order = [
+            str(option.get("standardNo") or "")
+            for option in cloned
+            if option.get("status") in CONTRACT_GB_STATUSES
+        ][: max(1, int(top))]
+    rank = {number: index for index, number in enumerate(order) if number}
+    reason = "模型按商品信息推荐" if ai_picked else "按商品分类与名称排序"
+    for option in cloned:
+        number = str(option.get("standardNo") or "")
+        option["recommended"] = number in rank
+        if option["recommended"] and not option.get("recommendReason"):
+            option["recommendReason"] = reason
+    cloned.sort(key=lambda option: (
+        0 if option.get("recommended") else 1,
+        rank.get(str(option.get("standardNo") or ""), 99),
+    ))
+    return cloned
+
+
+def search_contract_standards(env_path: str, query: str, *, limit: int = 12,
+                              product_name: str = "", category: str = "") -> list[dict]:
+    """合同页合并输入框：标准号按前缀，中文按名称，并用商品信息加权。
+
+    标准号检索不过滤状态（员工可能就是在查那条废止的），名称检索沿用
+    ``CONTRACT_GB_STATUSES``。返回已序列化的候选，含状态供页面打角标。
+    """
+    query = str(query or "").strip()
+    if len(query) < 2:
+        return []
+    limit = max(1, min(int(limit or 12), 40))
+    rows: list[dict] = []
+    seen: set[str] = set()
+    prefix_mode = query_is_standard_prefix(query)
+    if prefix_mode:
+        for row in search_standards_by_no(env_path, query, limit=limit * 6):
+            if not standard_starts_with(row.get("standard_no"), query):
+                continue
+            samr_id = str(row.get("samr_id") or "")
+            if samr_id and samr_id in seen:
+                continue
+            seen.add(samr_id)
+            rows.append(row)
+            if len(rows) >= limit * 2:
+                break
+    else:
+        for row in search_standards_by_name(env_path, query, limit=limit):
+            samr_id = str(row.get("samr_id") or "")
+            if samr_id and samr_id in seen:
+                continue
+            seen.add(samr_id)
+            rows.append(row)
+    ranked = sort_standard_hits(
+        rows, query, product_name=product_name, category=category,
+    )
+    return [serialize_gb_record(row) for row in ranked[:limit]]
+
+
+def expand_recommend_candidates(env_path: str, product: dict, existing: list[dict],
+                                *, limit: int = 12) -> list[dict]:
+    """用品名/分类在本地目录里补候选，供推荐排序；不引入目录外编号。"""
+    name = str((product or {}).get("name") or "").strip()
+    category = str((product or {}).get("category") or "").strip()
+    queries: list[str] = []
+    if len(name) >= 2:
+        queries.append(name)
+    for token in category_tokens(category, name)[:4]:
+        if token not in queries:
+            queries.append(token)
+    known = {str(item.get("standardNo") or "") for item in existing}
+    extras: list[dict] = []
+    for query in queries:
+        if len(query) < 2:
+            continue
+        for extra in search_contract_standards(
+            env_path, query, limit=6, product_name=name, category=category,
+        ):
+            number = str(extra.get("standardNo") or "")
+            if not number or number in known:
+                continue
+            extras.append(extra)
+            known.add(number)
+            if len(extras) >= limit:
+                return extras
+    return extras
+
+
+def search_samr_catalog_hits(env_path: str, keyword: str, *, limit: int = 8) -> list[dict]:
+    """国标平台关键词检索，只回收本地目录已有的标准号。"""
+    keyword = str(keyword or "").strip()[:40]
+    if len(keyword) < 2:
+        return []
+    client = SamrCatalogClient(
+        timeout=8, page_size=min(max(int(limit), 8), 20), request_interval=0,
+    )
+    _, _, rows = client.fetch_page({"keyword": keyword, "status": "现行"}, 1)
+    found: list[dict] = []
+    seen: set[str] = set()
+    for raw in rows:
+        norm = normalize_standard(raw, "")
+        if not norm:
+            continue
+        local = lookup_standard_by_no(env_path, str(norm.get("standard_no") or ""))
+        if not local:
+            continue
+        number = str(local.get("standard_no") or "")
+        if not number or number in seen:
+            continue
+        seen.add(number)
+        found.append(serialize_gb_option(local))
+        if len(found) >= limit:
+            break
+    return found
+
+
+def gb_recommend_prompt(product: dict, candidates: list[dict]) -> list[dict]:
+    lines = []
+    for option in candidates[:20]:
+        lines.append(
+            f"- {option.get('standardNo')} | {option.get('nameCn')} | "
+            f"{option.get('status')} | {option.get('stdType')}"
+        )
+    user = (
+        "根据商品信息，从下列候选里最多挑 3 条最合适的执行标准。"
+        "只准返回 JSON 数组，元素是标准号字符串。不要编造不在列表里的编号。"
+        f"\n商品：{product.get('name') or '—'}"
+        f"\n分类：{product.get('category') or '—'}"
+        f"\n规格：{product.get('specification') or '—'}"
+        f"\n备注：{product.get('remark') or '—'}"
+        f"\n候选：\n" + "\n".join(lines)
+    )
+    return [
+        {
+            "role": "system",
+            "content": "你是采购合同执行标准助手。只能从给定候选里挑选 GB/T 标准号，禁止编造。",
+        },
+        {"role": "user", "content": user},
+    ]
 
 
 def _latest_saved_standard(env_path: str, sku: str) -> dict | None:
@@ -1733,9 +1958,7 @@ def build_gb_sync_from_settings(
     scope = setting("GB_SYNC_SCOPE", "products")
     status = setting("GB_SYNC_STATUS", "")
     map_setting = str(setting("GB_SYNC_CATEGORY_MAP", "") or "").strip()
-    map_path = Path(map_setting) if map_setting else DEFAULT_CATEGORY_MAP
-    if not map_path.is_absolute():
-        map_path = ROOT / map_path
+    map_path = resolve_repo_path(map_setting) if map_setting else DEFAULT_CATEGORY_MAP
     client = SamrCatalogClient(
         timeout=float(setting("GB_SYNC_TIMEOUT_SECONDS", "30") or 30),
         page_size=int(setting("GB_SYNC_PAGE_SIZE", "50") or 50),

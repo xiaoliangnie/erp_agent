@@ -779,6 +779,56 @@ def upsert_order_records(env_path: str, records: list[dict], synced_at: str) -> 
     return {"orders": len(orders), "items": len(items), "images": sum(bool(item[7]) for item in items)}
 
 
+def replace_order_item_sku(env_path: str, o_id: str, source_sku: str, target_sku: str) -> bool:
+    """把一单镜像明细里的源 SKU 换成目标。增量同步滞后时先本地跟上。"""
+    o_id = str(o_id or "").strip()
+    source_sku = str(source_sku or "").strip()
+    target_sku = str(target_sku or "").strip()
+    if not o_id or not source_sku or not target_sku or source_sku == target_sku:
+        return False
+    synced_at = _format_api_time(business_now())
+    with connect(env_path) as conn:
+        try:
+            with conn.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT source_key, o_id, sku_id, i_id, name, properties_value, qty, "
+                    f"image_url, source_payload FROM `{ORDER_ITEM_TABLE}` "
+                    f"WHERE CAST(o_id AS CHAR)=%s",
+                    (o_id,),
+                )
+                rows = list(cursor.fetchall() or [])
+                sources = [row for row in rows if str(row.get("sku_id") or "") == source_sku]
+                if not sources:
+                    return False
+                has_target = any(str(row.get("sku_id") or "") == target_sku for row in rows)
+                for row in sources:
+                    cursor.execute(
+                        f"DELETE FROM `{ORDER_ITEM_TABLE}` WHERE source_key=%s",
+                        (row["source_key"],),
+                    )
+                if not has_target:
+                    src = sources[0]
+                    cursor.execute(
+                        _upsert_sql(ORDER_ITEM_TABLE, ORDER_ITEM_COLUMNS),
+                        (
+                            _source_key(o_id, "", target_sku, 1),
+                            o_id, target_sku,
+                            str(src.get("i_id") or ""),
+                            str(src.get("name") or ""),
+                            str(src.get("properties_value") or ""),
+                            str(src.get("qty") or "1"),
+                            str(src.get("image_url") or ""),
+                            src.get("source_payload") or "{}",
+                            synced_at,
+                        ),
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return True
+
+
 def upsert_product_records(env_path: str, records: list[dict], synced_at: str) -> dict:
     products = [normalize_product(record, synced_at) for record in records]
     with connect(env_path) as conn:
@@ -1052,6 +1102,44 @@ class RealtimeMirror:
                 pass
             raise
 
+    def refresh_orders(self, o_ids: list[str]) -> dict:
+        """按内部单号拉代理并覆盖镜像，不推进增量水位。"""
+        clean: list[str] = []
+        for value in o_ids or []:
+            oid = str(value or "").strip()
+            if oid and oid not in clean:
+                clean.append(oid)
+        if not clean:
+            return {"ok": True, "orders": 0, "items": 0, "pages": 0}
+        totals = {"orders": 0, "items": 0, "pages": 0, "requestId": ""}
+        synced_at = _format_api_time(business_now())
+        chunk_size = min(self.page_size, 20)
+        for offset in range(0, len(clean), chunk_size):
+            chunk = clean[offset:offset + chunk_size]
+            page = 1
+            while True:
+                value = self.client.post(ORDER_ROUTE, {
+                    "page_index": page,
+                    "page_size": self.page_size,
+                    "o_ids": ",".join(chunk),
+                })
+                records, more, request_id = extract_page(value, page, self.page_size)
+                counts = upsert_order_records(self.env_path, records, synced_at)
+                totals["orders"] += counts.get("orders", 0)
+                totals["items"] += counts.get("items", 0)
+                totals["pages"] += 1
+                totals["requestId"] = request_id or totals["requestId"]
+                if not more:
+                    break
+                page += 1
+                if page > 100:
+                    raise MirrorError("按单刷新订单超过 100 页，已停止")
+                if self.request_interval:
+                    time.sleep(self.request_interval)
+            if offset + chunk_size < len(clean) and self.request_interval:
+                time.sleep(self.request_interval)
+        return {"ok": True, **totals}
+
     def _sync_referenced_products(self) -> dict:
         """首次接入商品主数据时，优先补齐订单/采购镜像实际引用的 SKU。"""
         sql = f"""
@@ -1251,9 +1339,9 @@ def build_mirror_from_settings(
         if not secret_path.is_absolute():
             secret_path = root / secret_path
         try:
-            client_secret = secret_path.read_text(encoding="utf-8").strip()
+            client_secret = secret_path.read_text(encoding="utf-8").strip() or client_secret
         except OSError:
-            client_secret = ""
+            pass
     required = [
         setting("SUPPLY_API_BASE", "https://api.wjyfek.com"),
         setting("SUPPLY_API_CLIENT_ID", ""),
@@ -1265,9 +1353,8 @@ def build_mirror_from_settings(
         required[0], required[1], required[2],
         timeout=int(setting("REALTIME_SYNC_TIMEOUT_SECONDS", "45") or 45),
     )
-    image_dir = Path(setting("PRODUCT_IMAGE_CACHE_DIR", "data/product-images"))
-    if not image_dir.is_absolute():
-        image_dir = root / image_dir
+    from .paths import resolve_repo_path
+    image_dir = resolve_repo_path(setting("PRODUCT_IMAGE_CACHE_DIR", "files/data/product-images"), root=root)
     mirror = RealtimeMirror(
         env_path, client,
         page_size=int(setting("REALTIME_SYNC_PAGE_SIZE", "50") or 50),

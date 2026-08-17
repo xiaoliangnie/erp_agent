@@ -1,0 +1,46 @@
+{
+  "_说明": [
+    "合同生成映射表：ERP 采购单和本机『供应商管理』表的原始取值 → 合同字段。",
+    "invoice_types：Excel『发票类型』前缀 → 票种键（no_invoice / normal_invoice / special_invoice）。",
+    "  『(0%)』这类没写票种的不在表内，员工在合同页自己选票种，系统不猜。",
+    "payment_options：合同『付款方式』的备选条款。label 只在页面下拉里显示，",
+    "  写进合同的只有 text。员工也可以在页面选『手动输入』自己写。",
+    "erp_payment_defaults：ERP 单头 payment_method → 默认预选哪个 payment_options.key。",
+    "  只是预选，员工仍可改；ERP 该字段为空时不预选，必须自己选一条。",
+    "改这里不用重启服务，按文件修改时间重读。"
+  ],
+  "invoice_types": {
+    "专用发票": "special_invoice",
+    "专业发票": "special_invoice",
+    "普通发票": "normal_invoice",
+    "普票发票": "normal_invoice",
+    "不开发票": "no_invoice"
+  },
+  "payment_options": [
+    {
+      "key": "prepay_30_70",
+      "label": "3/7",
+      "text": "合同签订后支付30%预付款，大货完成数量质量经需方确认无误后，支付70%尾款。"
+    },
+    {
+      "key": "before_shipment",
+      "label": "发货前付款",
+      "text": "合同签订，大货完工，数量质量经需方确认无误后，支付100%货款"
+    },
+    {
+      "key": "after_arrival",
+      "label": "到仓后付款",
+      "text": "合同签订，大货发送到仓，数量质量经需方确认无误后，支付100%货款"
+    },
+    {
+      "key": "monthly",
+      "label": "月度结算",
+      "text": "按供方月度到仓合格货物数量，支付货款"
+    }
+  ],
+  "erp_payment_defaults": {
+    "MonthlyStatement": "monthly",
+    "CurrentSettlement": "after_arrival",
+    "CashOnDelivery": "after_arrival"
+  }
+}

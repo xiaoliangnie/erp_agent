@@ -21,7 +21,7 @@ import threading
 from ..agent.actions import ActionError
 from ..agent.runner import AgentDisabled
 from ..staff_names import parse_buyer_names
-from .sender import DingTalkSender
+from .sender import DingTalkError, DingTalkSender
 
 
 logger = logging.getLogger(__name__)
@@ -29,15 +29,20 @@ logger = logging.getLogger(__name__)
 
 CONFIRM_PATTERN = re.compile(r"^\s*(确认|执行|同意)\s*[:：#]?\s*([a-f0-9]{6,24})\s*$")
 CANCEL_PATTERN = re.compile(r"^\s*(取消|作废|不执行)\s*[:：#]?\s*([a-f0-9]{6,24})\s*$")
+BARE_CONFIRM_PATTERN = re.compile(
+    r"^\s*(确认|执行|同意|确认执行)(?:\s*[，,。；;：:].*)?\s*$"
+)
+BARE_CANCEL_PATTERN = re.compile(r"^\s*(取消|作废|不执行)(?:\s*[，,。；;：:].*)?\s*$")
 BIND_PATTERN = re.compile(r"^\s*(?:绑定|我是)\s+(.+?)\s*$")
 NEW_TOPIC_PATTERN = re.compile(r"^\s*(新话题|重置会话)\s*$")
 REMEMBER_PATTERN = re.compile(r"^\s*记住\s+(.+)$")
 FORGET_PATTERN = re.compile(r"^\s*忘记\s+(.+)$")
 HELP_TEXT = (
-    "可以直接问我：查采购单、看交期催办、生成采购合同、订货建议、异常订单换货。\n"
+    "可以直接问我：查采购单、看交期催办、生成采购合同、订货建议、异常订单换货、抖音换鞋垫。\n"
     "第一次先发「绑定 你的采购员姓名」，之后确认动作才对得上网页上的同一个人。\n"
     "ERP 里同一人有花名和「真名（花名）」时，绑其中一个即可，也可以「绑定 利特、李佳冬（利特）」。\n"
-    "需要确认的动作我会给出编号，回复「确认 编号」执行，「取消 编号」放弃。\n"
+    "需要确认的动作直接回复「确认」执行，「取消」放弃。\n"
+    "换鞋垫：查询一下现在抖音需要更换的鞋垫订单；要处理就加上「进行处理」，核对清单后回「确认」。写完会再发【任务完成】。\n"
     "品控：品控 佰特 604264 鞋垫开胶 3 双；品控查询 今天；品控关闭 编号；撤销品控 编号。\n"
     "换话题发「新话题」。记住偏好发「记住 …」，删除发「忘记 …」。"
 )
@@ -117,6 +122,8 @@ class DingTalkStreamChannel:
         self._session_started = False
         self.last_error = ""
         self.restart_count = 0
+        self._in_flight_confirms: set[str] = set()
+        self._confirm_threads: list[threading.Thread] = []
 
     @property
     def configured(self) -> bool:
@@ -208,7 +215,8 @@ class DingTalkStreamChannel:
         class Handler(stream.ChatbotHandler):
             async def process(self, callback):
                 message = stream.ChatbotMessage.from_dict(callback.data)
-                reply = channel.handle(
+                # handle 里会走 Playwright Sync API，不能停在 Stream 的 asyncio 循环上。
+                reply = await channel.handle_async(
                     text=getattr(getattr(message, "text", None), "content", "") or "",
                     message_id=getattr(message, "message_id", "") or "",
                     conversation_id=getattr(message, "conversation_id", "") or "",
@@ -244,6 +252,10 @@ class DingTalkStreamChannel:
             if self._client is client:
                 self._client = None
 
+    async def handle_async(self, **kwargs) -> str:
+        """把同步 handle 挪出 Stream 的 asyncio 循环，避免 Playwright Sync API 报错。"""
+        return await asyncio.to_thread(self.handle, **kwargs)
+
     def handle(self, *, text: str, message_id: str, conversation_id: str, sender_id: str,
                sender_name: str = "") -> str:
         """处理一条钉钉消息并返回要回复的文本。同一 message_id 只处理一次。"""
@@ -264,14 +276,30 @@ class DingTalkStreamChannel:
                 return self._bind(bind.group(1), sender_id, sender_name)
             confirm = CONFIRM_PATTERN.match(text)
             if confirm:
-                action = self.runner.confirm(
-                    confirm.group(2), operator, channel="dingtalk", actor_id=sender_id,
+                return self._handle_confirm(
+                    lambda: self.runner.confirm(
+                        confirm.group(2), operator, channel="dingtalk", actor_id=sender_id,
+                    ),
+                    conversation_id=conversation_id, sender_id=sender_id,
+                    operator=operator, session_key=session_key,
                 )
-                return f"已执行：{action['title']}\n{_brief(action.get('result'))}"
+            if BARE_CONFIRM_PATTERN.match(text):
+                return self._handle_confirm(
+                    lambda: self.runner.confirm_latest(
+                        operator, channel="dingtalk", actor_id=sender_id, session_key=session_key,
+                    ),
+                    conversation_id=conversation_id, sender_id=sender_id,
+                    operator=operator, session_key=session_key,
+                )
             cancel = CANCEL_PATTERN.match(text)
             if cancel:
                 action = self.runner.cancel(
                     cancel.group(2), operator, channel="dingtalk", actor_id=sender_id,
+                )
+                return f"已取消：{action['title']}"
+            if BARE_CANCEL_PATTERN.match(text):
+                action = self.runner.cancel_latest(
+                    operator, channel="dingtalk", actor_id=sender_id, session_key=session_key,
                 )
                 return f"已取消：{action['title']}"
             if text in ("帮助", "help", "?", "？"):
@@ -306,20 +334,19 @@ class DingTalkStreamChannel:
                     return str(exc)
                 if handled is not None:
                     return handled
+            intent_handler = getattr(self.runner, "handle_intent", None)
+            if intent_handler is not None:
+                intent_answer = intent_handler(
+                    text, session_key=session_key, operator=operator,
+                    channel="dingtalk", actor_id=sender_id,
+                )
+                if intent_answer is not None:
+                    return self._format_chat_reply(intent_answer, sender_id)
             answer = self.runner.chat(
                 message=text, session_key=session_key, operator=operator, channel="dingtalk",
                 actor_id=sender_id,
             )
-            reply = answer["reply"]
-            for action in answer["pendingActions"]:
-                reply += (
-                    f"\n\n待确认：{action['title']}\n"
-                    f"回复「确认 {action['id']}」执行，「取消 {action['id']}」放弃"
-                    f"（{action['expiresAt']} 前有效）"
-                )
-            if self.directory and sender_id and not self.directory.get_by_dingtalk_user_id(sender_id):
-                reply += "\n\n还没绑定采购员姓名。回复「绑定 利特」或「绑定 利特、李佳冬（利特）」。"
-            return reply
+            return self._format_chat_reply(answer, sender_id)
         except AgentDisabled as exc:
             return f"助手暂未启用：{exc}"
         except (ActionError, ValueError) as exc:
@@ -327,6 +354,100 @@ class DingTalkStreamChannel:
         except Exception as exc:
             logger.exception("DingTalk handle error")
             return "处理失败，请稍后再试或联系维护人。"
+
+    def _can_notify(self) -> bool:
+        sender = self.sender
+        return bool(sender and (getattr(sender, "app_ready", False) or getattr(sender, "webhook_ready", False)))
+
+    def _peek_open_action(self, session_key: str, operator: str, sender_id: str) -> dict | None:
+        sessions = getattr(self.runner, "sessions", None)
+        actions = getattr(self.runner, "actions", None)
+        if sessions is None or actions is None:
+            return None
+        session = sessions.ensure("dingtalk", session_key, operator)
+        found = actions.latest_open(session_id=session["id"])
+        if found is None and sender_id:
+            found = actions.latest_open(actor_id=sender_id)
+        return found
+
+    def _started_message(self, action: dict) -> str:
+        preview = action.get("preview") or {}
+        count = preview.get("processableCount") or len(preview.get("oIds") or [])
+        return (
+            f"已开始写入 {count} 单，完成后会再发一条【任务完成】结果日志。"
+            f"请稍等，不要重复确认。"
+        )
+
+    def _handle_confirm(self, execute, *, conversation_id: str, sender_id: str,
+                        operator: str, session_key: str) -> str:
+        action = self._peek_open_action(session_key, operator, sender_id)
+        if action and action.get("id") in self._in_flight_confirms:
+            return "上一批还在写入，完成后会再发【任务完成】，请不要重复确认。"
+        if action and action.get("tool") == "process_insole_orders" and self._can_notify():
+            self._run_confirm_later(execute, action["id"], conversation_id, sender_id)
+            return self._started_message(action)
+        return self._format_executed(execute())
+
+    def _run_confirm_later(self, execute, action_id: str, conversation_id: str,
+                           sender_id: str) -> None:
+        self._in_flight_confirms.add(action_id)
+
+        def worker():
+            try:
+                try:
+                    text = self._format_executed(execute())
+                except Exception as exc:
+                    logger.exception("钉钉确认后写入失败")
+                    text = f"【任务失败】鞋垫换货执行失败：{exc}"
+                self._notify_done(conversation_id, sender_id, text)
+            finally:
+                self._in_flight_confirms.discard(action_id)
+
+        thread = threading.Thread(target=worker, name="dingtalk-insole-confirm", daemon=True)
+        self._confirm_threads.append(thread)
+        thread.start()
+
+    def _notify_done(self, conversation_id: str, sender_id: str, text: str) -> None:
+        sender = self.sender
+        if sender is None:
+            return
+        at_ids = [sender_id] if sender_id else []
+        try:
+            if getattr(sender, "app_ready", False) and conversation_id:
+                sender.reply_text(conversation_id=conversation_id, text=text, at_user_ids=at_ids)
+            elif getattr(sender, "send_markdown", None):
+                sender.send_markdown("鞋垫换货任务完成", text, at_user_ids=at_ids)
+            if self.audit is not None:
+                self.audit.record_delivery(
+                    channel="dingtalk", target=conversation_id or "group",
+                    kind="insole_done", status="sent",
+                    detail={"senderId": sender_id, "text": text[:500]},
+                    idempotency_key=f"insole-done-{conversation_id}-{sender_id}-{hash(text) & 0xFFFFFFFF:x}",
+                )
+        except DingTalkError as exc:
+            logger.exception("任务完成通知发送失败：%s", exc)
+        except Exception:
+            logger.exception("任务完成通知发送失败")
+
+    def _format_executed(self, action: dict) -> str:
+        result = action.get("result")
+        if action.get("tool") == "process_insole_orders":
+            from ..exchange.insole import format_insole_result
+            return format_insole_result(result if isinstance(result, dict) else {})
+        return f"已执行：{action.get('title') or ''}\n{_brief(result)}"
+
+    def _format_chat_reply(self, answer: dict, sender_id: str) -> str:
+        reply = str(answer.get("reply") or "")
+        for action in answer.get("pendingActions") or []:
+            reply += (
+                f"\n\n待确认：{action['title']}\n"
+                f"回复「确认」执行，「取消」放弃；鞋垫写完会再通知"
+                f"（{action['expiresAt']} 前有效）"
+            )
+        if (self.directory and sender_id and not self.directory.get_by_dingtalk_user_id(sender_id)
+                and "绑定" not in reply):
+            reply += "\n\n还没绑定采购员姓名。回复「绑定 利特」或「绑定 利特、李佳冬（利特）」。"
+        return reply
 
     def _operator(self, sender_id: str, sender_name: str) -> str:
         if self.directory:

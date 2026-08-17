@@ -3,6 +3,7 @@
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -11,23 +12,36 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from .business_time import business_now
+from .contract_history import last_payment_choice, record_payment_choice
+from .paths import CONFIG_DIR, OUTPUTS_DIR, ROOT, TEMPLATES_DIR
+from .contract_mappings import load_mappings
 from .contract_workbook import write_contract_workbook
-from .database import connect, fetch_contract_order, load_all_env
+from .database import (
+    clean_master_text,
+    connect,
+    fetch_contract_order,
+    fetch_product_master,
+    fetch_supplier_price_history,
+    load_all_env,
+)
 from .gb_standards import (
     CONTRACT_GB_STATUSES,
     family_ids_for,
     fetch_family_standards,
-    fetch_sku_categories,
     load_category_map,
     lookup_standard_by_no,
+    mark_recommended_options,
     rank_standards,
     serialize_gb_option,
 )
 from .product_images import resolve_product_image
+from .supplier_master import (
+    load_supplier_book,
+    missing_supplier_fields,
+    supplier_issue,
+)
 
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG_DIR = ROOT / "config"
 PROJECT_ENV = load_all_env(ROOT / ".env") if (ROOT / ".env").exists() else {}
 CONTRACT_GB_TABLE = "contract_line_gb"
 CONTRACT_GB_SCHEMA = f"""
@@ -56,9 +70,16 @@ DEFAULT_INVOICE_RATES = {
     "special_invoice": 13,
 }
 
-PAYMENT_METHODS = {
-    "CurrentSettlement": "100% - 现结，入库结算",
-}
+INTERNAL_PAYMENT_TERMS = "内部往来，不列收付款信息"
+DEFAULT_RECEIVING_INFO = (
+    "鄂州仓：湖北省鄂州市华容区葛店镇电商大道8号蓝库电子商务有限公司1库1号4号门，"
+    "收货人：蜀黍家收货组，13385711803"
+)
+DEFAULT_INSPECTION_STANDARDS = "1.到仓产品及包装无破损\n2.入仓数量与下单数量一致"
+RECEIVING_INFO_LIMIT = 500
+INSPECTION_EXTRA_LIMIT = 500
+REMARK_PRICE_RE = re.compile(r"(\d+(?:\.\d+)?)")
+INSPECTION_NUMBERED_RE = re.compile(r"^\d+\s*[\.、．]")
 
 BASE_TERMS = [
     "上述价格为暂计价格，实际以购买方验收合格的产品数量为准；",
@@ -130,6 +151,130 @@ def invoice_term(invoice_type, tax_rate):
 
 _PREVIEW_SLOTS = threading.BoundedSemaphore(2)
 BUYER_REQUIRED = ("company_name", "delivery_address", "packaging_terms", "inspection_standards")
+
+
+def match_buyer(order, buyers=None):
+    """按 ERP 发货仓匹配需方资料，未命中用 default。"""
+    buyers = buyers if buyers is not None else load_json("buyers.json")
+    warehouse_key = str((order or {}).get("send_address") or "").strip()
+    return (buyers.get("warehouses") or {}).get(warehouse_key, buyers["default"])
+
+
+PAYMENT_TEXT_LIMIT = 500
+
+
+def payment_options(mappings=None):
+    """页面下拉用的付款方式条款；label 只用于选择，写进合同的是 text。"""
+    mappings = mappings if mappings is not None else load_mappings()
+    return [dict(option) for option in mappings["payment_options"]]
+
+
+def default_payment_option(order, mappings=None):
+    """按 ERP 单头 payment_method 预选一条；认不出就不预选，让员工自己挑。"""
+    mappings = mappings if mappings is not None else load_mappings()
+    erp_code = str((order or {}).get("payment_method") or "").strip()
+    return mappings["erp_payment_defaults"].get(erp_code, "")
+
+
+def normalize_payment_text(raw):
+    """手动输入的付款方式：去掉回车与首尾空白，限长，空值视为未填。"""
+    text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if len(text) > PAYMENT_TEXT_LIMIT:
+        raise ValueError(f"付款方式不能超过 {PAYMENT_TEXT_LIMIT} 个字")
+    return text
+
+
+def resolve_payment_terms(order, supplier, *, payment_option=None, payment_text=None,
+                          mappings=None):
+    """员工手输 > 员工选项 > 内部往来 > ERP 预选。都没有就要求先选一条。"""
+    mappings = mappings if mappings is not None else load_mappings()
+    manual = normalize_payment_text(payment_text)
+    if manual:
+        return manual
+    key = str(payment_option or "").strip()
+    if key:
+        text = mappings["payment_texts"].get(key)
+        if not text:
+            raise ValueError(f"付款方式「{key}」不在 config/contract_mappings.json 的 payment_options 里")
+        return text
+    if (supplier or {}).get("internal"):
+        return INTERNAL_PAYMENT_TERMS
+    fallback = mappings["payment_texts"].get(default_payment_option(order, mappings))
+    if fallback:
+        return fallback
+    raise ValueError("请先选择付款方式，或手动输入付款条款")
+
+
+def parse_remark_unit_price(remark):
+    """备注里第一个数字当作合同单价，如「包体32+2个魔术贴标3.45」→ 32。"""
+    text = str(remark or "").strip()
+    if not text:
+        return None
+    matched = REMARK_PRICE_RE.search(text)
+    if not matched:
+        return None
+    try:
+        value = Decimal(matched.group(1))
+    except (InvalidOperation, ValueError):
+        return None
+    if not value.is_finite() or value <= 0:
+        return None
+    return float(value)
+
+
+def normalize_receiving_info(raw, default=""):
+    text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return str(default or DEFAULT_RECEIVING_INFO).strip()
+    if len(text) > RECEIVING_INFO_LIMIT:
+        raise ValueError(f"收货信息不能超过 {RECEIVING_INFO_LIMIT} 个字")
+    return text
+
+
+def compose_inspection_standards(default_text, extra=None):
+    """默认两条保留；手输的非空行接着编号。已带序号的不再加前缀。"""
+    base = str(default_text or DEFAULT_INSPECTION_STANDARDS).replace("\r\n", "\n").replace("\r", "\n").strip()
+    extras = [
+        line.strip()
+        for line in str(extra or "").replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if line.strip()
+    ]
+    if extras and len("\n".join(extras)) > INSPECTION_EXTRA_LIMIT:
+        raise ValueError(f"检验标准手输不能超过 {INSPECTION_EXTRA_LIMIT} 个字")
+    if not extras:
+        return base
+    start = sum(1 for line in base.split("\n") if line.strip())
+    numbered = []
+    for offset, line in enumerate(extras, start=1):
+        if INSPECTION_NUMBERED_RE.match(line):
+            numbered.append(line)
+        else:
+            numbered.append(f"{start + offset}.{line}")
+    return f"{base}\n" + "\n".join(numbered) if base else "\n".join(numbered)
+
+
+def format_payment_block(payment, po_id, supplier=None):
+    """条款 + 采购单号 + 映射表收款账户（内部户不列）。"""
+    lines = [str(payment or "").strip()]
+    if po_id:
+        lines.append(f"采购单号{po_id}")
+    supplier = supplier or {}
+    if not supplier.get("internal"):
+        extras = []
+        name = str(supplier.get("bank_account_name") or "").strip()
+        bank = str(supplier.get("bank_name") or "").strip()
+        account = str(supplier.get("bank_account") or "").strip()
+        if name:
+            extras.append(f"付款账户名：{name}")
+        if bank:
+            extras.append(f"开户行：{bank}")
+        if account:
+            extras.append(f"账户：{account}")
+        if extras:
+            lines.append("    ".join(extras))
+    return "\n".join(line for line in lines if line)
 
 
 def normalize_price_overrides(raw):
@@ -320,17 +465,29 @@ def _family_rows(env_path, family_ids, cache):
     return cache[key]
 
 
-def get_contract_options(po_id, env_path=None):
+def get_contract_options(po_id, env_path=None, supplier_book=None, product_master=None):
     """返回员工选择票种、单价和执行标准时需要的采购信息。"""
     env_path = env_path or str(ROOT / "hanli.env")
     order, erp_items = fetch_contract_order(po_id, env_path)
-    suppliers = load_json("suppliers.json")
+    book = supplier_book or load_supplier_book()
     products = load_json("products.json")
+    buyers = load_json("buyers.json")
+    buyer = match_buyer(order, buyers)
     supplier_short = str(order.get("seller") or "").strip()
-    supplier = suppliers.get(supplier_short) or {}
+    supplier = book.lookup(supplier_short) or {}
     sku_ids = [str(item.get("sku_id") or "").strip() for item in erp_items]
-    sku_categories = fetch_sku_categories(env_path, sku_ids)
+    style_ids = [str(item.get("i_id") or "").strip() for item in erp_items]
+    master = product_master if product_master is not None else fetch_product_master(
+        env_path, sku_ids, style_ids,
+    )
     mapping = _load_category_map_or_empty()
+    # 历史参考查不到不该挡住整页：库慢或没历史时照常出选项。
+    try:
+        price_history = fetch_supplier_price_history(
+            env_path, supplier_short, sku_ids, exclude_po_id=str(order["po_id"]),
+        )
+    except Exception:
+        price_history = {}
     line_saves, sku_saves = load_saved_line_gb(env_path, str(order["po_id"]), sku_ids)
     family_cache = {}
     items = []
@@ -339,17 +496,28 @@ def get_contract_options(po_id, env_path=None):
         style = str(item.get("i_id") or "").strip()
         poi_id = str(item.get("poi_id") or "")
         product = products.get(sku) or products.get(style) or {}
+        sku_master = master.get(sku) or master.get(style) or {}
         image = resolve_product_image(product, sku=sku, style=style)
-        erp_category = sku_categories.get(sku) or str(product.get("category") or "")
+        erp_category = (
+            clean_master_text(product.get("category"))
+            or sku_master.get("category")
+            or ""
+        )
+        unit = clean_master_text(product.get("unit")) or sku_master.get("unit") or ""
+        national_code = (
+            clean_master_text(product.get("national_code"))
+            or sku_master.get("national_code")
+            or ""
+        )
         family_ids = family_ids_for(erp_category, mapping)
-        gb_options = [
+        gb_options = mark_recommended_options([
             serialize_gb_option(row)
             for row in rank_standards(
                 _family_rows(env_path, family_ids, family_cache),
                 product_name=str(item.get("name") or product.get("name") or ""),
                 category=erp_category,
             )
-        ]
+        ])
         saved = pick_saved_standard(poi_id, sku, line_saves, sku_saves) or {}
         gb_standard = str(saved.get("standard_no") or "")
         allowed = {option["standardNo"] for option in gb_options}
@@ -370,12 +538,17 @@ def get_contract_options(po_id, env_path=None):
             "imageStatus": image["status"],
             "imageSource": image["source"],
             "imageError": image["error"],
-            "specification": str(item.get("properties_value") or ""),
+            "specification": str(item.get("properties_value") or sku_master.get("specification") or ""),
             "deliveryDate": day(item.get("delivery_date")),
             "category": erp_category,
+            "unit": unit,
+            "nationalCode": national_code,
             "familyIds": family_ids,
             "gbOptions": gb_options,
             "gbStandard": gb_standard,
+            "priceHistory": price_history.get(sku) or [],
+            "remark": str(item.get("remark") or ""),
+            "remarkPrice": parse_remark_unit_price(item.get("remark")),
         })
     configured_rates = supplier.get("invoice_rates") or {}
     invoice_rates = {
@@ -383,6 +556,26 @@ def get_contract_options(po_id, env_path=None):
         for mode, default in DEFAULT_INVOICE_RATES.items()
     }
     delivery_dates = [item["deliveryDate"] for item in items if item["deliveryDate"]]
+    mappings = load_mappings()
+    last_payment = last_payment_choice(supplier_short)
+    erp_default = default_payment_option(order, mappings)
+    # 上次用过的优先于 ERP 预选：同一家供应商的条款通常沿用。
+    if last_payment.get("option") in mappings["payment_texts"]:
+        preselected = last_payment["option"]
+        payment_source = "history"
+        payment_note = f"上次用的（{last_payment.get('poId') or '—'} · {(last_payment.get('at') or '')[:10]}）"
+    elif erp_default:
+        preselected = erp_default
+        payment_source = "erp"
+        payment_note = f"按 ERP 付款方式 {order.get('payment_method')} 预选"
+    else:
+        preselected = ""
+        payment_source = ""
+        payment_note = ""
+    payment_terms = (
+        mappings["payment_texts"].get(preselected)
+        or (INTERNAL_PAYMENT_TERMS if supplier.get("internal") else "")
+    )
     return {
         "purchaseOrderNo": str(order["po_id"]),
         "orderDate": day(order.get("po_date")),
@@ -391,21 +584,62 @@ def get_contract_options(po_id, env_path=None):
         "purchaser": str(order.get("purchaser_name") or ""),
         "receiveAddress": str(order.get("send_address") or ""),
         "warehouse": str(order.get("wms_co_name") or ""),
-        "paymentMethod": PAYMENT_METHODS.get(order.get("payment_method"), str(order.get("payment_method") or "")),
+        "paymentMethod": payment_terms,
+        "paymentOptions": payment_options(mappings),
+        "paymentOption": preselected,
+        "paymentSource": payment_source,
+        "paymentNote": payment_note,
+        "lastPaymentText": last_payment.get("text", ""),
         "supplierShortName": supplier_short,
-        "supplierMapped": bool(supplier),
+        "supplierMapped": bool(supplier) and not supplier.get("frozen") and not missing_supplier_fields(supplier),
+        "supplierInternal": bool(supplier.get("internal")),
+        "supplierFrozen": bool(supplier.get("frozen")),
+        "supplierMissingFields": missing_supplier_fields(supplier or None),
+        "supplierIssue": supplier_issue(supplier_short, supplier or None),
         "supplierLegalName": supplier.get("legal_name", ""),
+        "supplierInvoiceLabel": supplier.get("invoice_label", ""),
+        "supplierBankAccountName": supplier.get("bank_account_name", ""),
+        "supplierBankName": supplier.get("bank_name", ""),
+        "supplierBankAccount": supplier.get("bank_account", ""),
+        "receivingInfo": buyer.get("receiving_info") or DEFAULT_RECEIVING_INFO,
+        "inspectionStandards": buyer.get("inspection_standards") or DEFAULT_INSPECTION_STANDARDS,
         "invoiceRates": invoice_rates,
         "erpPriceMode": supplier.get("erp_price_mode"),
+        "useErpPrice": bool(supplier.get("internal")),
         "totalQuantity": sum(item["quantity"] for item in items),
         "items": items,
     }
 
 
+def resolve_line_unit_price(erp_item, product, sku_master, *, invoice_type, supplier,
+                            override=None):
+    """单价：员工覆盖 → 备注首个数字 → products.json → ERP（票种匹配或内部户）。"""
+    sku = str(erp_item.get("sku_id") or "").strip()
+    if override is not None:
+        return float(override)
+    remark_price = parse_remark_unit_price(erp_item.get("remark"))
+    if remark_price is not None:
+        return remark_price
+    configured = (product.get("prices") or {}).get(invoice_type)
+    if configured is not None:
+        return float(configured)
+    internal = bool(supplier.get("internal"))
+    if supplier.get("erp_price_mode") == invoice_type or internal:
+        if not product and not sku_master and not internal:
+            raise ValueError(
+                f"商品 {sku} 未维护商品档案（config/products.json 与镜像商品资料都没有），不能用 ERP 价"
+            )
+        if erp_item.get("price") is not None and erp_item.get("price") != "":
+            return float(erp_item.get("price"))
+    raise ValueError(f"商品 {sku} 尚未维护“{INVOICE_LABELS[invoice_type]}”单价")
+
+
 def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=None,
                          gb_overrides=None, env_path=None, fetched=None,
-                         saved_gb=None, gb_lookup=None):
-    """把 ERP、供应商字典和产品补充资料合并成合同模型。"""
+                         saved_gb=None, gb_lookup=None, supplier_book=None, suppliers=None,
+                         payment_option=None, payment_text=None, product_master=None,
+                         receiving_info=None, inspection_extra=None):
+    """把 ERP、供应商主数据和产品补充资料合并成合同模型。"""
     if invoice_type not in INVOICE_LABELS:
         raise ValueError("票种只能是 no_invoice、normal_invoice 或 special_invoice")
     env_path = env_path or str(ROOT / "hanli.env")
@@ -414,16 +648,18 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
     else:
         order, erp_items = fetched
     buyers = load_json("buyers.json")
-    suppliers = load_json("suppliers.json")
     products = load_json("products.json")
 
     supplier_short = str(order.get("seller") or "").strip()
-    supplier = suppliers.get(supplier_short)
-    if not supplier:
-        raise ValueError(f"供应商简称“{supplier_short}”尚未维护完整信息")
-    missing = [key for key in ("legal_name", "address", "contact_name", "contact_phone") if not supplier.get(key)]
-    if missing:
-        raise ValueError(f"供应商“{supplier_short}”缺少字段：{', '.join(missing)}")
+    if supplier_book is not None:
+        supplier = supplier_book.lookup(supplier_short)
+    elif suppliers is not None:
+        supplier = suppliers.get(supplier_short)
+    else:
+        supplier = load_supplier_book().lookup(supplier_short)
+    issue = supplier_issue(supplier_short, supplier)
+    if issue:
+        raise ValueError(issue)
 
     configured_rate = (supplier.get("invoice_rates") or {}).get(invoice_type)
     default_rate = configured_rate if configured_rate is not None else DEFAULT_INVOICE_RATES[invoice_type]
@@ -432,14 +668,24 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
     if not math.isfinite(selected_rate) or selected_rate < 0 or selected_rate > 100:
         raise ValueError("税率必须在 0% 到 100% 之间")
 
-    warehouse_key = str(order.get("send_address") or "").strip()
-    buyer = (buyers.get("warehouses") or {}).get(warehouse_key, buyers["default"])
+    buyer = match_buyer(order, buyers)
     missing_buyer = [key for key in BUYER_REQUIRED if not str(buyer.get(key) or "").strip()]
     if missing_buyer:
         raise ValueError("买方资料缺少字段：" + "、".join(missing_buyer))
-    payment_key = order.get("payment_method")
-    if payment_key not in PAYMENT_METHODS:
-        raise ValueError("付款方式未维护，不能生成合同")
+    receiving = normalize_receiving_info(
+        receiving_info, buyer.get("receiving_info") or DEFAULT_RECEIVING_INFO,
+    )
+    inspection = compose_inspection_standards(
+        buyer.get("inspection_standards") or DEFAULT_INSPECTION_STANDARDS,
+        inspection_extra,
+    )
+    internal = bool(supplier.get("internal"))
+    payment = resolve_payment_terms(
+        order, supplier, payment_option=payment_option, payment_text=payment_text,
+    )
+    payment_key = "" if normalize_payment_text(payment_text) else (
+        str(payment_option or "").strip() or default_payment_option(order)
+    )
     overrides = normalize_price_overrides(price_overrides)
     gb_overrides = normalize_gb_overrides(gb_overrides)
     sku_ids = [str(item.get("sku_id") or "").strip() for item in erp_items]
@@ -453,6 +699,14 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
             return gb_lookup(standard_no)
         return lookup_standard_by_no(env_path, standard_no)
 
+    if product_master is not None:
+        master = product_master
+    else:
+        master = fetch_product_master(
+            env_path,
+            [str(item.get("sku_id") or "").strip() for item in erp_items],
+            [str(item.get("i_id") or "").strip() for item in erp_items],
+        )
     items = []
     delivery_dates = []
     for erp_item in erp_items:
@@ -460,18 +714,30 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
         style = str(erp_item.get("i_id") or "").strip()
         poi_id = str(erp_item.get("poi_id") or "")
         product = products.get(sku) or products.get(style) or {}
-        price = overrides.get(sku)
-        if price is None:
-            price = (product.get("prices") or {}).get(invoice_type)
-        if price is None and supplier.get("erp_price_mode") == invoice_type:
-            if not product:
-                raise ValueError(f"商品 {sku} 未维护商品档案，不能用 ERP 价")
-            price = erp_item.get("price")
-        if price is None:
-            raise ValueError(f"商品 {sku} 尚未维护“{INVOICE_LABELS[invoice_type]}”单价")
-        unit = str(product.get("unit") or "").strip()
+        sku_master = master.get(sku) or master.get(style) or {}
+        price = resolve_line_unit_price(
+            erp_item, product, sku_master, invoice_type=invoice_type,
+            supplier=supplier, override=overrides.get(sku),
+        )
+        # 单位 / 条码 / 虚拟分类允许用商品主数据兜底；单价不行，缺价仍然中止。
+        unit = clean_master_text(product.get("unit")) or sku_master.get("unit") or ""
         if not unit:
-            raise ValueError(f"商品 {sku} 未维护单位")
+            if sku_master:
+                raise ValueError(f"商品 {sku} 在 ERP 商品资料里单位为空，请在聚水潭补单位")
+            raise ValueError(
+                f"商品 {sku} 未维护单位：config/products.json 没有该 SKU，"
+                "镜像库 realtime_products 也没有这条商品资料"
+            )
+        national_code = (
+            clean_master_text(product.get("national_code"))
+            or sku_master.get("national_code")
+            or ""
+        )
+        virtual_category = (
+            clean_master_text(product.get("virtual_category"))
+            or sku_master.get("virtual_category")
+            or ""
+        )
         eta = day(erp_item.get("delivery_date"))
         if eta:
             delivery_dates.append(eta)
@@ -484,13 +750,19 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
             "poiId": poi_id,
             "sku": sku,
             "styleCode": style,
-            "nationalCode": str(product.get("national_code") or ""),
+            "nationalCode": national_code,
             "gbStandard": gb["standard_no"],
             "gbSamrId": gb["samr_id"],
             "gbStandardName": gb["name_cn"],
-            "name": str(erp_item.get("name") or product.get("name") or ""),
-            "category": str(product.get("category") or ""),
-            "virtualCategory": str(product.get("virtual_category") or ""),
+            "name": str(
+                erp_item.get("name") or product.get("name") or sku_master.get("name") or ""
+            ),
+            "category": (
+                clean_master_text(product.get("category"))
+                or sku_master.get("category")
+                or ""
+            ),
+            "virtualCategory": virtual_category,
             "materialProcess": str(product.get("material_process") or erp_item.get("properties_value") or ""),
             "packaging": str(product.get("packaging") or ""),
             "quantity": parse_quantity(erp_item.get("qty")),
@@ -506,7 +778,6 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
     terms = BASE_TERMS.copy()
     terms[3] = invoice_term(invoice_type, selected_rate)
     delivery_date = max(delivery_dates) if delivery_dates else ""
-    payment = PAYMENT_METHODS[payment_key]
     return {
         "purchaseOrderNo": str(order["po_id"]),
         "orderDate": day(order.get("po_date")),
@@ -516,8 +787,12 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
         "supplier": {
             "shortName": supplier_short,
             "legalName": supplier["legal_name"],
-            "address": supplier["address"],
-            "contact": f"{supplier['contact_name']} {supplier['contact_phone']}".strip(),
+            "address": supplier.get("address") or "",
+            "contact": (
+                "内部往来" if internal
+                else f"{supplier['contact_name']} {supplier['contact_phone']}".strip()
+            ),
+            "internal": internal,
         },
         "invoice": {
             "type": invoice_type,
@@ -526,26 +801,101 @@ def build_contract_model(po_id, invoice_type, *, tax_rate=None, price_overrides=
         },
         "items": items,
         "packagingTerms": buyer["packaging_terms"],
-        "paymentTerms": f"{payment}\n采购单号{order['po_id']}",
-        "inspectionStandards": buyer["inspection_standards"],
-        "deliveryAddress": buyer["delivery_address"],
+        "paymentOption": payment_key,
+        "paymentText": payment,
+        "paymentTerms": format_payment_block(payment, order["po_id"], supplier),
+        "inspectionStandards": inspection,
+        "receivingInfo": receiving,
+        "deliveryAddress": receiving,
         "terms": [f"{index + 1}、{term}" for index, term in enumerate(terms)],
         "applicant": str(order.get("purchaser_name") or ""),
     }
 
 
-def generate_contract(po_id, invoice_type, output_path, *, tax_rate=None, price_overrides=None, gb_overrides=None, preview_path=None, env_path=None):
+def blank_contract_model():
+    """每份合同都相同的固定栏：需方、收货信息、包装、检验、送货地址、条款。采购单内容留空。"""
+    buyers = load_json("buyers.json")
+    buyer = buyers["default"]
+    receiving = str(buyer.get("receiving_info") or DEFAULT_RECEIVING_INFO).strip()
+    terms = BASE_TERMS.copy()
+    terms[3] = "本订货单约定的票种与税率以实际签署为准；"
+    return {
+        "isTemplate": True,
+        "purchaseOrderNo": "",
+        "orderDate": "",
+        "deliveryDate": "",
+        "projectLead": "",
+        "buyer": buyer,
+        "supplier": {
+            "shortName": "",
+            "legalName": "",
+            "address": "",
+            "contact": "",
+            "internal": False,
+        },
+        "invoice": {},
+        "items": [{
+            "poiId": "",
+            "sku": "",
+            "styleCode": "",
+            "nationalCode": "",
+            "gbStandard": "",
+            "name": "",
+            "category": "",
+            "virtualCategory": "",
+            "materialProcess": "",
+            "packaging": "",
+            "quantity": None,
+            "unit": "",
+            "unitPrice": None,
+            "remark": "",
+            "imagePath": None,
+        }],
+        "packagingTerms": buyer["packaging_terms"],
+        "paymentOption": "",
+        "paymentText": "",
+        "paymentTerms": "",
+        "inspectionStandards": buyer.get("inspection_standards") or DEFAULT_INSPECTION_STANDARDS,
+        "receivingInfo": receiving,
+        "deliveryAddress": receiving,
+        "terms": [f"{index + 1}、{term}" for index, term in enumerate(terms)],
+        "applicant": "",
+    }
+
+
+def write_blank_contract_template(output_path=None):
+    """用固定栏生成空白采购合同母版，替换 ``templates/采购合同模板.xlsx``。"""
+    path = Path(output_path or TEMPLATES_DIR / "采购合同模板.xlsx")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return write_contract_workbook(blank_contract_model(), path)
+
+
+def generate_contract(po_id, invoice_type, output_path, *, tax_rate=None, price_overrides=None,
+                      gb_overrides=None, preview_path=None, env_path=None,
+                      payment_option=None, payment_text=None,
+                      receiving_info=None, inspection_extra=None):
     """生成最终 Excel；电子表格由 openpyxl 在进程内写入。"""
     env_path = env_path or str(ROOT / "hanli.env")
     model = build_contract_model(
         po_id, invoice_type, tax_rate=tax_rate,
         price_overrides=price_overrides, gb_overrides=gb_overrides, env_path=env_path,
+        payment_option=payment_option, payment_text=payment_text,
+        receiving_info=receiving_info, inspection_extra=inspection_extra,
     )
     persist_contract_gb(env_path, po_id, model["items"])
+    # 只是下次的预选参考，写不进去不该让已经算好的合同失败。
+    try:
+        record_payment_choice(
+            model["supplier"]["shortName"], option=model["paymentOption"],
+            text=model["paymentText"], po_id=str(po_id),
+        )
+    except Exception:
+        pass
     output_path = Path(output_path).resolve()
-    outputs_root = (ROOT / "outputs").resolve()
-    if outputs_root not in output_path.parents and output_path.parent != outputs_root:
-        raise ValueError("合同输出路径必须位于 outputs/ 下")
+    outputs_root = OUTPUTS_DIR.resolve()
+    under_official = outputs_root in output_path.parents or output_path.parent == outputs_root
+    if not under_official and "outputs" not in output_path.parts:
+        raise ValueError("合同输出路径必须位于 files/outputs/ 下")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     write_contract_workbook(model, output_path)
     if preview_path:
@@ -553,12 +903,57 @@ def generate_contract(po_id, invoice_type, output_path, *, tax_rate=None, price_
     return output_path
 
 
+def _windows_soffice_paths():
+    roots = (
+        Path(r"C:\Program Files\LibreOffice\program"),
+        Path(r"C:\Program Files (x86)\LibreOffice\program"),
+    )
+    names = ("soffice.com", "soffice.exe")
+    return [root / name for root in roots for name in names]
+
+
+def _extra_pdftoppm_paths():
+    home = Path.home()
+    return [
+        home / ".cache" / "codex-runtimes" / "codex-primary-runtime"
+        / "dependencies" / "native" / "poppler" / "Library" / "bin" / "pdftoppm.exe",
+    ]
+
+
+def resolve_preview_binary(setting_name, *candidates):
+    """配置路径必须真实存在才用；macOS 的 .env 拷到 Windows 时直接跳过。"""
+    configured = str(contract_setting(setting_name) or "").strip()
+    names = [configured, *candidates] if configured else list(candidates)
+    if setting_name == "CONTRACT_SOFFICE":
+        names.extend(str(path) for path in _windows_soffice_paths())
+    elif setting_name == "CONTRACT_PDFTOPPM":
+        names.extend(str(path) for path in _extra_pdftoppm_paths())
+    for name in names:
+        if not name:
+            continue
+        path = Path(name)
+        if path.is_file():
+            return str(path)
+        found = shutil.which(name)
+        if found:
+            return found
+    return ""
+
+
 def render_contract_preview(xlsx_path, preview_path):
     """用真实办公套件渲染 XLSX，确保嵌入的商品图片出现在预览中。"""
-    soffice = contract_setting("CONTRACT_SOFFICE") or shutil.which("soffice")
-    pdftoppm = contract_setting("CONTRACT_PDFTOPPM") or shutil.which("pdftoppm")
+    soffice = resolve_preview_binary("CONTRACT_SOFFICE", "soffice.com", "soffice", "soffice.exe")
+    pdftoppm = resolve_preview_binary("CONTRACT_PDFTOPPM", "pdftoppm", "pdftoppm.exe")
     if not soffice or not pdftoppm:
-        raise RuntimeError("缺少 LibreOffice 或 pdftoppm，无法生成含商品图片的合同预览")
+        missing = []
+        if not soffice:
+            missing.append("LibreOffice（soffice）")
+        if not pdftoppm:
+            missing.append("poppler（pdftoppm）")
+        raise RuntimeError(
+            "本机缺少 " + " 和 ".join(missing) + "，无法生成含商品图片的合同预览。"
+            "请安装后把可执行文件路径写进 .env 的 CONTRACT_SOFFICE / CONTRACT_PDFTOPPM"
+        )
     xlsx_path = Path(xlsx_path).resolve()
     preview_path = Path(preview_path).resolve()
     preview_path.parent.mkdir(parents=True, exist_ok=True)
@@ -574,9 +969,10 @@ def render_contract_preview(xlsx_path, preview_path):
     try:
         with tempfile.TemporaryDirectory(prefix="contract-preview-") as temp_dir:
             profile = Path(temp_dir) / "lo-profile"
+            profile.mkdir(parents=True, exist_ok=True)
             subprocess.run([
-                soffice, "--headless",
-                f"-env:UserInstallation=file://{profile}",
+                soffice, "--headless", "--nologo", "--nolockcheck", "--norestore",
+                f"-env:UserInstallation={profile.resolve().as_uri()}",
                 "--convert-to",
                 'pdf:calc_pdf_Export:{"SinglePageSheets":{"type":"boolean","value":"true"}}',
                 "--outdir", temp_dir, str(xlsx_path),
@@ -592,6 +988,8 @@ def render_contract_preview(xlsx_path, preview_path):
             ], cwd=ROOT, check=True, stdout=subprocess.DEVNULL, timeout=30)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("合同预览超时") from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("找不到预览程序，请检查 CONTRACT_SOFFICE / CONTRACT_PDFTOPPM 是否指向本机真实文件") from exc
     finally:
         _PREVIEW_SLOTS.release()
     if not preview_path.exists():

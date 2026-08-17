@@ -162,18 +162,27 @@ def build_reminders(rows, today=None):
     }
 
 
+def _as_name_list(value) -> list[str]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item).strip() for item in value if str(item).strip()]
+    name = str(value).strip()
+    return [name] if name else []
+
+
 def filter_orders(reminders, *, buckets=None, buyer="", supplier="", limit=50):
     """按档位、采购员、供应商裁剪催办清单，供工具和推送共用。"""
     wanted = tuple(buckets) if buckets else URGENT_BUCKETS
     unknown = [key for key in wanted if key not in WAVES]
     if unknown:
         raise ValueError("催办档位只能是：" + "、".join(BUCKET_ORDER))
-    buyer = str(buyer or "").strip()
+    buyer_names = _as_name_list(buyer)
     supplier = str(supplier or "").strip()
     picked = [
         item for item in reminders["orders"]
         if item["bucket"] in wanted
-        and (not buyer or buyer in item["buyer"])
+        and (not buyer_names or any(name in item["buyer"] for name in buyer_names))
         and (not supplier or supplier in item["supplier"])
     ]
     limit = max(1, min(int(limit or 50), 500))

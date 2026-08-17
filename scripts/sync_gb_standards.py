@@ -39,7 +39,7 @@ def main():
         choices=["products", "filtered", "all"],
         help="products=按商品表分类；filtered=手工 CCS/ICS/关键字；all=全部国家标准目录",
     )
-    parser.add_argument("--map", help="商品分类映射 JSON，默认 config/gb_category_map.json")
+    parser.add_argument("--map", help="商品分类映射 JSON，默认 files/config/gb_category_map.json")
     parser.add_argument("--ccs", help="filtered 范围：中国标准分类号，逗号分隔")
     parser.add_argument("--ics", help="filtered 范围：国际标准分类号，逗号分隔")
     parser.add_argument("--keyword", help="filtered 范围：中文标准名称关键字，逗号分隔")
@@ -51,9 +51,9 @@ def main():
     values = load_all_env(args.config) if Path(args.config).exists() else {}
     scope = args.scope or setting(values, "GB_SYNC_SCOPE", "products")
     status = args.status if args.status is not None else setting(values, "GB_SYNC_STATUS", "")
-    map_path = Path(args.map) if args.map else Path(setting(values, "GB_SYNC_CATEGORY_MAP", "") or DEFAULT_CATEGORY_MAP)
-    if not map_path.is_absolute():
-        map_path = ROOT / map_path
+    from backend.paths import resolve_repo_path
+    raw_map = args.map or setting(values, "GB_SYNC_CATEGORY_MAP", "")
+    map_path = resolve_repo_path(raw_map) if raw_map else Path(DEFAULT_CATEGORY_MAP)
     client = SamrCatalogClient(
         timeout=float(setting(values, "GB_SYNC_TIMEOUT_SECONDS", "30") or 30),
         page_size=int(args.page_size or setting(values, "GB_SYNC_PAGE_SIZE", "50") or 50),
@@ -74,7 +74,7 @@ def main():
         for family_id, cats in scope_info["families"].items():
             print(f"  {family_id}：{('、'.join(cats))}")
         if scope_info["unmapped"]:
-            print("未映射分类（已跳过，请补 config/gb_category_map.json）：" + "、".join(scope_info["unmapped"]))
+            print("未映射分类（已跳过，请补 files/config/gb_category_map.json）：" + "、".join(scope_info["unmapped"]))
         if scope_info["ignored"]:
             print("忽略分类：" + "、".join(repr(item) for item in scope_info["ignored"]))
         query_loader = query_loader

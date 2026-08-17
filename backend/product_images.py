@@ -14,8 +14,9 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[1]
-CONFIG_IMAGE_DIR = ROOT / "config" / "product-images"
+from .paths import ROOT, local_dir, resolve_repo_path
+
+CONFIG_IMAGE_DIR = local_dir("config") / "product-images"
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp")
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 WORKER_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,120}$")
@@ -97,13 +98,13 @@ def resolve_product_image(product: dict, *, sku: str, style: str,
     configured = product.get("image_path")
     if configured:
         path = Path(str(configured)).expanduser()
-        path = path if path.is_absolute() else base / path
+        path = path if path.is_absolute() else resolve_repo_path(configured, root=base)
         if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES:
             return {"path": str(path.resolve()), "source": "商品映射", "status": "ready", "error": ""}
-    local = _existing_image(base / "config" / "product-images", sku, style)
+    local = _existing_image(local_dir("config", root=base) / "product-images", sku, style)
     if local:
         return {"path": str(local), "source": "SKU 本地图片", "status": "ready", "error": ""}
-    cached = _existing_image(cache_dir or base / "data" / "product-images", sku, style)
+    cached = _existing_image(cache_dir or local_dir("data", root=base) / "product-images", sku, style)
     if cached:
         return {"path": str(cached), "source": "聚水潭接口缓存", "status": "ready", "error": ""}
     return {

@@ -2,7 +2,6 @@
 """品控台账：登记 / 关闭 / 撤销 / 查询。只写 Agent SQLite，不碰镜像库。"""
 from __future__ import annotations
 
-import json
 import secrets
 import sqlite3
 from datetime import timedelta
@@ -10,16 +9,12 @@ from pathlib import Path
 
 from ..agent.store import AgentStore, now
 from ..business_time import business_today
+from ..supplier_master import load_supplier_names as load_master_supplier_names
 from .parse import parse_quality_command, parse_quality_fields
 
 
 def load_supplier_names(root: Path) -> set[str]:
-    path = Path(root) / "config" / "suppliers.json"
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return set()
-    return {str(key).strip() for key in payload if str(key).strip()}
+    return load_master_supplier_names(root)
 
 
 class QualityError(ValueError):

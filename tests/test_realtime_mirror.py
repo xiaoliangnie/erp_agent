@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from pymysql.err import OperationalError
 
@@ -10,6 +11,7 @@ from backend.realtime_mirror import (
     PRODUCT_ROUTE,
     SUPPLIER_ROUTE,
     ProxyAPIError,
+    RealtimeMirror,
     blocked_image_url,
     cache_product_image,
     extract_page,
@@ -164,6 +166,31 @@ class RealtimeMirrorParsingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(ValueError, "内网或本机"):
                 cache_product_image(Path(tmp), "SKU-01", "http://127.0.0.1/pic.png")
+
+    def test_refresh_orders_looks_up_by_internal_ids(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, route, body):
+                self.calls.append((route, body))
+                return {
+                    "request_id": "req-refresh",
+                    "data": {"code": 0, "datas": [{"o_id": "11549976", "items": []}]},
+                }
+
+        client = FakeClient()
+        mirror = RealtimeMirror("unused.env", client, request_interval=0)
+        with patch(
+            "backend.realtime_mirror.upsert_order_records",
+            return_value={"orders": 1, "items": 0},
+        ) as upserted:
+            result = mirror.refresh_orders(["11549976", "11549976", "11550001"])
+        self.assertTrue(result["ok"])
+        self.assertEqual(1, result["orders"])
+        self.assertEqual(ORDER_ROUTE, client.calls[0][0])
+        self.assertEqual("11549976,11550001", client.calls[0][1]["o_ids"])
+        upserted.assert_called_once()
 
 
 if __name__ == "__main__":

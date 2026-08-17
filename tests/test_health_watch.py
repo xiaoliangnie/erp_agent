@@ -193,7 +193,7 @@ class LoggingSetupTests(unittest.TestCase):
 
     def test_relative_log_path_resolves_under_repo_root(self):
         path = resolve_log_path("data/app.log")
-        self.assertTrue(str(path).endswith("data/app.log"))
+        self.assertTrue(str(path).replace("\\", "/").endswith("files/data/app.log"))
         self.assertIsNone(resolve_log_path(""))
         self.assertIsNone(resolve_log_path(None))
 

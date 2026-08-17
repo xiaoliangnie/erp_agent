@@ -63,7 +63,8 @@ def batches(items, size=200):
 
 def main():
     parser = argparse.ArgumentParser(description="同步采购 CSV 到 MySQL")
-    parser.add_argument("--csv", default=str(ROOT / "data" / "snapshots" / "采购单完整数据.csv"))
+    from backend.paths import DATA_DIR
+    parser.add_argument("--csv", default=str(DATA_DIR / "snapshots" / "采购单完整数据.csv"))
     parser.add_argument("--env", required=True, help="目标 MySQL 的 env 文件路径")
     args = parser.parse_args()
 

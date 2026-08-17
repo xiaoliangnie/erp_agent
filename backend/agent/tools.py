@@ -22,12 +22,20 @@ from ..contracts import INVOICE_LABELS, generate_contract, get_contract_options
 from ..database import fetch_contract_order_choices, fetch_exchange_products
 from ..delivery_reminders import BUCKET_ORDER, URGENT_BUCKETS, build_reminders, filter_orders, reminder_markdown
 from ..gb_standards import catalog_status, family_ids_for, lookup_product_standards
-from ..order_source import fetch_exchange_order_items, fetch_exchange_orders
+from ..exchange.insole import (
+    DEFAULT_SHOP, execute_insole_orders, format_insole_list, load_written_insole_orders,
+    locate_insole_orders, public_order, remember_insole_writes, sync_insole_mirror,
+)
+from ..order_source import OrderSourceError, fetch_exchange_order_items, fetch_exchange_orders
 from ..procurement_data import day, integer, number, text
 from ..product_images import resolve_product_image
+from ..staff_names import SELF_SCOPE_UNBOUND
 
 
 RISK_LEVELS = {"L0": "只读", "L1": "生成产物", "L2": "对外动作", "L3": "改主数据"}
+PERMISSIONS = {"read", "write", "notify"}
+SIDE_EFFECTS = {"none", "file", "notify", "erp", "write"}
+SELF_SCOPE_TOKENS = frozenset({"我", "我的", "我名下", "本人", "自己"})
 
 # 架构方案 §14 预留的工具位：只占位，不提前写实现。上线任何一项都是在这里加一条
 # `registry.register(...)`，Agent Core 不动。价格盯盘 / 库存预警 / 采购草稿已取消。
@@ -40,6 +48,21 @@ class ToolError(ValueError):
     """业务侧可回给员工的工具错误。"""
 
 
+class PermissionDenied(ToolError):
+    """权限拒绝，带结构化 decision，不靠 prompt 拦。"""
+
+    def __init__(self, reason: str, *, role="", tool="", permission="", channel=""):
+        super().__init__(reason)
+        self.decision = {
+            "ok": False,
+            "reason": reason,
+            "role": role,
+            "tool": tool,
+            "permission": permission,
+            "channel": channel,
+        }
+
+
 @dataclass
 class ToolContext:
     """工具的静态依赖 + 当次调用的身份。"""
@@ -48,20 +71,29 @@ class ToolContext:
     root: Path
     fetch_rows: Callable[..., tuple]
     exchange: Any = None
+    erp: Any = None
     forecast: Any = None
     notifier: Any = None
     audit: Any = None
     setting: Any = None
     quality: Any = None
+    mirror: Any = None
     operator: str = ""
+    user_id: str = ""
     channel: str = "web"
     session_id: str | None = None
     run_id: str | None = None
     action_id: str | None = None
+    role: str = "operator"
+    buyer_names: tuple[str, ...] = ()
 
-    def for_caller(self, *, operator: str, channel: str, session_id=None, run_id=None, action_id=None):
-        return replace(self, operator=operator, channel=channel, session_id=session_id,
-                       run_id=run_id, action_id=action_id)
+    def for_caller(self, *, operator: str, channel: str, session_id=None, run_id=None,
+                   action_id=None, user_id="", role="operator", buyer_names=()):
+        return replace(
+            self, operator=operator, user_id=str(user_id or ""),
+            channel=channel, session_id=session_id, run_id=run_id, action_id=action_id,
+            role=str(role or "operator"), buyer_names=tuple(buyer_names or ()),
+        )
 
     def rows(self, year=None):
         """取一年的采购明细行；缓存策略由注入的 `fetch_rows` 决定。"""
@@ -77,6 +109,35 @@ class Tool:
     handler: Callable[[dict, ToolContext], Any]
     title: Callable[[dict], str] | None = None
     preview: Callable[[dict, ToolContext], dict] | None = None
+    permission: str = ""
+    side_effect: str = ""
+    channels: tuple[str, ...] = ()
+
+    def __post_init__(self):
+        if not self.permission:
+            if self.risk == "L0":
+                permission = "read"
+            elif self.name.startswith("send_") or self.name.startswith("push_"):
+                permission = "notify"
+            else:
+                permission = "write"
+            object.__setattr__(self, "permission", permission)
+        if not self.side_effect:
+            if self.risk == "L0":
+                effect = "none"
+            elif self.name.startswith("send_") or self.name.startswith("push_"):
+                effect = "notify"
+            elif "contract" in self.name:
+                effect = "file"
+            else:
+                effect = "write"
+            object.__setattr__(self, "side_effect", effect)
+        if self.permission not in PERMISSIONS:
+            raise ValueError(f"未知 permission {self.permission}")
+        if self.side_effect not in SIDE_EFFECTS:
+            raise ValueError(f"未知 side_effect {self.side_effect}")
+        if self.channels:
+            object.__setattr__(self, "channels", tuple(str(item) for item in self.channels if item))
 
     @property
     def needs_confirm(self) -> bool:
@@ -138,6 +199,9 @@ class ToolRegistry:
             "risk": self._tools[name].risk,
             "riskLabel": RISK_LEVELS[self._tools[name].risk],
             "needsConfirm": self._tools[name].needs_confirm,
+            "permission": self._tools[name].permission,
+            "sideEffect": self._tools[name].side_effect,
+            "channels": list(self._tools[name].channels),
             "description": self._tools[name].description,
         } for name in self.names()]
 
@@ -147,6 +211,79 @@ def _limit(value, default=20, cap=200):
         return max(1, min(int(value or default), cap))
     except (TypeError, ValueError):
         return default
+
+
+LINE_CAP = 30
+
+
+def tool_envelope(*, ok=True, summary, data=None, truncated=False, hint=""):
+    """给模型的工具返回：短中文摘要 + 截断后的 data。全量仍只给页面。"""
+    payload = {
+        "ok": bool(ok),
+        "summary": str(summary or ""),
+        "data": data,
+        "truncated": bool(truncated),
+    }
+    if hint:
+        payload["hint"] = str(hint)
+    return payload
+
+
+def clip_rows(rows, cap=LINE_CAP, keep=None):
+    rows = list(rows or [])
+    truncated = len(rows) > cap
+    clipped = rows[:cap]
+    if keep:
+        clipped = [
+            {key: row.get(key) for key in keep if isinstance(row, dict) and key in row}
+            if isinstance(row, dict) else row
+            for row in clipped
+        ]
+    return clipped, truncated
+
+
+def as_tool_envelope(result):
+    """L0 结果统一成信封。已是信封或 ``{error}`` 的保持原样。"""
+    if isinstance(result, dict) and result.get("error") and "ok" not in result:
+        return result
+    if isinstance(result, dict) and "ok" in result and "summary" in result:
+        result.setdefault("data", None)
+        result.setdefault("truncated", False)
+        return result
+    if isinstance(result, dict) and "summary" in result:
+        return tool_envelope(
+            summary=str(result.get("summary") or ""),
+            data=result,
+            truncated=bool(result.get("truncated")),
+            hint=str(result.get("hint") or ""),
+        )
+    return tool_envelope(summary=_fallback_summary(result), data=result)
+
+
+def _fallback_summary(result) -> str:
+    if not isinstance(result, dict):
+        return "已返回结果"
+    for key in ("count", "purchaseOrderNo", "today", "message", "selectedOrderCount"):
+        if result.get(key) not in (None, ""):
+            return f"{key}={result[key]}"
+    return "已返回结构化结果，请引用 data 中的数字，不要口算"
+
+
+def is_self_scope(value) -> bool:
+    return str(value or "").strip() in SELF_SCOPE_TOKENS
+
+
+def scoped_buyers(value, ctx) -> list[str]:
+    """空 = 不限；「我名下」= 绑定采购员署名；其它原文。"""
+    raw = str(value or "").strip()
+    if is_self_scope(raw):
+        names = [name for name in (ctx.buyer_names or ()) if name]
+        if not names:
+            raise ToolError(SELF_SCOPE_UNBOUND)
+        return names
+    if raw:
+        return [raw]
+    return []
 
 
 def _po_id(arguments) -> str:
@@ -176,36 +313,62 @@ def _sku_list(value, label) -> list[str]:
 
 def _search_purchase_orders(arguments, ctx):
     query = str(arguments.get("query") or "").strip()
+    if is_self_scope(query):
+        query = scoped_buyers(query, ctx)[0]
     orders = fetch_contract_order_choices(ctx.env_path, limit=_limit(arguments.get("limit"), 20, 100), query=query)
-    return {"query": query, "count": len(orders), "orders": orders}
+    return tool_envelope(
+        summary=f"命中 {len(orders)} 张采购单" + (f"，关键词 {query}" if query else ""),
+        data={"query": query, "count": len(orders), "orders": orders},
+        hint="只要一张单时用 get_purchase_order，不要用催办或换货代替",
+    )
 
 
 def _get_purchase_order(arguments, ctx):
     options = get_contract_options(_po_id(arguments), ctx.env_path)
-    return {
-        "purchaseOrderNo": options["purchaseOrderNo"],
-        "orderDate": options["orderDate"],
-        "deliveryDate": options["deliveryDate"],
-        "status": options["status"],
-        "purchaser": options["purchaser"],
-        "supplier": options["supplierShortName"],
-        "supplierMapped": options["supplierMapped"],
-        "warehouse": options["warehouse"],
-        "receiveAddress": options["receiveAddress"],
-        "paymentMethod": options["paymentMethod"],
-        "invoiceRates": options["invoiceRates"],
-        "totalQuantity": options["totalQuantity"],
-        "items": [{
-            "sku": item["sku"], "name": item["name"], "specification": item["specification"],
-            "quantity": item["quantity"], "inQuantity": item["inQuantity"],
-            "pendingQuantity": max(0, item["quantity"] - item["inQuantity"]),
-            "erpPrice": item["erpPrice"], "deliveryDate": item["deliveryDate"],
-            "maintainedPrices": item["prices"],
-            "category": item.get("category") or "",
-            "gbStandard": item.get("gbStandard") or "",
-            "gbOptionCount": len(item.get("gbOptions") or []),
-        } for item in options["items"]],
-    }
+    items = [{
+        "sku": item["sku"], "name": item["name"], "specification": item["specification"],
+        "quantity": item["quantity"], "inQuantity": item["inQuantity"],
+        "pendingQuantity": max(0, item["quantity"] - item["inQuantity"]),
+        "erpPrice": item["erpPrice"], "deliveryDate": item["deliveryDate"],
+        "maintainedPrices": item["prices"],
+        "category": item.get("category") or "",
+        "unit": item.get("unit") or "",
+        "nationalCode": item.get("nationalCode") or "",
+        "gbStandard": item.get("gbStandard") or "",
+        "gbOptionCount": len(item.get("gbOptions") or []),
+    } for item in options["items"]]
+    pending = sum(item["pendingQuantity"] for item in items)
+    shown, truncated = clip_rows(
+        items, LINE_CAP, keep=("sku", "name", "quantity", "pendingQuantity", "deliveryDate"),
+    )
+    extra = "（已截断展示前 30 行）" if truncated else ""
+    return tool_envelope(
+        summary=(
+            f"采购单 {options['purchaseOrderNo']}，供应商{options['supplierShortName'] or '未维护'}，"
+            f"待入库 {pending}，明细 {len(items)} 行{extra}"
+        ),
+        data={
+            "purchaseOrderNo": options["purchaseOrderNo"],
+            "orderDate": options["orderDate"],
+            "deliveryDate": options["deliveryDate"],
+            "status": options["status"],
+            "purchaser": options["purchaser"],
+            "supplier": options["supplierShortName"],
+            "supplierMapped": options["supplierMapped"],
+            "warehouse": options["warehouse"],
+            "receiveAddress": options["receiveAddress"],
+            "paymentMethod": options["paymentMethod"],
+            "paymentOption": options["paymentOption"],
+            "paymentOptions": options["paymentOptions"],
+            "invoiceRates": options["invoiceRates"],
+            "totalQuantity": options["totalQuantity"],
+            "pendingQuantity": pending,
+            "itemCount": len(items),
+            "items": shown,
+        },
+        truncated=truncated,
+        hint="需要某一行的单价请再查，不要口算合计" if truncated else "",
+    )
 
 
 def _delivery_reminders(arguments, ctx):
@@ -215,30 +378,40 @@ def _delivery_reminders(arguments, ctx):
     orders, matched = filter_orders(
         reminders,
         buckets=buckets,
-        buyer=arguments.get("buyer") or "",
+        buyer=scoped_buyers(arguments.get("buyer"), ctx),
         supplier=arguments.get("supplier") or "",
         limit=_limit(arguments.get("limit"), 30, 200),
     )
-    return {
-        "today": reminders["today"],
-        "year": meta.get("year"),
-        "totals": reminders["totals"],
-        "buckets": reminders["buckets"],
-        "byBuyer": reminders["byBuyer"][:20],
-        "matched": matched,
-        "returned": len(orders),
-        "orders": orders,
-        "note": "交期取 item_delivery_date，为空退到最早预计到货日期；只统计仍有待入库数量的明细行",
-    }
+    totals = reminders["totals"]
+    return tool_envelope(
+        summary=(
+            f"交期提醒 {reminders['today']}，匹配 {matched} 张，返回 {len(orders)} 张；"
+            f"紧急 {totals.get('urgentOrderCount', 0)} 单、"
+            f"待入库 {totals.get('urgentPendingQty', 0)}"
+        ),
+        data={
+            "today": reminders["today"],
+            "year": meta.get("year"),
+            "totals": totals,
+            "buckets": reminders["buckets"],
+            "byBuyer": reminders["byBuyer"][:20],
+            "matched": matched,
+            "returned": len(orders),
+            "orders": orders,
+            "note": "交期取 item_delivery_date，为空退到最早预计到货日期；只统计仍有待入库数量的明细行",
+        },
+        truncated=matched > len(orders),
+        hint="不要用换货工具处理采购逾期；只要一张单用 get_purchase_order",
+    )
 
 
 def _dashboard_summary(arguments, ctx):
     """看板统计：直接从明细行现算，与页面同一口径。"""
     rows, meta = ctx.rows(arguments.get("year"))
-    buyer = str(arguments.get("buyer") or "").strip()
+    buyers = scoped_buyers(arguments.get("buyer"), ctx)
     supplier = str(arguments.get("supplier") or "").strip()
     picked = [row for row in rows
-              if (not buyer or buyer in text(row.get("采购员")))
+              if (not buyers or any(name in text(row.get("采购员")) for name in buyers))
               and (not supplier or supplier in text(row.get("item_supplier_id")))]
     totals = {"lines": len(picked), "orders": 0, "quantity": 0, "inQuantity": 0,
               "pendingQuantity": 0, "amount": 0.0}
@@ -271,11 +444,11 @@ def _dashboard_summary(arguments, ctx):
         return [{**item, "amount": round(item["amount"], 2)} for item in ranked]
 
     dates.sort()
-    return {
+    payload = {
         "year": meta.get("year"),
         "source": meta.get("source"),
         "availableYears": meta.get("availableYears") or [],
-        "filter": {"buyer": buyer, "supplier": supplier},
+        "filter": {"buyer": "、".join(buyers), "supplier": supplier},
         "dateRange": {"min": dates[0] if dates else "", "max": dates[-1] if dates else ""},
         "totals": totals,
         "topBuyers": top(by_buyer),
@@ -283,6 +456,14 @@ def _dashboard_summary(arguments, ctx):
         "topCategories": top(by_category),
         "note": "采购金额 = 基本金额；已入库 = item_in_qty；待入库 = 数量 − 已入库按行取正",
     }
+    return tool_envelope(
+        summary=(
+            f"{payload['year'] or '本年'}看板：{totals['orders']} 单、"
+            f"待入库 {totals['pendingQuantity']}、金额 {totals['amount']}"
+        ),
+        data=payload,
+        hint="看板统计不要用交期催办或换货代替",
+    )
 
 
 def _search_products(arguments, ctx):
@@ -291,7 +472,11 @@ def _search_products(arguments, ctx):
         limit=_limit(arguments.get("limit"), 20, 100),
         query=str(arguments.get("query") or "").strip(),
     )
-    return {"count": len(products), "products": products}
+    return tool_envelope(
+        summary=f"命中 {len(products)} 个商品",
+        data={"count": len(products), "products": products},
+        hint="锁定 SKU 后再查国标或换货，不要猜编码",
+    )
 
 
 def _gb_catalog_status(arguments, ctx):
@@ -323,7 +508,8 @@ GAP_LIST_CAP = 20
 
 
 def _load_config_object(root: Path, name: str) -> dict:
-    path = Path(root) / "config" / name
+    from ..paths import local_dir
+    path = local_dir("config", root=root) / name
     if not path.is_file():
         raise ToolError(f"找不到配置 {name}")
     try:
@@ -415,7 +601,11 @@ def _master_data_gaps(arguments, ctx):
     cutoff = (today - timedelta(days=days)).isoformat()
     window = [row for row in rows if (day(row.get("采购日期")) or "") >= cutoff]
 
-    suppliers = _load_config_object(ctx.root, "suppliers.json")
+    from ..supplier_master import load_supplier_book
+    try:
+        supplier_book = load_supplier_book(root=ctx.root)
+    except FileNotFoundError as exc:
+        raise ToolError(str(exc)) from exc
     products = _load_config_object(ctx.root, "products.json")
     mapping = _load_config_object(ctx.root, "gb_category_map.json")
     ignored = {str(item).strip() for item in (mapping.get("ignore") or [])}
@@ -433,7 +623,7 @@ def _master_data_gaps(arguments, ctx):
         category = text(row.get("item_sku_other_3")) or "未分类"
         buyer = text(row.get("采购员"))
         po_id = text(row.get("采购单号"))
-        if supplier and supplier not in suppliers:
+        if supplier and supplier_book.lookup(supplier) is None:
             item = missing_suppliers.setdefault(
                 supplier, {"name": supplier, "poIds": set(), "buyers": set()},
             )
@@ -517,10 +707,19 @@ def _master_data_gaps(arguments, ctx):
             "missingPrices": len(prices),
             "unmappedCategories": len(categories),
         },
-        "note": "供应商键是 ERP seller 简称；图片按商品映射 / SKU 本地图 / 缓存；缺价指 products.json 该票种单价为 null",
+        "note": "供应商按本机「供应商管理」表的简称匹配 ERP seller；图片按商品映射 / SKU 本地图 / 缓存；缺价指 products.json 该票种单价为 null",
     }
     payload["markdown"] = _gaps_markdown(payload)
-    return payload
+    counts = payload["counts"]
+    return tool_envelope(
+        summary=(
+            f"近 {days} 天主数据缺口：供应商未维护 {counts['missingSuppliers']}、"
+            f"SKU 无图 {counts['missingImages']}、缺价 {counts['missingPrices']}、"
+            f"分类未映射 {counts['unmappedCategories']}"
+        ),
+        data=payload,
+        hint="不要编造未维护的供应商或价格",
+    )
 
 
 def _require_order_source(ctx):
@@ -531,15 +730,37 @@ def _require_order_source(ctx):
 
 def _search_sales_orders(arguments, ctx):
     """让 Agent 先把员工说的平台单号/店铺等解析成明确 ERP o_id。"""
+    query = str(arguments.get("query") or "").strip()
+    source_sku = str(arguments.get("source_sku") or "").strip()
+    shop = str(arguments.get("shop") or "").strip()
+    date_from = str(arguments.get("date_from") or "").strip()
+    date_to = str(arguments.get("date_to") or "").strip()
+    status = arguments.get("status")
+    if status is None:
+        status = arguments.get("status_include")
     result = fetch_exchange_orders(
         _require_order_source(ctx), ctx.env_path,
-        query=str(arguments.get("query") or "").strip(),
-        source_sku=str(arguments.get("source_sku") or "").strip(),
+        query=query, source_sku=source_sku, shop=shop, status=status,
+        date_from=date_from, date_to=date_to,
         limit=_limit(arguments.get("limit"), 20, 100),
     )
     if not result.get("configured"):
         raise ToolError(result.get("message") or "订单镜像暂不可用")
-    return {"count": len(result.get("orders") or []), **result}
+    orders = result.get("orders") or []
+    oids = [item.get("oId") for item in orders if item.get("oId")]
+    filters = result.get("filters") or {}
+    shown = "、".join(oids[:8])
+    extra = f"，o_id：{shown}" if shown else ""
+    hint = "结果不唯一就列出候选追问，不要猜 o_id"
+    if len(oids) == 1:
+        hint = "已收到唯一 o_id，可再查明细或登记换货"
+    elif not oids:
+        hint = "没有命中订单；放宽状态/日期或核对 SKU 后再查，不要编造单号"
+    return tool_envelope(
+        summary=f"命中 {len(orders)} 张销售订单{extra}",
+        data={"count": len(orders), "orders": orders, "oIds": oids, "filters": filters},
+        hint=hint,
+    )
 
 
 def _get_sales_order_items(arguments, ctx):
@@ -550,7 +771,16 @@ def _get_sales_order_items(arguments, ctx):
     )
     if not result.get("configured"):
         raise ToolError(result.get("message") or "订单明细镜像暂不可用")
-    return result
+    items = result.get("items") or []
+    shown, truncated = clip_rows(
+        items, LINE_CAP, keep=("sku", "styleCode", "name", "totalQuantity", "orderCount"),
+    )
+    return tool_envelope(
+        summary=f"{result.get('selectedOrderCount') or 0} 张订单共 {len(items)} 个 SKU",
+        data={**result, "items": shown, "itemCount": len(items)},
+        truncated=truncated,
+        hint="确认源 SKU 后再登记换货，不要口算数量",
+    )
 
 
 def _require_forecast(ctx):
@@ -579,8 +809,8 @@ def _order_suggestion(arguments, ctx):
         result["forecastRunId"] = ctx.audit.record_forecast(
             model_name=result["model"]["name"], model_version=result["model"]["version"],
             keys=keys, inputs=result["inputs"], output=result,
-            operator=ctx.operator, session_id=ctx.session_id, run_id=ctx.run_id,
-            pending_action_id=ctx.action_id,
+            operator=ctx.operator, user_id=ctx.user_id, session_id=ctx.session_id,
+            run_id=ctx.run_id, pending_action_id=ctx.action_id,
         )
     return result
 
@@ -597,11 +827,18 @@ def _contract_preview(arguments, ctx):
     rate = arguments.get("tax_rate")
     if rate is None:
         rate = options["invoiceRates"].get(invoice_type)
+    payment_key = str(arguments.get("payment_option") or options.get("paymentOption") or "")
+    payment_text = next(
+        (item["text"] for item in options.get("paymentOptions") or [] if item["key"] == payment_key),
+        options.get("paymentMethod") or "",
+    )
     return {
         "purchaseOrderNo": po_id,
         "invoiceType": invoice_type,
         "invoiceLabel": INVOICE_LABELS[invoice_type],
         "taxRate": rate,
+        "paymentOption": payment_key,
+        "paymentTerms": payment_text,
         "supplier": options["supplierShortName"],
         "supplierMapped": options["supplierMapped"],
         "purchaser": options["purchaser"],
@@ -621,10 +858,12 @@ def _generate_contract(arguments, ctx):
     po_id = _po_id(arguments)
     invoice_type = str(arguments.get("invoice_type") or "special_invoice")
     contract_id = secrets.token_hex(12)
-    output_dir = ctx.root / "outputs" / "agent" / contract_id
+    from ..paths import local_dir
+    output_dir = local_dir("outputs", root=ctx.root) / "agent" / contract_id
     generate_contract(
         po_id, invoice_type, output_dir / "contract.xlsx",
         tax_rate=arguments.get("tax_rate"),
+        payment_option=arguments.get("payment_option"),
         gb_overrides=arguments.get("gb_overrides") or arguments.get("gbOverrides") or {},
         preview_path=output_dir / "preview.png",
         env_path=ctx.env_path,
@@ -700,13 +939,159 @@ def _submit_exchange(arguments, ctx):
     }
 
 
+def _optional_oids(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, str):
+        value = re.split(r"[\s,，;；]+", value.strip())
+    if not isinstance(value, list):
+        raise ToolError("o_ids 必须是列表")
+    items = []
+    for raw in value:
+        item = str(raw or "").strip()
+        if item and item not in items:
+            items.append(item)
+    return items
+
+
+def _insole_written(ctx) -> dict:
+    return load_written_insole_orders(ctx.setting, root=ctx.root)
+
+
+def _locate_insole(arguments, ctx):
+    shop = str(arguments.get("shop") or DEFAULT_SHOP).strip() or DEFAULT_SHOP
+    try:
+        located = locate_insole_orders(
+            ctx.setting, ctx.env_path,
+            shop=shop, o_ids=_optional_oids(arguments.get("o_ids")),
+            written=_insole_written(ctx), root=ctx.root,
+        )
+    except (OrderSourceError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+    processable = [public_order(row) for row in located["processable"]]
+    parked = [public_order(row) for row in located["parked"]]
+    return tool_envelope(
+        summary=(
+            f"抖音鞋垫待处理 {located['processableCount']} 单，"
+            f"暂不处理 {located['parkedCount']} 单"
+        ),
+        data={
+            "shop": located["shop"],
+            "sourceSku": located["sourceSku"],
+            "sync": located["sync"],
+            "processableCount": located["processableCount"],
+            "parkedCount": located["parkedCount"],
+            "skippedCount": located["skippedCount"],
+            "oIds": located["oIds"],
+            "orders": processable,
+            "parked": parked[:30],
+            "markdown": format_insole_list(located),
+        },
+        truncated=len(located["parked"]) > 30,
+        hint="要处理必须再走 process_insole_orders；员工回复「确认」后由后端写入。Delivering 不要自行加入",
+    )
+
+
+def _insole_preview(arguments, ctx):
+    shop = str(arguments.get("shop") or DEFAULT_SHOP).strip() or DEFAULT_SHOP
+    try:
+        located = locate_insole_orders(
+            ctx.setting, ctx.env_path,
+            shop=shop, o_ids=_optional_oids(arguments.get("o_ids")),
+            written=_insole_written(ctx), root=ctx.root,
+        )
+    except (OrderSourceError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+    arguments["o_ids"] = list(located["oIds"])
+    arguments["shop"] = shop
+    if not located["processable"]:
+        raise ToolError(
+            format_insole_list(located)
+            + "\n没有可处理的抖音鞋垫订单（需要 Question / WaitConfirm；半码按码数舍去小数后映射）。"
+        )
+    return {
+        "shop": shop,
+        "sourceSku": located["sourceSku"],
+        "processableCount": located["processableCount"],
+        "parkedCount": located["parkedCount"],
+        "oIds": located["oIds"],
+        "orders": [public_order(row) for row in located["processable"]],
+        "parked": [public_order(row) for row in located["parked"][:20]],
+        "markdown": format_insole_list(located),
+        "note": "直接回复「确认」即可，由后端串行写入 ERP，不用去换货页。写完会再发一条【任务完成】结果。发货中不处理；半码按码数舍去小数。",
+    }
+
+
+def _process_insole(arguments, ctx):
+    shop = str(arguments.get("shop") or DEFAULT_SHOP).strip() or DEFAULT_SHOP
+    o_ids = _optional_oids(arguments.get("o_ids"))
+    if not o_ids:
+        raise ToolError("没有可执行的订单清单，请先定位并确认")
+    written = _insole_written(ctx)
+    try:
+        located = locate_insole_orders(
+            ctx.setting, ctx.env_path, shop=shop, o_ids=o_ids,
+            written=written, root=ctx.root,
+        )
+    except (OrderSourceError, ValueError) as exc:
+        raise ToolError(str(exc)) from exc
+    if not located["processable"]:
+        if any(oid in written for oid in o_ids):
+            raise ToolError("这些订单已经写入过，镜像尚未跟上，不再重复执行")
+        raise ToolError("确认时这些订单已不可处理（可能已换过或状态变了）")
+    try:
+        result = execute_insole_orders(ctx.erp, located["processable"])
+    except Exception as exc:
+        raise ToolError(str(exc)) from exc
+    ok_ids = {str(item.get("o_id") or "") for item in result.get("succeeded") or []}
+    fail_map = {
+        str(item.get("o_id") or ""): str(item.get("error") or item.get("reason") or "")
+        for item in result.get("failed") or []
+    }
+    skip_map = {
+        str(item.get("o_id") or ""): str(item.get("reason") or "")
+        for item in result.get("plans") or [] if not item.get("ok")
+    }
+    log = []
+    for row in located["processable"]:
+        oid = str(row["o_id"])
+        if oid in ok_ids:
+            log.append({"oId": oid, "targetSku": row.get("target_sku") or "", "result": "ok"})
+        elif oid in fail_map:
+            log.append({
+                "oId": oid, "targetSku": row.get("target_sku") or "",
+                "result": "failed", "error": fail_map[oid],
+            })
+        else:
+            log.append({
+                "oId": oid, "targetSku": row.get("target_sku") or "",
+                "result": "skipped", "error": skip_map.get(oid, ""),
+            })
+    writes = [
+        {"o_id": item["oId"], "target_sku": item.get("targetSku") or ""}
+        for item in log if item.get("result") == "ok" and item.get("oId")
+    ]
+    if writes:
+        remember_insole_writes(writes, root=ctx.root)
+        sync_insole_mirror(ctx.env_path, writes, mirror=getattr(ctx, "mirror", None))
+    return {
+        "okCount": result["okCount"],
+        "skippedCount": result["skippedCount"],
+        "failedCount": result["failedCount"],
+        "attempted": result["attempted"],
+        "oIds": [row["o_id"] for row in located["processable"]],
+        "failed": result.get("failed") or [],
+        "log": log,
+    }
+
+
 def _reminder_selection(arguments, ctx):
     rows, meta = ctx.rows(arguments.get("year"))
     reminders = build_reminders(rows, arguments.get("today"))
     buckets = arguments.get("buckets") or list(URGENT_BUCKETS)
     orders, matched = filter_orders(
         reminders, buckets=buckets,
-        buyer=arguments.get("buyer") or "",
+        buyer=scoped_buyers(arguments.get("buyer"), ctx),
         limit=_limit(arguments.get("limit"), 100, 500),
     )
     return reminders, orders, matched, meta
@@ -837,7 +1222,7 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
         description="按四波催办口径（T-20 / T-10 / T-1 / 逾期）汇总仍有待入库数量的采购单，可按档位、采购员、供应商过滤。",
         parameters={"type": "object", "properties": {
             "buckets": BUCKETS_PARAM,
-            "buyer": {"type": "string", "description": "采购员姓名，支持部分匹配"},
+            "buyer": {"type": "string", "description": "采购员姓名，支持部分匹配；填「我名下」只看绑定人"},
             "supplier": {"type": "string", "description": "供应商名称，支持部分匹配"},
             "limit": {"type": "integer", "description": "返回采购单条数，默认 30"},
             "year": YEAR_PARAM, "today": TODAY_PARAM,
@@ -849,7 +1234,7 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
         description="采购看板统计：单数、明细行数、采购金额、数量、已入库、待入库、入库率，以及采购员/供应商/品类金额 Top。",
         parameters={"type": "object", "properties": {
             "year": YEAR_PARAM,
-            "buyer": {"type": "string", "description": "只看某个采购员"},
+            "buyer": {"type": "string", "description": "只看某个采购员；填「我名下」只看绑定人"},
             "supplier": {"type": "string", "description": "只看某个供应商"},
         }},
         risk="L0", handler=_dashboard_summary,
@@ -893,7 +1278,7 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
     registry.register(Tool(
         name="master_data_gaps",
         description=(
-            "汇总近 N 天采购涉及的主数据缺口：供应商未在 suppliers.json 维护、SKU 无图、"
+            "汇总近 N 天采购涉及的主数据缺口：供应商未在本机供应商管理表维护、SKU 无图、"
             "所选票种缺价、分类未映射国标目录族。问「哪些供应商还没维护」「哪些 SKU 没图」时用。"
             "只读，输出 markdown 可直接发钉钉；不要逐张单猜测或编造全称/单价。"
         ),
@@ -909,13 +1294,21 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
         registry.register(Tool(
             name="search_sales_orders",
             description=(
-                "按内部订单号、平台订单号、店铺、买家或源 SKU 搜索订单镜像，返回明确 ERP o_id。"
-                "处理「异常订单」换货时：单号不明确就用这个工具，按待发货 + 含源 SKU 收候选；"
+                "按内部订单号、平台订单号、店铺、日期、状态或源 SKU 搜索订单镜像，返回明确 ERP o_id。"
+                "处理「异常订单」换货时：单号不明确就用这个工具收候选。"
+                "未指定状态且不是在查某一张明确单号时，默认只看待发货。"
                 "不要用交期催办工具。自然语言换货在 o_id 不明确时必须先调用。"
             ),
             parameters={"type": "object", "properties": {
-                "query": {"type": "string", "description": "订单号、平台单号、店铺或买家关键词，可空"},
+                "query": {"type": "string", "description": "订单号、平台单号或买家关键词，可空"},
                 "source_sku": {"type": "string", "description": "可选：订单必须包含的源 SKU"},
+                "shop": {"type": "string", "description": "可选：店铺名，部分匹配"},
+                "status": {
+                    "type": "string",
+                    "description": "订单状态，默认待发货；查某一张明确单号时可不传；传 all 表示不限状态",
+                },
+                "date_from": {"type": "string", "description": "下单日起 YYYY-MM-DD"},
+                "date_to": {"type": "string", "description": "下单日止 YYYY-MM-DD"},
                 "limit": {"type": "integer", "description": "返回条数，默认 20"},
             }},
             risk="L0", handler=_search_sales_orders,
@@ -966,6 +1359,13 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
             "invoice_type": {"type": "string", "enum": list(INVOICE_LABELS),
                              "description": "票种：no_invoice 不开票 / normal_invoice 普票 / special_invoice 专票"},
             "tax_rate": {"type": "number", "description": "税率百分数，缺省用供应商维护值"},
+            "payment_option": {
+                "type": "string",
+                "description": (
+                    "付款方式条款键，取值见 get_purchase_order 返回的 paymentOptions；"
+                    "缺省用 ERP 付款方式预选。不要自己编写付款条款。"
+                ),
+            },
             "gb_overrides": {
                 "type": "object",
                 "additionalProperties": {"type": "string"},
@@ -991,13 +1391,44 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
             risk="L1", handler=_submit_exchange, preview=_exchange_preview,
             title=lambda args: f"登记换货试算 {args.get('source_sku', '')} → {args.get('target_sku', '')}",
         ))
+        registry.register(Tool(
+            name="locate_insole_orders",
+            description=(
+                "查询抖音订单里仍挂着旧鞋垫 SKU（XZ25401308-101）的清单，"
+                "按同单鞋子毫米数映射目标鞋垫。只读，不写 ERP。"
+                "默认只把 Question / WaitConfirm 标为待处理；Delivering 只列出。"
+                "半码按码数舍去小数后映射。员工说「查一下抖音要换的鞋垫订单」时用这个。"
+            ),
+            parameters={"type": "object", "properties": {
+                "shop": {"type": "string", "description": "店铺关键词，默认抖音"},
+                "o_ids": {"type": "array", "items": {"type": "string"},
+                          "description": "可选：只看这些内部订单号"},
+            }},
+            risk="L0", handler=_locate_insole,
+        ))
+        registry.register(Tool(
+            name="process_insole_orders",
+            description=(
+                "按定位清单串行更换抖音鞋垫。必须先给出订单信息供员工确认；"
+                "员工回复「确认」后由后端写入 ERP，不要叫员工去换货页，不要再次调用本工具。"
+                "不要把 Delivering 加进执行清单。指定源→目标的普通换货仍用 submit_exchange_dry_run。"
+            ),
+            parameters={"type": "object", "properties": {
+                "shop": {"type": "string", "description": "店铺关键词，默认抖音"},
+                "o_ids": {"type": "array", "items": {"type": "string"},
+                          "description": "要处理的内部订单号；缺省为当前全部可处理单"},
+            }},
+            risk="L2", handler=_process_insole, preview=_insole_preview,
+            title=lambda args: "处理抖音鞋垫订单",
+            side_effect="erp",
+        ))
     if with_notifier:
         registry.register(Tool(
             name="send_delivery_reminder",
             description="把交期催办清单发到钉钉采购群并 @ 对应采购员。对外动作，确认前会先给出完整清单。",
             parameters={"type": "object", "properties": {
                 "buckets": BUCKETS_PARAM,
-                "buyer": {"type": "string", "description": "只催某个采购员"},
+                "buyer": {"type": "string", "description": "只催某个采购员；填「我名下」只看绑定人"},
                 "limit": {"type": "integer", "description": "最多包含多少张采购单，默认 100"},
                 "year": YEAR_PARAM, "today": TODAY_PARAM,
             }},

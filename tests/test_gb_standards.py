@@ -16,6 +16,7 @@ from backend.gb_standards import (
     load_category_map,
     lookup_product_standards,
     looks_like_standard_no,
+    mark_recommended_options,
     match_categories,
     match_contract_gb_alerts,
     match_families,
@@ -23,9 +24,13 @@ from backend.gb_standards import (
     noteworthy_transition,
     notify_contract_gb_changes,
     parse_csv_list,
+    parse_recommended_nos,
     parse_search_response,
+    query_is_standard_prefix,
     resolve_product_scope,
     search_params,
+    sort_standard_hits,
+    standard_starts_with,
 )
 
 
@@ -371,6 +376,46 @@ class GbChangeAlertTests(unittest.TestCase):
         self.assertEqual("同一批国标变更已经提醒过", second["reason"])
         self.assertEqual(1, len(sender.calls))
         self.assertIn("604264", sender.calls[0]["text"])
+
+
+class ContractGbRecommendTests(unittest.TestCase):
+    def test_prefix_matches_standard_number(self):
+        self.assertTrue(query_is_standard_prefix("GB/T 36"))
+        self.assertTrue(query_is_standard_prefix("9832"))
+        self.assertFalse(query_is_standard_prefix("毛绒玩具"))
+        self.assertTrue(standard_starts_with("GB/T 369-2008", "GB/T 36"))
+        self.assertTrue(standard_starts_with("GB/T 9832-2026", "9832"))
+        self.assertFalse(standard_starts_with("GB/T 136-2017", "GB/T 36"))
+
+    def test_prefix_hits_rank_first(self):
+        rows = [
+            {"standard_no": "GB/T 136-2017", "status": "现行", "std_type": "产品",
+             "name_cn": "无关", "issue_date": "2017-01-01"},
+            {"standard_no": "GB/T 369-2008", "status": "现行", "std_type": "产品",
+             "name_cn": "毛绒玩具", "issue_date": "2008-01-01"},
+        ]
+        ranked = sort_standard_hits(rows, "GB/T 36", product_name="毛绒熊", category="毛绒")
+        self.assertEqual("GB/T 369-2008", ranked[0]["standard_no"])
+
+    def test_model_can_only_pick_allowed_numbers(self):
+        allowed = ["GB/T 9832-2026", "GB 6675.1-2014"]
+        picked = parse_recommended_nos(
+            '先看这些：["GB/T 9832-2026", "GB/T 99999-2099", "GB 6675.1-2014"]',
+            allowed,
+        )
+        self.assertEqual(["GB/T 9832-2026", "GB 6675.1-2014"], picked)
+        self.assertEqual([], parse_recommended_nos('["GB/T 1-2009"]', allowed))
+
+    def test_recommend_marks_model_picks_first(self):
+        options = [
+            {"standardNo": "GB/T 1-2009", "status": "现行", "nameCn": "标准化工作导则"},
+            {"standardNo": "GB/T 9832-2026", "status": "即将实施", "nameCn": "毛绒、布制玩具"},
+        ]
+        marked = mark_recommended_options(options, ["GB/T 9832-2026"])
+        self.assertEqual("GB/T 9832-2026", marked[0]["standardNo"])
+        self.assertTrue(marked[0]["recommended"])
+        self.assertEqual("模型按商品信息推荐", marked[0]["recommendReason"])
+        self.assertFalse(marked[1]["recommended"])
 
 
 if __name__ == "__main__":

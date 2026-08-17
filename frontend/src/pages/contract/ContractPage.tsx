@@ -3,24 +3,15 @@ import { useSearchParams } from "react-router-dom";
 import { TopBar } from "../../components/TopBar";
 import { errorText, openBlob, publicApi } from "../../api/client";
 import { DEFAULT_RATES, INVOICE_LABELS } from "./types";
-import type { ContractItem, ContractOptions, GbOption, InvoiceType, OrderChoice, ProductImageJob } from "./types";
+import type { ContractItem, ContractOptions, InvoiceType, OrderChoice, ProductImageJob } from "./types";
+import { GbPicker } from "./GbPicker";
 import "./contract.css";
 
 type StatusKind = "" | "ok" | "error";
 
+const MANUAL_PAYMENT = "__manual__";
+
 const isPoId = (value: string) => /^\d+$/.test(value);
-
-function gbStatusKind(status: string): "critical" | "warning" | "good" | "" {
-  if (status === "废止") return "critical";
-  if (status === "即将实施") return "warning";
-  if (status === "现行") return "good";
-  return "";
-}
-
-function gbOptionLabel(option: GbOption): string {
-  const extra = option.status && option.status !== "现行" ? ` · ${option.status}` : "";
-  return `${option.standardNo} ${option.nameCn}${extra}`.trim();
-}
 
 function isAbortError(error: unknown): boolean {
   return error instanceof Error && error.name === "AbortError";
@@ -32,11 +23,37 @@ function parseFiniteNumber(value: string, label: string): number {
   return parsed;
 }
 
-/** 该票种维护了价格就用它，否则只有 ERP 单价口径匹配时才带出来 —— 不猜价格。 */
-function priceFor(item: ContractItem, mode: InvoiceType, erpPriceMode: InvoiceType | null): string {
+/** 备注首个数字优先，其次维护价，再才是 ERP 单价（票种匹配或内部户）。 */
+function priceFor(
+  item: ContractItem,
+  mode: InvoiceType,
+  erpPriceMode: InvoiceType | null,
+  useErpPrice = false,
+): string {
+  if (item.remarkPrice != null) return String(item.remarkPrice);
   const configured = item.prices[mode];
   if (configured != null) return String(configured);
-  return erpPriceMode === mode ? String(item.erpPrice) : "";
+  return useErpPrice || erpPriceMode === mode ? String(item.erpPrice) : "";
+}
+
+function paymentPreviewText(
+  order: ContractOptions,
+  optionKey: string,
+  manualText: string,
+): string {
+  const clause = optionKey === MANUAL_PAYMENT
+    ? manualText.trim()
+    : (order.paymentOptions ?? []).find((item) => item.key === optionKey)?.text ?? "";
+  const lines = [clause, `采购单号${order.purchaseOrderNo}`].filter(Boolean);
+  if (!order.supplierInternal) {
+    const extras = [
+      order.supplierBankAccountName ? `付款账户名：${order.supplierBankAccountName}` : "",
+      order.supplierBankName ? `开户行：${order.supplierBankName}` : "",
+      order.supplierBankAccount ? `账户：${order.supplierBankAccount}` : "",
+    ].filter(Boolean);
+    if (extras.length) lines.push(extras.join("    "));
+  }
+  return lines.join("\n");
 }
 
 export default function ContractPage() {
@@ -50,6 +67,10 @@ export default function ContractPage() {
   const [invoiceType, setInvoiceType] = useState<InvoiceType>("special_invoice");
   const [taxRate, setTaxRate] = useState("13");
   const [prices, setPrices] = useState<Record<string, string>>({});
+  const [paymentOption, setPaymentOption] = useState("");
+  const [paymentText, setPaymentText] = useState("");
+  const [receivingInfo, setReceivingInfo] = useState("");
+  const [inspectionExtra, setInspectionExtra] = useState("");
   const [gbSelections, setGbSelections] = useState<Record<string, string>>({});
   const [status, setStatus] = useState<{ text: string; kind: StatusKind }>({ text: "", kind: "" });
   const [previewUrl, setPreviewUrl] = useState("");
@@ -82,7 +103,9 @@ export default function ContractPage() {
 
   const applyPrices = useCallback((next: ContractOptions, mode: InvoiceType) => {
     const filled: Record<string, string> = {};
-    for (const item of next.items) filled[item.sku] = priceFor(item, mode, next.erpPriceMode);
+    for (const item of next.items) {
+      filled[item.sku] = priceFor(item, mode, next.erpPriceMode, next.useErpPrice);
+    }
     setPrices(filled);
   }, []);
 
@@ -107,14 +130,32 @@ export default function ContractPage() {
           { signal },
         );
         setOrder(data);
-        applyPrices(data, invoiceTypeRef.current);
+        const mode = data.erpPriceMode && data.erpPriceMode in INVOICE_LABELS
+          ? data.erpPriceMode
+          : invoiceTypeRef.current;
+        if (mode !== invoiceTypeRef.current) setInvoiceType(mode);
+        setTaxRate(String(data.invoiceRates[mode] ?? DEFAULT_RATES[mode]));
+        // 有预选就用预选；内部户没预选时退回手输并带出「内部往来」。
+        const internalManual = data.supplierInternal && !data.paymentOption;
+        setPaymentOption(internalManual ? MANUAL_PAYMENT : data.paymentOption);
+        setPaymentText(internalManual ? data.paymentMethod : "");
+        setReceivingInfo(data.receivingInfo || "");
+        setInspectionExtra("");
+        applyPrices(data, mode);
         applyGb(data);
-        say(
-          data.supplierMapped
-            ? "采购信息已读取，请确认票种、税率和各商品单价，然后预览。"
-            : "供应商简称尚未维护完整映射，不能生成合同。",
-          data.supplierMapped ? "ok" : "error",
-        );
+        const missingUnits = data.items.filter((item) => !item.unit).map((item) => item.sku);
+        if (!data.supplierMapped) {
+          say(data.supplierIssue || "供应商简称尚未维护完整映射，不能生成合同。", "error");
+        } else if (missingUnits.length) {
+          say(`商品 ${missingUnits.join("、")} 在商品资料里单位为空，请先在聚水潭补单位。`, "error");
+        } else {
+          say(
+            data.supplierInternal
+              ? "内部往来户，合同不列收付款信息。请确认票种、税率和单价后预览。"
+              : "采购信息已读取，请确认付款方式、票种、税率和各商品单价，然后预览。",
+            "ok",
+          );
+        }
       } catch (error) {
         if (isAbortError(error)) return;
         setOrder(null);
@@ -182,6 +223,9 @@ export default function ContractPage() {
       priceOverrides[item.sku] = parseFiniteNumber(value, `商品 ${item.sku} 的合同单价`);
     }
     if (taxRate === "") throw new Error("请填写所选票种的税率。");
+    const manual = paymentOption === MANUAL_PAYMENT;
+    if (!paymentOption) throw new Error("请选择付款方式。");
+    if (manual && !paymentText.trim()) throw new Error("请填写付款方式条款。");
     const gbOverrides: Record<string, string> = {};
     for (const item of order.items) {
       gbOverrides[item.poiId] = gbSelections[item.poiId] ?? "";
@@ -190,6 +234,10 @@ export default function ContractPage() {
       poId: order.purchaseOrderNo,
       invoiceType,
       taxRate: parseFiniteNumber(taxRate, "税率"),
+      paymentOption: manual ? "" : paymentOption,
+      paymentText: manual ? paymentText.trim() : "",
+      receivingInfo: receivingInfo.trim(),
+      inspectionExtra: inspectionExtra.trim(),
       priceOverrides,
       gbOverrides,
     };
@@ -255,7 +303,9 @@ export default function ContractPage() {
     }
   }
 
-  const canPreview = Boolean(order?.supplierMapped) && busy === "";
+  const paymentReady = paymentOption !== "" && (paymentOption !== MANUAL_PAYMENT || paymentText.trim() !== "");
+  const missingUnits = order?.items.filter((item) => !item.unit).map((item) => item.sku) ?? [];
+  const canPreview = Boolean(order?.supplierMapped) && paymentReady && missingUnits.length === 0 && busy === "";
   const missingImages = order?.items.filter((item) => !item.hasImage).length ?? 0;
 
   async function syncImages() {
@@ -296,7 +346,8 @@ export default function ContractPage() {
         ["交货日期", order.deliveryDate],
         ["采购员", order.purchaser],
         ["供应商简称", order.supplierShortName],
-        ["供方完整名称", order.supplierMapped ? order.supplierLegalName : "未维护"],
+        ["供方完整名称", order.supplierInternal ? `${order.supplierLegalName || order.supplierShortName}（内部）` : (order.supplierLegalName || "未维护")],
+        ["主数据票种", order.supplierInternal ? "内部往来，不列收付款" : (order.supplierInvoiceLabel || "未填写")],
         ["采购数量", order.totalQuantity],
         ["仓库 / 收货信息", order.warehouse || order.receiveAddress],
       ]
@@ -324,6 +375,8 @@ export default function ContractPage() {
                     loadedPoId.current = "";
                     setOrder(null);
                     setGbSelections({});
+                    setReceivingInfo("");
+                    setInspectionExtra("");
                     invalidatePreview();
                   }
                 }}
@@ -365,6 +418,23 @@ export default function ContractPage() {
                 }}
               />
             </div>
+            <div className="field payment-field">
+              <label htmlFor="payment-option">付款方式</label>
+              <select
+                id="payment-option"
+                value={paymentOption}
+                onChange={(event) => {
+                  setPaymentOption(event.target.value);
+                  invalidatePreview();
+                }}
+              >
+                <option value="">请选择付款方式</option>
+                {(order?.paymentOptions ?? []).map((option) => (
+                  <option key={option.key} value={option.key}>{option.label}</option>
+                ))}
+                <option value={MANUAL_PAYMENT}>手动输入</option>
+              </select>
+            </div>
             <button type="button" className="btn primary" disabled={!canPreview} onClick={() => void makePreview()}>
               {busy === "preview" ? "生成中…" : "预览合同"}
             </button>
@@ -372,6 +442,62 @@ export default function ContractPage() {
               下载 Excel
             </button>
           </div>
+          {order && paymentOption === MANUAL_PAYMENT ? (
+            <div className="payment-manual">
+              <label htmlFor="payment-text">付款方式条款（原样写入合同）</label>
+              <textarea
+                id="payment-text"
+                rows={2}
+                placeholder="例如：合同签订后支付30%预付款，余款验收合格后结清"
+                value={paymentText}
+                onChange={(event) => {
+                  setPaymentText(event.target.value);
+                  invalidatePreview();
+                }}
+              />
+            </div>
+          ) : null}
+          {order && paymentOption ? (
+            <div className="payment-preview">
+              写入合同：
+              <pre>{paymentPreviewText(order, paymentOption, paymentText)}</pre>
+              {order.paymentNote && paymentOption === order.paymentOption ? (
+                <em className="hint"> · {order.paymentNote}</em>
+              ) : null}
+            </div>
+          ) : null}
+          {order ? (
+            <div className="contract-extras">
+              <div className="payment-manual">
+                <label htmlFor="receiving-info">收货信息（写入表头 B6:H7 与送货地址行，可改）</label>
+                <textarea
+                  id="receiving-info"
+                  rows={3}
+                  value={receivingInfo}
+                  onChange={(event) => {
+                    setReceivingInfo(event.target.value);
+                    invalidatePreview();
+                  }}
+                />
+              </div>
+              <div className="payment-manual">
+                <label htmlFor="inspection-extra">检验标准加行（空则只用默认两条；有内容从 3 起编号）</label>
+                <textarea
+                  id="inspection-extra"
+                  rows={3}
+                  placeholder={"例如：外箱完好\n吊牌齐全"}
+                  value={inspectionExtra}
+                  onChange={(event) => {
+                    setInspectionExtra(event.target.value);
+                    invalidatePreview();
+                  }}
+                />
+                <div className="inspection-default">
+                  默认：{(order.inspectionStandards || "").split("\n").filter(Boolean).join("；")}
+                </div>
+              </div>
+            </div>
+          ) : null}
           <div className={`status ${status.kind}`} role="status">
             {status.text}
           </div>
@@ -406,7 +532,7 @@ export default function ContractPage() {
         <section className="panel">
           <div className="panel-head">
             <strong>商品、执行标准与合同单价</strong>
-            <small>执行标准可空；国标码是商品条码，与国家标准不是同一列</small>
+            <small>国标码是商品条码，与执行标准不是同一列</small>
           </div>
           {!order ? (
             <div className="empty">先选择采购单</div>
@@ -416,9 +542,11 @@ export default function ContractPage() {
                 <thead>
                   <tr>
                     <th>SKU / 款号</th>
+                    <th>国标码</th>
                     <th>商品 / 规格</th>
-                    <th>分类</th>
                     <th>执行标准</th>
+                    <th>分类</th>
+                    <th>单位</th>
                     <th>交期</th>
                     <th className="n">采购数</th>
                     <th className="n">已入库</th>
@@ -428,79 +556,34 @@ export default function ContractPage() {
                 </thead>
                 <tbody>
                   {order.items.map((item) => {
-                    const current = (item.gbOptions ?? []).filter((option) => option.status === "现行");
-                    const upcoming = (item.gbOptions ?? []).filter((option) => option.status === "即将实施");
-                    const revoked = (item.gbOptions ?? []).filter((option) => option.status === "废止");
-                    const other = (item.gbOptions ?? []).filter(
-                      (option) =>
-                        option.status !== "现行" && option.status !== "即将实施" && option.status !== "废止",
-                    );
                     const selected = gbSelections[item.poiId] ?? "";
-                    const selectedOption = (item.gbOptions ?? []).find((option) => option.standardNo === selected);
-                    const badgeKind = gbStatusKind(selectedOption?.status ?? "");
+                    const lastBuy = (item.priceHistory ?? [])[0];
                     return (
                     <tr key={item.poiId || item.sku}>
-                      <td>{item.sku + (item.styleCode ? ` / ${item.styleCode}` : "")}</td>
-                      <td>{item.name + (item.specification ? ` / ${item.specification}` : "")}</td>
-                      <td>{item.category || "—"}</td>
                       <td>
-                        {(item.gbOptions ?? []).length === 0 ? (
-                          <span className="gb-empty">该类暂无国标目录</span>
-                        ) : (
-                          <div className="gb-pick">
-                          <select
-                            className="gb-select"
-                            value={selected}
-                            onChange={(event) => {
-                              setGbSelections((currentValue) => ({
-                                ...currentValue,
-                                [item.poiId]: event.target.value,
-                              }));
-                              invalidatePreview();
-                            }}
-                          >
-                            <option value="">未选执行标准</option>
-                            {other.map((option) => (
-                              <option key={option.standardNo} value={option.standardNo}>
-                                {gbOptionLabel(option)}
-                              </option>
-                            ))}
-                            {current.length ? (
-                              <optgroup label="现行">
-                                {current.map((option) => (
-                                  <option key={option.standardNo} value={option.standardNo}>
-                                    {gbOptionLabel(option)}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            ) : null}
-                            {upcoming.length ? (
-                              <optgroup label="即将实施">
-                                {upcoming.map((option) => (
-                                  <option key={option.standardNo} value={option.standardNo}>
-                                    {gbOptionLabel(option)}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            ) : null}
-                            {revoked.length ? (
-                              <optgroup label="废止">
-                                {revoked.map((option) => (
-                                  <option key={option.standardNo} value={option.standardNo}>
-                                    {gbOptionLabel(option)}
-                                  </option>
-                                ))}
-                              </optgroup>
-                            ) : null}
-                          </select>
-                          {selectedOption?.status ? (
-                            <span className={`gb-badge${badgeKind ? ` ${badgeKind}` : ""}`}>
-                              {selectedOption.status}
-                            </span>
-                          ) : null}
-                          </div>
-                        )}
+                        {item.sku + (item.styleCode ? ` / ${item.styleCode}` : "")}
                       </td>
+                      <td>{item.nationalCode || "—"}</td>
+                      <td>
+                        {item.name + (item.specification ? ` / ${item.specification}` : "")}
+                        {item.remark ? <div className="sku-extra">备注 {item.remark}</div> : null}
+                      </td>
+                      <td>
+                        <GbPicker
+                          item={item}
+                          selected={selected}
+                          onSelect={(picked) => {
+                            setGbSelections((currentValue) => ({
+                              ...currentValue,
+                              [item.poiId]: picked,
+                            }));
+                            invalidatePreview();
+                          }}
+                          onError={(text) => say(text, "error")}
+                        />
+                      </td>
+                      <td>{item.category || "—"}</td>
+                      <td className={item.unit ? "" : "unit-missing"}>{item.unit || "未维护"}</td>
                       <td>{item.deliveryDate || "—"}</td>
                       <td className="n">{item.quantity}</td>
                       <td className="n">{item.inQuantity}</td>
@@ -519,6 +602,29 @@ export default function ContractPage() {
                             invalidatePreview();
                           }}
                         />
+                        {item.remarkPrice != null ? (
+                          <div className="price-history">备注解析 {item.remarkPrice}</div>
+                        ) : null}
+                        {lastBuy ? (
+                          <div className="price-history">
+                            <span title={`${item.priceHistory.length} 次历史采购`}>
+                              上次 {lastBuy.price}（{lastBuy.date} · {lastBuy.poId}）
+                            </span>
+                            <button
+                              type="button"
+                              className="link-btn"
+                              disabled={prices[item.sku] === String(lastBuy.price)}
+                              onClick={() => {
+                                setPrices((current) => ({ ...current, [item.sku]: String(lastBuy.price) }));
+                                invalidatePreview();
+                              }}
+                            >
+                              采用
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="price-history muted">无历史采购</div>
+                        )}
                       </td>
                     </tr>
                     );

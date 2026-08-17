@@ -5,6 +5,8 @@
 """
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -25,7 +27,7 @@ from backend.agent import (
 )
 from backend.agent.llm import LLMClient
 from backend.dingtalk.identity import StaffDirectory
-from backend.staff_names import WEB_OPERATOR_UNBOUND
+from backend.staff_names import VIEWER_WRITE_DENIED, WEB_OPERATOR_UNBOUND
 
 
 class FakeLLM:
@@ -314,10 +316,13 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("search_sales_orders", full.names())
         self.assertIn("get_sales_order_items", full.names())
         self.assertIn("submit_exchange_dry_run", full.names())
+        self.assertIn("locate_insole_orders", full.names())
+        self.assertIn("process_insole_orders", full.names())
         self.assertIn("send_delivery_reminder", full.names())
         lean = build_registry(with_forecast=False, with_exchange=False, with_notifier=False)
         self.assertNotIn("forecast_demand", lean.names())
         self.assertNotIn("search_sales_orders", lean.names())
+        self.assertNotIn("locate_insole_orders", lean.names())
         self.assertNotIn("send_delivery_reminder", lean.names())
         self.assertIn("delivery_reminders", lean.names())
         self.assertIn("gb_catalog_status", lean.names())
@@ -344,6 +349,10 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("执行标准", prompt)
         self.assertIn("gb_catalog_status", prompt)
         self.assertIn("master_data_gaps", prompt)
+        self.assertIn("locate_insole_orders", prompt)
+        self.assertIn("process_insole_orders", prompt)
+        self.assertIn("抖音鞋垫", prompt)
+        self.assertIn("不要叫员工去换货页", prompt)
 
     def test_risk_levels_and_confirmation_requirements(self):
         registry = build_registry()
@@ -360,6 +369,15 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(by_name["generate_purchase_contract"]["needsConfirm"])
         self.assertEqual("L2", by_name["send_delivery_reminder"]["risk"])
         self.assertTrue(by_name["send_delivery_reminder"]["needsConfirm"])
+        self.assertEqual("read", by_name["delivery_reminders"]["permission"])
+        self.assertEqual("write", by_name["generate_purchase_contract"]["permission"])
+        self.assertEqual("file", by_name["generate_purchase_contract"]["sideEffect"])
+        self.assertEqual("notify", by_name["send_delivery_reminder"]["permission"])
+        self.assertEqual("notify", by_name["send_delivery_reminder"]["sideEffect"])
+        self.assertEqual("L0", by_name["locate_insole_orders"]["risk"])
+        self.assertEqual("L2", by_name["process_insole_orders"]["risk"])
+        self.assertTrue(by_name["process_insole_orders"]["needsConfirm"])
+        self.assertEqual("erp", by_name["process_insole_orders"]["sideEffect"])
 
     def test_schemas_are_openai_function_shaped(self):
         for schema in build_registry().schemas():
@@ -649,7 +667,9 @@ class MasterDataGapsTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_summarises_recent_gaps(self):
-        result = self.tool.handler({"days": 30, "today": "2026-08-13"}, self.ctx)
+        wrapped = self.tool.handler({"days": 30, "today": "2026-08-13"}, self.ctx)
+        self.assertTrue(wrapped["ok"])
+        result = wrapped["data"]
         self.assertEqual(3, result["rowCount"])
         self.assertEqual(["乙"], [item["name"] for item in result["missingSuppliers"]])
         self.assertEqual({"SKU-NO", "SKU-NOPRICE"}, {item["sku"] for item in result["missingImages"]})
@@ -664,11 +684,11 @@ class MasterDataGapsTests(unittest.TestCase):
     def test_invoice_type_narrows_price_gaps(self):
         result = self.tool.handler(
             {"days": 30, "today": "2026-08-13", "invoice_type": "special_invoice"}, self.ctx,
-        )
+        )["data"]
         self.assertEqual({"SKU-NO", "SKU-NOPRICE"}, {item["sku"] for item in result["missingPrices"]})
         normal = self.tool.handler(
             {"days": 30, "today": "2026-08-13", "invoice_type": "normal_invoice"}, self.ctx,
-        )
+        )["data"]
         self.assertEqual(["SKU-NO"], [item["sku"] for item in normal["missingPrices"]])
 
 
@@ -830,6 +850,139 @@ class RetentionTests(AgentTestCase):
         self.assertIn("该留", remaining)
         self.assertNotIn("该删", remaining)
         self.assertFalse(stale.exists())
+
+
+class RequestContextAndEnvelopeTests(AgentTestCase):
+    def test_web_and_dingtalk_share_bound_user_id(self):
+        directory = StaffDirectory(self.store)
+        directory.upsert("张三", dingtalk_user_id="u-zhang")
+        agent = self.runner([text_answer("web"), text_answer("ding")], directory=directory)
+        web = agent.chat(message="问", session_key="w1", operator="张三", channel="web")
+        ding = agent.chat(
+            message="问", session_key="d1", operator="张三", channel="dingtalk", actor_id="u-zhang",
+        )
+        self.assertEqual("u-zhang", web["userId"])
+        self.assertEqual("u-zhang", ding["userId"])
+        self.assertEqual({"u-zhang"}, {row["userId"] for row in self.audit.recent_runs()})
+
+    def test_l0_result_uses_envelope(self):
+        agent = self.runner([tool_answer("read_orders", {"query": "604264"}), text_answer("查到了")])
+        agent.chat(message="查一下 604264", session_key="s1", operator="张三")
+        payload = json.loads(agent.llm.calls[1]["messages"][-1]["content"])
+        self.assertTrue(payload["ok"])
+        self.assertIn("summary", payload)
+        self.assertIn("604264", payload["data"]["orders"])
+        self.assertIn("604264", self.audit.recent_tools()[0]["resultSummary"])
+
+    def test_search_sales_orders_schema_has_candidate_filters(self):
+        tool = build_registry(with_exchange=True).get("search_sales_orders")
+        props = tool.parameters["properties"]
+        for key in ("status", "shop", "date_from", "date_to", "source_sku"):
+            self.assertIn(key, props)
+
+    def test_bound_operator_exposes_role_and_buyer_names(self):
+        directory = StaffDirectory(self.store)
+        directory.upsert("利特", dingtalk_user_id="u-lite", aliases=["李佳冬（利特）"])
+        agent = self.runner([text_answer("好")], directory=directory)
+        answer = agent.chat(message="问", session_key="s1", operator="利特")
+        self.assertEqual("operator", answer["role"])
+        self.assertIn("利特", answer["buyerNames"])
+        self.assertIn("李佳冬（利特）", answer["buyerNames"])
+
+
+class SessionSerialAndRoleTests(AgentTestCase):
+    def test_same_session_chats_run_one_after_another(self):
+        events = []
+        lock = threading.Lock()
+
+        class SerialLLM:
+            model = "fake-model"
+            configured = True
+
+            def status(self):
+                return {"configured": True, "model": self.model}
+
+            def chat(self, messages, *, tools=None, tool_choice="auto"):
+                with lock:
+                    events.append("enter")
+                time.sleep(0.08)
+                with lock:
+                    events.append("leave")
+                return {"role": "assistant", "content": "ok", "tool_calls": []}
+
+        agent = AgentRunner(
+            registry=self.registry, llm=SerialLLM(), sessions=self.sessions,
+            actions=self.actions, audit=self.audit, context=self.context,
+        )
+        errors = []
+
+        def run(text):
+            try:
+                agent.chat(message=text, session_key="same", operator="张三")
+            except Exception as exc:
+                errors.append(exc)
+
+        first = threading.Thread(target=run, args=("一",))
+        second = threading.Thread(target=run, args=("二",))
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+        self.assertEqual([], errors)
+        self.assertEqual(["enter", "leave", "enter", "leave"], events)
+
+    def test_viewer_cannot_create_pending_write(self):
+        directory = StaffDirectory(self.store)
+        directory.upsert("看客", dingtalk_user_id="u-view", role="viewer")
+        agent = self.runner(
+            [tool_answer("make_file", {"po_id": "604264"}), text_answer("不能写")],
+            directory=directory,
+        )
+        answer = agent.chat(message="生成合同", session_key="s1", operator="看客", channel="web")
+        self.assertEqual([], self.executed)
+        self.assertEqual([], answer["pendingActions"])
+        payload = json.loads(agent.llm.calls[1]["messages"][-1]["content"])
+        self.assertEqual(VIEWER_WRITE_DENIED, payload["error"])
+        self.assertEqual("viewer", payload["permission"]["role"])
+
+    def test_viewer_cannot_confirm(self):
+        directory = StaffDirectory(self.store)
+        directory.upsert("利特", dingtalk_user_id="u-lite")
+        directory.upsert("看客", dingtalk_user_id="u-view", role="viewer")
+        agent = self.runner(
+            [tool_answer("make_file", {"po_id": "604264"}), text_answer("请确认")],
+            directory=directory,
+        )
+        created = agent.chat(message="生成合同", session_key="s1", operator="利特", channel="web")
+        action_id = created["pendingActions"][0]["id"]
+        with self.assertRaises(ActionError) as caught:
+            agent.confirm(action_id, operator="看客", channel="web")
+        self.assertEqual(403, caught.exception.status)
+        self.assertEqual(VIEWER_WRITE_DENIED, str(caught.exception))
+        self.assertEqual([], self.executed)
+
+    def test_self_scope_uses_bound_buyer_names(self):
+        from backend.agent.tools import scoped_buyers
+
+        directory = StaffDirectory(self.store)
+        directory.upsert("利特", dingtalk_user_id="u-lite", aliases=["李佳冬（利特）"])
+        seen = {}
+
+        def peek(arguments, ctx):
+            seen["buyers"] = scoped_buyers(arguments.get("buyer"), ctx)
+            return {"ok": True, "summary": "范围已解析"}
+
+        self.registry.register(Tool(
+            name="peek_scope", description="看范围",
+            parameters={"type": "object", "properties": {"buyer": {"type": "string"}}},
+            risk="L0", handler=peek,
+        ))
+        agent = self.runner(
+            [tool_answer("peek_scope", {"buyer": "我名下"}), text_answer("好")],
+            directory=directory,
+        )
+        agent.chat(message="我名下逾期", session_key="s1", operator="利特")
+        self.assertEqual(["利特", "李佳冬（利特）"], seen["buyers"])
 
 
 if __name__ == "__main__":

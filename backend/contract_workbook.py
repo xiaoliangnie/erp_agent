@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """用 openpyxl 把合同模型写成采购单工作簿。
 
-布局与已下线的 generate_contract.mjs 对齐：16 列 A–P、明细从第 9 行起、
-小计 ``=N{row}*L{row}``、合计 ``=SUM(O…)``。国标码（E，商品条码）写文本并
-使用 ``@`` 格式，不再用 ``=TEXT`` 公式；执行标准（F，GB/T…）仍为文本。
+16 列 A–P、明细从第 9 行起、小计 ``=N{row}*L{row}``、合计 ``=SUM(O…)``。
+国标码（E，商品条码）写文本并使用 ``@`` 格式；品名在 F，执行标准（G，GB/T…）紧随品名。
+需方收货信息占 A6:A7 / B6:H7；一条明细时送货地址落在第 14 行。
+明细备注写在 Q 列，不进 A–P 合同区。
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ SHEET_NAME = "合同"
 ITEM_START = 9
 COLUMN_COUNT = 16
 COLUMN_WIDTHS = [
-    13.34, 17, 17, 17, 16.58, 16.5, 19.64, 8.4,
+    13.34, 17, 17, 17, 16.58, 19.64, 16.5, 8.4,
     9.06, 15.2, 16.93, 12.34, 12.34, 12.7, 12.34, 8.68,
 ]
 IMAGE_COL = 1  # B
@@ -101,6 +102,8 @@ def format_tax_rate_text(value):
 
 def unit_price_header(invoice):
     invoice = invoice or {}
+    if not invoice.get("type"):
+        return "单价"
     if invoice.get("type") == "no_invoice":
         return "单价（不开票）"
     rate = format_tax_rate_text(invoice.get("taxRate") or 0)
@@ -132,15 +135,17 @@ def _build_sheet(sheet, model, items, layout, temp_dir):
         sheet.merge_cells(address)
 
     _write_header(sheet, model)
-    _write_items(sheet, items, layout, temp_dir)
+    _write_items(sheet, items, layout, temp_dir, blank=bool(model.get("isTemplate")))
     _write_footer(sheet, model, layout)
     _apply_styles(sheet, layout)
+    _place_local_remarks(sheet, layout)
 
 
 def _merges(layout):
     return [
         "A1:P2", "A3:B3", "C3:P3",
-        "B4:H4", "J4:P4", "B5:H5", "J5:P5", "B6:H6", "J6:P6", "B7:H7", "J7:P7",
+        "B4:H4", "J4:P4", "B5:H5", "J5:P5",
+        "A6:A7", "B6:H7", "J6:P6", "J7:P7",
         f"A{layout.total_row}:N{layout.total_row}",
         f"B{layout.packaging_row}:P{layout.packaging_row}",
         f"B{layout.payment_row}:P{layout.payment_row}",
@@ -171,32 +176,34 @@ def _write_header(sheet, model):
     sheet["B5"] = _text(buyer.get("company_name"))
     sheet["I5"] = "供方："
     sheet["J5"] = _text(supplier.get("legalName"))
-    sheet["A6"] = "送货地址："
-    sheet["B6"] = _text(buyer.get("warehouse_name"))
+    sheet["A6"] = "收货信息"
+    sheet["B6"] = _text(model.get("receivingInfo") or model.get("deliveryAddress"))
     sheet["I6"] = "地址："
     sheet["J6"] = _text(supplier.get("address"))
-    sheet["A7"] = "联系人："
-    sheet["B7"] = _text(buyer.get("contact") or model.get("deliveryAddress"))
     sheet["I7"] = "联系人："
     sheet["J7"] = _text(supplier.get("contact"))
     headers = [
-        "序号", "图片", "款式编码", "商品编码", "国标码", "执行标准", "品名", "分类",
+        "序号", "图片", "款式编码", "商品编码", "国标码", "品名", "执行标准", "分类",
         "虚拟分类", "材质工艺", "包装方式", "数量", "单位", unit_price_header(invoice),
         "小计：元", "备注",
     ]
     for column, value in enumerate(headers, start=1):
         sheet.cell(8, column, value)
+    sheet.cell(8, 17, "备注")
 
 
-def _write_items(sheet, items, layout, temp_dir):
+def _write_items(sheet, items, layout, temp_dir, *, blank=False):
     for index, item in enumerate(items):
         row = layout.item_start + index
+        sheet.cell(row, 15, f"=N{row}*L{row}")
+        if blank:
+            continue
         sheet.cell(row, 1, index + 1)
         sheet.cell(row, 3, _text(item.get("styleCode")))
         sheet.cell(row, 4, _text(item.get("sku")))
         sheet.cell(row, 5, _text(item.get("nationalCode")))
-        sheet.cell(row, 6, _text(item.get("gbStandard")))
-        sheet.cell(row, 7, _text(item.get("name")))
+        sheet.cell(row, 6, _text(item.get("name")))
+        sheet.cell(row, 7, _text(item.get("gbStandard")))
         sheet.cell(row, 8, _text(item.get("category")))
         sheet.cell(row, 9, _text(item.get("virtualCategory")))
         sheet.cell(row, 10, _text(item.get("materialProcess")))
@@ -204,8 +211,7 @@ def _write_items(sheet, items, layout, temp_dir):
         sheet.cell(row, 12, item.get("quantity") if item.get("quantity") is not None else 0)
         sheet.cell(row, 13, _text(item.get("unit") or "个"))
         sheet.cell(row, 14, float(item.get("unitPrice") or 0))
-        sheet.cell(row, 15, f"=N{row}*L{row}")
-        sheet.cell(row, 16, _text(item.get("remark")))
+        sheet.cell(row, 17, _text(item.get("remark")))
         _place_item_image(sheet, row, item.get("imagePath"), temp_dir)
 
 
@@ -239,6 +245,7 @@ def _apply_styles(sheet, layout):
     _style(sheet, "A1:P2", font=FONT_TITLE, alignment=ALIGN_CENTER)
     _style(sheet, "B4:H4", number_format=DATE_FORMAT)
     _style(sheet, "J4:P4", number_format=DATE_FORMAT)
+    _style(sheet, "A4:P7", alignment=ALIGN_CENTER)
     _style(sheet, "A8:P8", font=FONT_BODY, alignment=ALIGN_CENTER)
     item_range = f"A{layout.item_start}:P{layout.item_end}"
     _style(sheet, item_range, font=FONT_ITEM, alignment=ALIGN_CENTER)
@@ -264,15 +271,35 @@ def _apply_styles(sheet, layout):
     )
     for row in (1, 2):
         sheet.row_dimensions[row].height = 18
-    for row in range(3, 8):
+    for row in range(3, 6):
         sheet.row_dimensions[row].height = 23
+    for row in (6, 7):
+        sheet.row_dimensions[row].height = 32
     sheet.row_dimensions[8].height = 34
+    _style(
+        sheet, f"A{layout.parties_row}:P{layout.parties_row}",
+        alignment=ALIGN_CENTER,
+    )
+    _style(sheet, "Q8", font=FONT_BODY, alignment=ALIGN_CENTER)
+    if layout.item_end >= layout.item_start:
+        _style(
+            sheet, f"Q{layout.item_start}:Q{layout.item_end}",
+            font=FONT_ITEM, alignment=ALIGN_LEFT, number_format=TEXT_FORMAT,
+        )
     for row in range(layout.item_start, layout.item_end + 1):
         sheet.row_dimensions[row].height = ITEM_ROW_HEIGHT
     sheet.row_dimensions[layout.total_row].height = 23
     sheet.row_dimensions[layout.terms_row].height = 270
     sheet.row_dimensions[layout.parties_row].height = 24
     sheet.row_dimensions[layout.signatures_row].height = 24
+
+
+def _place_local_remarks(sheet, layout):
+    """备注写在可见的 Q 列，打印区仍只到 P，预览按 A–P 出图。"""
+    sheet.cell(8, 17, "备注")
+    sheet.column_dimensions["Q"].hidden = False
+    sheet.column_dimensions["Q"].width = 28
+    sheet.print_area = f"A1:P{layout.final_row}"
 
 
 def _place_item_image(sheet, row, image_path, temp_dir):

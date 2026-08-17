@@ -10,6 +10,21 @@ __pycache__/
 .DS_Store
 node_modules
 frontend/dist/
+files/outputs/*
+!files/outputs/.gitkeep
+files/data/*.sqlite3
+files/data/*.sqlite3-*
+files/data/product-images/
+files/data/models/
+files/data/*.log
+files/data/health_watch_state.json
+files/data/insole_written.json
+files/data/secrets/
+files/config/staff_bindings.json
+files/config/供应商管理.xlsx
+files/config/*供应商*.xlsx
+files/config/payment_history.json
+# 旧顶栏目录若残留，继续忽略运行时文件
 outputs/*
 !outputs/.gitkeep
 data/*.sqlite3
@@ -19,4 +34,7 @@ data/models/
 data/*.log
 data/health_watch_state.json
 config/staff_bindings.json
+config/供应商管理.xlsx
+config/*供应商*.xlsx
+config/payment_history.json
 docs/api.txt

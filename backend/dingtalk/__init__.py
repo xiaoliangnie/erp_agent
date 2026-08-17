@@ -36,7 +36,8 @@ def build_dingtalk(*, setting, store, audit, flag, root=None):
         )
     directory = StaffDirectory(store)
     if root:
-        directory.seed_from_json(Path(root) / "config" / "staff_bindings.json")
+        from ..paths import local_dir
+        directory.seed_from_json(local_dir("config", root=root) / "staff_bindings.json")
     notifier = ReminderNotifier(
         sender=sender, directory=directory, audit=audit,
         title=setting("DINGTALK_REMINDER_TITLE", "采购交期催办"),

@@ -16,8 +16,14 @@ from .actions import ActionError, PendingActions
 from .audit import AuditLog, summarize
 from .llm import LLMClient, LLMError
 from .sessions import SessionStore, encode_tool_result
-from ..staff_names import WEB_OPERATOR_UNBOUND
-from .tools import RISK_LEVELS, ToolContext, ToolError, ToolRegistry, declared_arguments
+from ..staff_names import VIEWER_WRITE_DENIED, WEB_OPERATOR_UNBOUND
+from .context import resolve_request_context
+from .intents import INSOLE_PROCESS, INSOLE_QUERY, classify_intent
+from .permissions import CAPABILITY_INSOLE_PROCESS, check_capability
+from .tools import (
+    RISK_LEVELS, PermissionDenied, ToolContext, ToolError, ToolRegistry,
+    as_tool_envelope, declared_arguments,
+)
 from .validate import validate_arguments
 
 
@@ -38,6 +44,12 @@ SYSTEM_PROMPT = """你是「蜀黍家」采购供应链助手，服务对象是�
   含源 SKU，可加店铺/日期）和订单明细；结果不唯一就列出候选并追问，不允许猜测。
   参数明确后调用 submit_exchange_dry_run，仍需员工确认登记，dry-run 完成后还要在换货页
   二次确认，才会实际修改 ERP。
+- 员工说查询或处理「抖音鞋垫订单」时：先 locate_insole_orders 列出内部单号、平台单号、
+  状态、店铺、鞋码和目标 SKU；要处理再调用 process_insole_orders。确认前必须把订单信息
+  讲清楚。半码按码数舍去小数后映射，不得把 Delivering 加进执行清单。
+  已有待确认动作时不要再次调用 process_insole_orders。员工回复「确认」后由后端串行写 ERP，
+  写完钉钉会再发一条【任务完成】结果日志。不要叫员工去换货页，不要说你没有确认入口或
+  不能主动通知，也不要让员工靠反复查询来猜是否写完。
 - 「异常订单」第一期只处理 SKU 替换：同款换规格、指定源→目标、已维护的白名单跨款。
   备注异常、超卖、地址错误等没有配置规则，说明做不了，不得自行定义、筛选或拿换货硬套。
   采购逾期走催办工具，不要和订单换货混用。
@@ -53,7 +65,10 @@ SYSTEM_PROMPT = """你是「蜀黍家」采购供应链助手，服务对象是�
 - 交期取该行 item_delivery_date，为空退到最早预计到货日期，都没有算未排期。
 - 四波催办：逾期（剩余 < 0）/ T-1（0~1 天）/ T-10（2~10 天）/ T-20（11~20 天）。
 
-今天是 {today}。当前员工：{operator}。当前渠道：{channel}。
+今天是 {today}。当前员工：{operator}。角色：{role}。当前渠道：{channel}。
+绑定采购员（「我名下」）：{buyers}。
+员工说「我名下」时，buyer 填「我名下」或绑定姓名，不要填别人的名字。
+viewer 只能查询，不要调用需要确认的工具。
 可用工具（风险级 / 说明）：
 {tools}"""
 
@@ -83,13 +98,33 @@ class AgentRunner:
         self.summary_trigger = max(1, int(summary_trigger))
         self.summary_keep = max(1, int(summary_keep))
         self.max_tool_calls = max(1, int(max_tool_calls))
-        self._usage = {"prompt_tokens": 0, "completion_tokens": 0}
 
     def _web_staff_allowed(self, operator: str, channel: str) -> bool:
         """网页 L1/L2 必须对上员工绑定表；钉钉渠道和未注入目录时不拦（离线测试仍可用）。"""
         if channel != "web" or self.directory is None:
             return True
         return bool(self.directory.known_operator(operator))
+
+    def _assert_tool_allowed(self, tool, request) -> None:
+        if tool.channels and request.channel not in tool.channels:
+            raise PermissionDenied(
+                f"工具 {tool.name} 不能在 {request.channel} 渠道使用",
+                role=request.role, tool=tool.name, permission=tool.permission,
+                channel=request.channel,
+            )
+        if request.role == "viewer" and (tool.needs_confirm or tool.permission != "read"):
+            raise PermissionDenied(
+                VIEWER_WRITE_DENIED,
+                role=request.role, tool=tool.name, permission=tool.permission,
+                channel=request.channel,
+            )
+        if tool.side_effect == "erp":
+            check_capability(
+                self.directory,
+                operator=request.operator, actor_id=request.actor_id,
+                channel=request.channel, role=request.role,
+                capability=CAPABILITY_INSOLE_PROCESS,
+            )
 
     @property
     def available(self) -> bool:
@@ -108,15 +143,19 @@ class AgentRunner:
             "tools": self.registry.catalog(),
         }
 
-    def system_prompt(self, operator: str, channel: str) -> str:
+    def system_prompt(self, operator: str, channel: str, *, role: str = "operator",
+                      buyer_names=()) -> str:
         tools = "\n".join(
             f"- {item['name']}（{item['risk']} {item['riskLabel']}）：{item['description']}"
             for item in self.registry.catalog()
         )
+        buyers = "、".join(buyer_names) if buyer_names else "未绑定"
         return SYSTEM_PROMPT.format(
             today=business_today().isoformat(),
             operator=operator or "未署名",
+            role=role or "operator",
             channel=channel,
+            buyers=buyers,
             tools=tools,
         )
 
@@ -132,64 +171,166 @@ class AgentRunner:
 
         session = self.sessions.ensure(channel, session_key, operator)
         session_id = session["id"]
+        with self.sessions.lock_for(session_id):
+            return self._chat_locked(
+                message=message, session=session, operator=operator,
+                channel=channel, actor_id=actor_id, session_key=session_key,
+            )
+
+    def _chat_locked(self, *, message, session, operator, channel, actor_id, session_key) -> dict:
+        session_id = session["id"]
         operator = operator or session.get("operator") or ""
+        request = resolve_request_context(
+            self.directory, operator=operator, channel=channel, actor_id=actor_id,
+            session_key=session_key,
+        )
+        operator = request.operator or operator
         run_id = self.audit.start_run(
             session_id=session_id, channel=channel, operator=operator,
-            request=message, model=self.llm.model,
+            user_id=request.user_id, request=message, model=self.llm.model,
         )
         self.sessions.add_message(session_id, "user", message, run_id=run_id)
+        intent = classify_intent(message)
+        if intent is not None:
+            return self._dispatch_intent(intent, session, request, run_id)
         memory = ""
         if self.memories and self.memories.enabled and self.directory and operator:
             if self.directory.known_operator(operator):
                 memory = self.memories.prompt_block(operator)
         messages = self.sessions.context_messages(
             session_id,
-            system=self.system_prompt(operator, channel),
+            system=self.system_prompt(
+                operator, channel, role=request.role, buyer_names=request.buyer_names,
+            ),
             memory=memory,
             summary=self.sessions.latest_summary(session_id),
         )
         steps: list[dict] = []
         pending: list[dict] = []
         started = time.monotonic()
-        self._usage = {"prompt_tokens": 0, "completion_tokens": 0}
+        usage = {"prompt_tokens": 0, "completion_tokens": 0}
         try:
             reply = self._loop(
-                messages, steps, pending, session_id, run_id, operator, channel, actor_id,
+                messages, steps, pending, session_id, run_id, request, usage,
             )
         except (LLMError, ToolError, ValueError) as exc:
             self.audit.finish_run(run_id, status="failed", steps=len(steps),
                                   duration_ms=int((time.monotonic() - started) * 1000), error=str(exc),
-                                  prompt_tokens=self._usage["prompt_tokens"],
-                                  completion_tokens=self._usage["completion_tokens"])
+                                  prompt_tokens=usage["prompt_tokens"],
+                                  completion_tokens=usage["completion_tokens"])
             raise
         except Exception as exc:
             self.audit.finish_run(run_id, status="failed", steps=len(steps),
                                   duration_ms=int((time.monotonic() - started) * 1000),
                                   error=f"{type(exc).__name__}: {exc}",
-                                  prompt_tokens=self._usage["prompt_tokens"],
-                                  completion_tokens=self._usage["completion_tokens"])
+                                  prompt_tokens=usage["prompt_tokens"],
+                                  completion_tokens=usage["completion_tokens"])
             raise
         self.sessions.add_message(session_id, "assistant", reply, run_id=run_id)
         self.audit.finish_run(run_id, status="ok", reply=reply, steps=len(steps),
                               duration_ms=int((time.monotonic() - started) * 1000),
-                              prompt_tokens=self._usage["prompt_tokens"],
-                              completion_tokens=self._usage["completion_tokens"])
+                              prompt_tokens=usage["prompt_tokens"],
+                              completion_tokens=usage["completion_tokens"])
         self._maybe_summarize(session_id)
         return {
             "ok": True,
             "sessionId": session_id,
             "runId": run_id,
             "operator": operator,
+            "userId": request.user_id,
+            "traceId": request.trace_id,
+            "role": request.role,
+            "buyerNames": list(request.buyer_names),
+            "usage": dict(usage),
             "reply": reply,
             "steps": steps,
             "pendingActions": pending,
         }
 
-    def _loop(self, messages, steps, pending, session_id, run_id, operator, channel,
-              actor_id="") -> str:
+    def handle_intent(self, message: str, *, session_key: str, operator: str = "",
+                      channel: str = "web", actor_id: str = "") -> dict | None:
+        """固定意图不走 LLM。未识别返回 None，由调用方再走 chat。"""
+        message = str(message or "").strip()
+        intent = classify_intent(message)
+        if intent is None:
+            return None
+        session = self.sessions.ensure(channel, session_key, operator)
+        with self.sessions.lock_for(session["id"]):
+            request = resolve_request_context(
+                self.directory, operator=operator or session.get("operator") or "",
+                channel=channel, actor_id=actor_id, session_key=session_key,
+            )
+            run_id = self.audit.start_run(
+                session_id=session["id"], channel=channel,
+                operator=request.operator or operator, user_id=request.user_id,
+                request=message, model="intent",
+            )
+            self.sessions.add_message(session["id"], "user", message, run_id=run_id)
+            return self._dispatch_intent(intent, session, request, run_id)
+
+    def _dispatch_intent(self, intent, session, request, run_id) -> dict:
+        started = time.monotonic()
+        tool_name = "locate_insole_orders" if intent.name == INSOLE_QUERY else "process_insole_orders"
+        if intent.name not in {INSOLE_QUERY, INSOLE_PROCESS}:
+            tool_name = ""
+        result, action = ({"error": f"未实现的意图 {intent.name}"}, None)
+        if tool_name:
+            result, action = self._invoke(
+                {"function": {
+                    "name": tool_name,
+                    "arguments": json.dumps(intent.arguments or {}, ensure_ascii=False),
+                }},
+                session["id"], run_id, request,
+            )
+        if isinstance(result, dict) and result.get("error"):
+            reply = str(result["error"])
+            status = "error"
+            pending = []
+        elif action:
+            preview = action.get("preview") or {}
+            reply = str(preview.get("markdown") or action.get("title") or "请核对订单后确认。")
+            note = preview.get("note")
+            if note:
+                reply = f"{reply}\n{note}"
+            status = "awaiting_confirm"
+            pending = [action]
+        else:
+            data = result.get("data") if isinstance(result, dict) else None
+            reply = ""
+            if isinstance(data, dict):
+                reply = str(data.get("markdown") or "")
+            if not reply and isinstance(result, dict):
+                reply = str(result.get("summary") or "没有待处理的鞋垫订单。")
+            status = "ok"
+            pending = []
+        steps = [{"tool": tool_name or intent.name, "status": status}]
+        self.sessions.add_message(session["id"], "assistant", reply, run_id=run_id)
+        self.audit.finish_run(
+            run_id, status="ok" if status != "error" else "failed",
+            reply=reply, steps=len(steps),
+            duration_ms=int((time.monotonic() - started) * 1000),
+            error=reply if status == "error" else "",
+        )
+        return {
+            "ok": status != "error",
+            "sessionId": session["id"],
+            "runId": run_id,
+            "operator": request.operator,
+            "userId": request.user_id,
+            "traceId": request.trace_id,
+            "role": request.role,
+            "buyerNames": list(request.buyer_names),
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "reply": reply,
+            "steps": steps,
+            "pendingActions": pending,
+            "intent": intent.name,
+        }
+
+    def _loop(self, messages, steps, pending, session_id, run_id, request, usage) -> str:
         for step in range(self.max_steps):
             answer = self.llm.chat(messages, tools=self.registry.schemas())
-            self._add_usage(answer.get("usage"))
+            self._add_usage(answer.get("usage"), usage)
             tool_calls = answer.get("tool_calls") or []
             if len(tool_calls) > self.max_tool_calls:
                 tool_calls = tool_calls[:self.max_tool_calls]
@@ -202,9 +343,7 @@ class AgentRunner:
             self.sessions.add_message(session_id, "assistant", answer.get("content") or "",
                                       run_id=run_id, tool_calls=tool_calls)
             for call in tool_calls:
-                result, action = self._invoke(
-                    call, session_id, run_id, operator, channel, actor_id,
-                )
+                result, action = self._invoke(call, session_id, run_id, request)
                 steps.append({
                     "step": step + 1,
                     "tool": (call.get("function") or {}).get("name") or "",
@@ -228,12 +367,16 @@ class AgentRunner:
                                           name=tool_message["name"], tool_call_id=tool_message["tool_call_id"])
         return "这轮需要的工具调用超过了步数上限，请把问题拆小一点再问（比如只问一个采购单或一个档位）。"
 
-    def _invoke(self, call, session_id, run_id, operator, channel, actor_id=""):
+    def _invoke(self, call, session_id, run_id, request):
         """执行一次工具调用；L1/L2 只登记待确认动作。"""
         function = call.get("function") or {}
         name = str(function.get("name") or "")
         raw_arguments = function.get("arguments") or "{}"
         started = time.monotonic()
+        operator = request.operator
+        channel = request.channel
+        actor_id = request.actor_id
+        user_id = request.user_id
         try:
             arguments = json.loads(raw_arguments) if isinstance(raw_arguments, str) else dict(raw_arguments)
             if not isinstance(arguments, dict):
@@ -241,8 +384,12 @@ class AgentRunner:
             tool = self.registry.get(name)
             arguments = declared_arguments(tool, arguments)
             arguments = validate_arguments(tool, arguments)
-            ctx = self.context.for_caller(operator=operator, channel=channel,
-                                          session_id=session_id, run_id=run_id)
+            ctx = self.context.for_caller(
+                operator=operator, user_id=user_id, channel=channel,
+                session_id=session_id, run_id=run_id,
+                role=request.role, buyer_names=request.buyer_names,
+            )
+            self._assert_tool_allowed(tool, request)
             if tool.needs_confirm:
                 if not self._web_staff_allowed(operator, channel):
                     raise ToolError(WEB_OPERATOR_UNBOUND)
@@ -253,17 +400,30 @@ class AgentRunner:
                 if not isinstance(preview, dict):
                     preview = {"value": preview}
                 preview = {**preview, "arguments": arguments}
+                if tool.name == "process_insole_orders" and session_id:
+                    existing = self._reuse_insole_pending(
+                        session_id, arguments, operator, actor_id,
+                    )
+                    if existing:
+                        return {
+                            "status": "awaiting_confirm",
+                            "actionId": existing["id"],
+                            "risk": f"{tool.risk} {RISK_LEVELS[tool.risk]}",
+                            "expiresAt": existing["expiresAt"],
+                            "preview": existing.get("preview") or preview,
+                            "message": "已有待确认动作。请让员工直接回复「确认」，由后端写入 ERP，不要去换货页，也不要再次调用本工具。",
+                        }, existing
                 action = self.actions.create(
                     tool=tool.name, risk=tool.risk, arguments=arguments,
                     title=tool.title(arguments) if tool.title else tool.name,
-                    preview=preview, operator=operator, channel=channel,
+                    preview=preview, operator=operator, user_id=user_id, channel=channel,
                     session_id=session_id, run_id=run_id, actor_id=actor_id,
                 )
                 self.audit.record_tool(
                     tool=name, risk=tool.risk, status="awaiting_confirm", arguments=arguments,
                     result={"actionId": action["id"]}, run_id=run_id, session_id=session_id,
-                    pending_action_id=action["id"], operator=operator, channel=channel,
-                    duration_ms=int((time.monotonic() - started) * 1000),
+                    pending_action_id=action["id"], operator=operator, user_id=user_id,
+                    channel=channel, duration_ms=int((time.monotonic() - started) * 1000),
                 )
                 return {
                     "status": "awaiting_confirm",
@@ -271,31 +431,100 @@ class AgentRunner:
                     "risk": f"{tool.risk} {RISK_LEVELS[tool.risk]}",
                     "expiresAt": action["expiresAt"],
                     "preview": preview,
-                    "message": "已生成待确认动作，尚未执行。请向员工说明要点并等待确认。",
+                    "message": (
+                        "已生成待确认动作，尚未执行。鞋垫换货请让员工直接回复「确认」，"
+                        "由后端串行写入 ERP，不要去换货页，也不要再次调用本工具。"
+                        if tool.name == "process_insole_orders"
+                        else "已生成待确认动作，尚未执行。请向员工说明要点并等待确认。"
+                    ),
                 }, action
-            result = tool.handler(arguments, ctx)
+            result = as_tool_envelope(tool.handler(arguments, ctx))
             self.audit.record_tool(
                 tool=name, risk=tool.risk, status="ok", arguments=arguments, result=result,
-                run_id=run_id, session_id=session_id, operator=operator, channel=channel,
-                duration_ms=int((time.monotonic() - started) * 1000),
+                run_id=run_id, session_id=session_id, operator=operator, user_id=user_id,
+                channel=channel, duration_ms=int((time.monotonic() - started) * 1000),
             )
             return result, None
         except (ToolError, ActionError, ValueError, RuntimeError) as exc:
             self.audit.record_tool(
                 tool=name, status="error", arguments={"raw": summarize(raw_arguments)},
                 error=str(exc), run_id=run_id, session_id=session_id, operator=operator,
-                channel=channel, duration_ms=int((time.monotonic() - started) * 1000),
+                user_id=user_id, channel=channel,
+                duration_ms=int((time.monotonic() - started) * 1000),
             )
-            return {"error": str(exc)}, None
+            payload = {"error": str(exc)}
+            if isinstance(exc, PermissionDenied):
+                payload["permission"] = exc.decision
+            return payload, None
         except Exception as exc:
             logger.exception("Agent tool error [%s]", name)
             self.audit.record_tool(
                 tool=name, status="error", arguments={"raw": summarize(raw_arguments)},
                 error=f"{type(exc).__name__}: {exc}", run_id=run_id, session_id=session_id,
-                operator=operator, channel=channel,
+                operator=operator, user_id=user_id, channel=channel,
                 duration_ms=int((time.monotonic() - started) * 1000),
             )
             return {"error": f"工具 {name} 执行失败，请稍后重试或联系维护人"}, None
+
+    def _open_insole_actions(self, session_id: str) -> list[dict]:
+        return [
+            item for item in self.actions.list(session_id=session_id, status="pending")
+            if item.get("tool") == "process_insole_orders"
+        ]
+
+    def _cancel_extra_insole(self, actions: list[dict], keep_id: str,
+                             operator: str, actor_id: str) -> None:
+        for item in actions:
+            if item["id"] == keep_id:
+                continue
+            try:
+                self.actions.cancel(item["id"], operator, actor_id=actor_id)
+            except ActionError:
+                pass
+
+    def _reuse_insole_pending(self, session_id: str, arguments: dict,
+                              operator: str, actor_id: str) -> dict | None:
+        """同一会话只保留一条鞋垫待确认，避免重复调用再生成新动作。"""
+        opens = self._open_insole_actions(session_id)
+        if not opens:
+            return None
+        wanted = set(arguments.get("o_ids") or [])
+        keep = next(
+            (item for item in opens
+             if set((item.get("arguments") or {}).get("o_ids") or []) == wanted),
+            None,
+        )
+        if keep:
+            self._cancel_extra_insole(opens, keep["id"], operator, actor_id)
+            return keep
+        self._cancel_extra_insole(opens, "", operator, actor_id)
+        return None
+
+    def confirm_latest(self, operator: str = "", *, channel: str = "web",
+                       actor_id: str = "", session_key: str = "") -> dict:
+        """钉钉只回「确认」时，执行当前会话最近一条待确认动作。"""
+        session = self.sessions.ensure(channel, session_key, operator)
+        action = self.actions.latest_open(session_id=session["id"])
+        if action is None and actor_id:
+            action = self.actions.latest_open(actor_id=actor_id)
+        if action is None:
+            raise ActionError("当前没有待确认的动作。请先查询并处理鞋垫订单。", 404)
+        if action.get("tool") == "process_insole_orders" and action.get("sessionId"):
+            self._cancel_extra_insole(
+                self._open_insole_actions(action["sessionId"]),
+                action["id"], operator, actor_id,
+            )
+        return self.confirm(action["id"], operator, channel=channel, actor_id=actor_id)
+
+    def cancel_latest(self, operator: str = "", *, channel: str = "web",
+                      actor_id: str = "", session_key: str = "") -> dict:
+        session = self.sessions.ensure(channel, session_key, operator)
+        action = self.actions.latest_open(session_id=session["id"])
+        if action is None and actor_id:
+            action = self.actions.latest_open(actor_id=actor_id)
+        if action is None:
+            raise ActionError("当前没有待取消的动作。", 404)
+        return self.cancel(action["id"], operator, channel=channel, actor_id=actor_id)
 
     def confirm(self, action_id: str, operator: str = "", channel: str = "web",
                 actor_id: str = "") -> dict:
@@ -307,11 +536,25 @@ class AgentRunner:
                 raise ActionError("还没绑定采购员姓名，不能确认。请先回复「绑定 姓名」。", 403)
         action = self.actions.get(action_id)
         tool = self.registry.get(action["tool"])
+        request = resolve_request_context(
+            self.directory, operator=operator, channel=channel, actor_id=actor_id,
+        )
+        if request.role == "viewer":
+            raise ActionError(VIEWER_WRITE_DENIED, 403)
+        session_id = action.get("sessionId") or ""
+        if session_id:
+            with self.sessions.lock_for(session_id):
+                return self._confirm_execute(action_id, operator, actor_id, request, tool)
+        return self._confirm_execute(action_id, operator, actor_id, request, tool)
 
+    def _confirm_execute(self, action_id, operator, actor_id, request, tool) -> dict:
         def executor(name, arguments, current):
             ctx = self.context.for_caller(
-                operator=current["operator"] or operator, channel=current["channel"] or channel,
+                operator=current["operator"] or operator,
+                user_id=current.get("userId") or request.user_id,
+                channel=current["channel"] or request.channel,
                 session_id=current["sessionId"], run_id=current["runId"], action_id=current["id"],
+                role=request.role, buyer_names=request.buyer_names,
             )
             started = time.monotonic()
             try:
@@ -321,15 +564,15 @@ class AgentRunner:
                     tool=name, risk=tool.risk, status="error", arguments=arguments,
                     error=f"{type(exc).__name__}: {exc}", run_id=current["runId"],
                     session_id=current["sessionId"], pending_action_id=current["id"],
-                    operator=ctx.operator, channel=ctx.channel,
+                    operator=ctx.operator, user_id=ctx.user_id, channel=ctx.channel,
                     duration_ms=int((time.monotonic() - started) * 1000),
                 )
                 raise
             self.audit.record_tool(
                 tool=name, risk=tool.risk, status="executed", arguments=arguments, result=result,
                 run_id=current["runId"], session_id=current["sessionId"],
-                pending_action_id=current["id"], operator=ctx.operator, channel=ctx.channel,
-                duration_ms=int((time.monotonic() - started) * 1000),
+                pending_action_id=current["id"], operator=ctx.operator, user_id=ctx.user_id,
+                channel=ctx.channel, duration_ms=int((time.monotonic() - started) * 1000),
             )
             return result
 
@@ -349,6 +592,11 @@ class AgentRunner:
         if channel == "dingtalk" and self.directory is not None:
             if not actor_id or not self.directory.get_by_dingtalk_user_id(actor_id):
                 raise ActionError("还没绑定采购员姓名，不能取消。请先回复「绑定 姓名」。", 403)
+        request = resolve_request_context(
+            self.directory, operator=operator, channel=channel, actor_id=actor_id,
+        )
+        if request.role == "viewer":
+            raise ActionError(VIEWER_WRITE_DENIED, 403)
         return self.actions.cancel(action_id, operator, actor_id=actor_id)
 
     def _maybe_summarize(self, session_id: str) -> None:
@@ -380,11 +628,11 @@ class AgentRunner:
         except Exception:
             logger.exception("Session summary failed")
 
-    def _add_usage(self, usage) -> None:
-        if not isinstance(usage, dict):
+    def _add_usage(self, incoming, bucket) -> None:
+        if not isinstance(incoming, dict) or not isinstance(bucket, dict):
             return
-        self._usage["prompt_tokens"] += int(usage.get("prompt_tokens") or 0)
-        self._usage["completion_tokens"] += int(usage.get("completion_tokens") or 0)
+        bucket["prompt_tokens"] += int(incoming.get("prompt_tokens") or 0)
+        bucket["completion_tokens"] += int(incoming.get("completion_tokens") or 0)
 
     def pending(self, *, session_id: str | None = None, limit: int = 20) -> list[dict]:
         return self.actions.list(session_id=session_id, limit=limit)

@@ -122,9 +122,8 @@ def main():
         model.fit(dataset)
         metrics = evaluate(model, dataset, args.holdout_days)
 
-        directory = Path(args.model_dir or setting("FORECAST_MODEL_DIR", "data/models"))
-        if not directory.is_absolute():
-            directory = ROOT / directory
+        from backend.paths import resolve_repo_path
+        directory = resolve_repo_path(args.model_dir or setting("FORECAST_MODEL_DIR", "files/data/models"))
         metadata = ForecastStore(directory).save(
             model, version=args.version, mark_latest=not args.no_latest,
             metadata={

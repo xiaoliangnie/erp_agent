@@ -363,6 +363,130 @@ def fetch_contract_order(po_id, env_path="hanli.env", *, fixture_path=None):
     return order, items
 
 
+_MASTER_PLACEHOLDERS = {"", "null", "none", "undefined", "nil"}
+
+
+def clean_master_text(value) -> str:
+    """商品主数据里的空值：接口常把未填写成 JSON null 或字面量 'null'。"""
+    text = str(value or "").strip()
+    return "" if text.lower() in _MASTER_PLACEHOLDERS else text
+
+
+def _is_missing_table(exc: BaseException) -> bool:
+    try:
+        code = int(exc.args[0])
+    except (IndexError, TypeError, ValueError):
+        code = None
+    if code in {1146, 1054}:
+        return True
+    text = str(exc).lower()
+    return "doesn't exist" in text or "unknown table" in text or "unknown column" in text
+
+
+def fetch_product_master(env_path, sku_ids, style_ids=()):
+    """SKU / 款式编码 → 商品主数据（名称、单位、分类、条码、虚拟分类）。
+
+    合同在 `config/products.json` 没维护时用它兜底这些字段；**单价不在此列**，
+    单价仍然只认配置或 ERP 单头价。表不存在返回空 dict；连库失败要抛给调用方，
+    不能装成「商品没维护」。
+    """
+    skus = [str(sku).strip() for sku in dict.fromkeys(sku_ids or []) if str(sku).strip()]
+    styles = [str(sid).strip() for sid in dict.fromkeys(style_ids or []) if str(sid).strip()]
+    if not skus and not styles:
+        return {}
+    clauses = []
+    params = []
+    if skus:
+        clauses.append(f"sku_id IN ({','.join(['%s'] * len(skus))})")
+        params.extend(skus)
+    if styles:
+        clauses.append(f"i_id IN ({','.join(['%s'] * len(styles))})")
+        params.extend(styles)
+    sql = (
+        f"SELECT sku_id, i_id, name, unit, category, brand, properties_value, "
+        f"JSON_UNQUOTE(JSON_EXTRACT(source_payload, '$.sku_code')) AS sku_code, "
+        f"JSON_UNQUOTE(JSON_EXTRACT(source_payload, '$.vc_name')) AS vc_name "
+        f"FROM `{REALTIME_PRODUCT_TABLE}` WHERE {' OR '.join(clauses)}"
+    )
+    try:
+        with connect(env_path, autocommit=True) as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(sql, tuple(params))
+                rows = cursor.fetchall() or []
+    except Exception as exc:
+        if _is_missing_table(exc):
+            return {}
+        raise
+    master = {}
+    for row in rows:
+        record = {
+            "name": clean_master_text(row.get("name")),
+            "unit": clean_master_text(row.get("unit")),
+            "category": clean_master_text(row.get("category")),
+            "brand": clean_master_text(row.get("brand")),
+            "specification": clean_master_text(row.get("properties_value")),
+            "national_code": clean_master_text(row.get("sku_code")),
+            "virtual_category": clean_master_text(row.get("vc_name")),
+        }
+        sku = str(row.get("sku_id") or "").strip()
+        style = str(row.get("i_id") or "").strip()
+        if sku:
+            master[sku] = record
+        # 款式编码只作次级键，已有 SKU 命中时不覆盖。
+        if style and style not in master:
+            master[style] = record
+    return master
+
+
+def fetch_supplier_price_history(env_path, seller, sku_ids, *, exclude_po_id=None, depth=3):
+    """同一供应商同一 SKU 的最近几次采购价，供合同页做单价参考。
+
+    只回本单之前的记录；``depth`` 是每颗 SKU 最多回几条。查不到就返回空 dict，
+    不影响合同生成。
+    """
+    seller = str(seller or "").strip()
+    unique = [str(sku).strip() for sku in dict.fromkeys(sku_ids or []) if str(sku).strip()]
+    if not seller or not unique:
+        return {}
+    depth = max(1, min(int(depth), 10))
+    marks = ",".join(["%s"] * len(unique))
+    exclude_sql = "AND i.po_id <> %s" if exclude_po_id else ""
+    sql = f"""
+        SELECT sku_id, price, qty, po_id, po_date
+        FROM (
+            SELECT i.sku_id, i.price, i.qty, i.po_id, m.po_date,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY i.sku_id ORDER BY m.po_date DESC, i.po_id DESC
+                   ) AS rn
+            FROM `{REALTIME_ITEM_TABLE}` i
+            JOIN `{REALTIME_MAIN_TABLE}` m ON m.po_id = i.po_id
+            WHERE m.seller = %s AND i.sku_id IN ({marks}) {exclude_sql}
+              AND COALESCE(i.price, 0) > 0
+        ) ranked
+        WHERE rn <= %s
+        ORDER BY sku_id, rn
+    """
+    params = [seller, *unique]
+    if exclude_po_id:
+        params.append(str(exclude_po_id))
+    params.append(depth)
+    history = {}
+    with connect(env_path, autocommit=True) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(sql, tuple(params))
+            for row in cursor.fetchall() or []:
+                sku = str(row.get("sku_id") or "")
+                if not sku:
+                    continue
+                history.setdefault(sku, []).append({
+                    "price": float(row.get("price") or 0),
+                    "quantity": float(row.get("qty") or 0),
+                    "poId": str(row.get("po_id") or ""),
+                    "date": str(row.get("po_date") or "")[:10],
+                })
+    return history
+
+
 def fetch_contract_order_choices(env_path="hanli.env", limit=100, query=""):
     """搜索本年度可用于生成合同的采购单，供页面选择。"""
     limit = max(1, min(int(limit), 1000))

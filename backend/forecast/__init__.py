@@ -2,7 +2,7 @@
 """销量预测与订货建议子系统。
 
 对外只暴露 `Forecaster` 接口和 `ForecastService`：模型换实现、换训练方式都不影响
-调用方。接入自己训练的模型见 `docs/预测模型接入.md`。
+调用方。接入自己训练的模型见 `docs/预测.md`。
 """
 from .dataset import (
     DataUnavailable,

@@ -175,7 +175,7 @@ class ExcelLayoutTests(unittest.TestCase):
             b"\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82"
         )
         model = _sample_model(items=[
-            _sample_item(imagePath=str(png)),
+            _sample_item(imagePath=str(png), remark="包体32+2个魔术贴标3.45"),
             _sample_item(
                 poiId="102", sku="SKU-B", nationalCode="ABC-01",
                 gbStandard="", imagePath=None, quantity=2, unitPrice=8.5,
@@ -188,27 +188,42 @@ class ExcelLayoutTests(unittest.TestCase):
         headers = [ws.cell(8, col).value for col in range(1, 17)]
         self.assertEqual(16, len(headers))
         self.assertEqual("国标码", headers[4])
-        self.assertEqual("执行标准", headers[5])
-        self.assertLess(headers.index("国标码"), headers.index("执行标准"))
+        self.assertEqual("品名", headers[5])
+        self.assertEqual("执行标准", headers[6])
+        self.assertLess(headers.index("国标码"), headers.index("品名"))
+        self.assertLess(headers.index("品名"), headers.index("执行标准"))
         self.assertEqual(unit_price_header(model["invoice"]), headers[13])
         self.assertIn("13%", headers[13])
         self.assertIn("专票", headers[13])
         self.assertEqual("6901234567890", ws["E9"].value)
         self.assertFalse(str(ws["E9"].value).startswith("="))
         self.assertEqual("@", ws["E9"].number_format)
-        self.assertEqual("GB/T 9832-2007", ws["F9"].value)
+        self.assertEqual("小熊", ws["F9"].value)
+        self.assertEqual("GB/T 9832-2007", ws["G9"].value)
         self.assertEqual("ABC-01", ws["E10"].value)
-        self.assertFalse(ws["F10"].value)
+        self.assertFalse(ws["G10"].value)
         self.assertEqual(10, ws["L9"].value)
         self.assertEqual("=N9*L9", ws["O9"].value)
         self.assertEqual("=N10*L10", ws["O10"].value)
         self.assertEqual(f"=SUM(O{layout.item_start}:O{layout.item_end})", ws["O11"].value)
         merged = {str(item) for item in ws.merged_cells.ranges}
         self.assertIn("A1:P2", merged)
+        self.assertIn("A6:A7", merged)
+        self.assertIn("B6:H7", merged)
         self.assertIn(f"A{layout.total_row}:N{layout.total_row}", merged)
+        self.assertEqual("收货信息", ws["A6"].value)
+        self.assertEqual("center", ws["B4"].alignment.horizontal)
+        self.assertEqual("center", ws["B5"].alignment.horizontal)
+        self.assertEqual("center", ws["J5"].alignment.horizontal)
+        self.assertEqual("center", ws["B6"].alignment.horizontal)
         self.assertEqual(1, len(ws._images))
         self.assertEqual("暂无图片", ws["B10"].value)
         self.assertIsNone(ws["B9"].value)
+        self.assertIsNone(ws["P9"].value)
+        self.assertEqual("包体32+2个魔术贴标3.45", ws["Q9"].value)
+        self.assertEqual("备注", ws["Q8"].value)
+        self.assertFalse(bool(ws.column_dimensions["Q"].hidden))
+        self.assertIn(f"$A$1:$P${layout.final_row}", ws.print_area or "")
         wb.close()
 
     def test_decimal_quantity_is_written_not_truncated(self):
@@ -221,6 +236,48 @@ class ExcelLayoutTests(unittest.TestCase):
         self.assertEqual(100.6, float(wb["合同"]["L9"].value))
         self.assertNotEqual(100, wb["合同"]["L9"].value)
         self.assertEqual("=N9*L9", wb["合同"]["O9"].value)
+        wb.close()
+
+    def test_one_item_puts_delivery_address_on_row_14(self):
+        from openpyxl import load_workbook
+        from backend.contract_workbook import layout_for
+
+        model = _sample_model()
+        path = self._write(model, "one-item.xlsx")
+        wb = load_workbook(path)
+        ws = wb["合同"]
+        layout = layout_for(1)
+        self.assertEqual(14, layout.address_row)
+        self.assertEqual("送货地址", ws["A14"].value)
+        self.assertEqual("鄂州仓：默认收货信息", ws["B14"].value)
+        self.assertEqual("鄂州仓：默认收货信息", ws["B6"].value)
+        self.assertEqual("收货信息", ws["A6"].value)
+        wb.close()
+
+    def test_blank_template_keeps_fixed_fields_and_empty_po(self):
+        from openpyxl import load_workbook
+        from backend.contracts import DEFAULT_RECEIVING_INFO, write_blank_contract_template
+
+        path = write_blank_contract_template(self.dir / "采购合同模板.xlsx")
+        wb = load_workbook(path)
+        ws = wb["合同"]
+        self.assertEqual("杭 州 无 际 云 帆 采 购 单", ws["A1"].value)
+        self.assertEqual("需方：", ws["A5"].value)
+        self.assertEqual("杭州无际云帆文化传媒有限公司", ws["B5"].value)
+        self.assertEqual("收货信息", ws["A6"].value)
+        self.assertEqual(DEFAULT_RECEIVING_INFO, ws["B6"].value)
+        self.assertIsNone(ws["B4"].value)
+        self.assertFalse(ws["J5"].value)
+        self.assertEqual("国标码", ws["E8"].value)
+        self.assertEqual("品名", ws["F8"].value)
+        self.assertEqual("执行标准", ws["G8"].value)
+        self.assertEqual("单价", ws["N8"].value)
+        self.assertIsNone(ws["A9"].value)
+        self.assertEqual("=N9*L9", ws["O9"].value)
+        self.assertEqual("送货地址", ws["A14"].value)
+        self.assertEqual(DEFAULT_RECEIVING_INFO, ws["B14"].value)
+        self.assertEqual("包装", ws["A11"].value)
+        self.assertEqual("检验标准", ws["A13"].value)
         wb.close()
 
     def test_no_invoice_header_and_empty_items_fail(self):
@@ -308,7 +365,8 @@ def _sample_model(*, invoice_type="special_invoice", tax_rate=13, items=None, **
         "packagingTerms": "包装条款",
         "paymentTerms": "100% - 现结\n采购单号604264",
         "inspectionStandards": "检验条款",
-        "deliveryAddress": "送货地址全文",
+        "receivingInfo": "鄂州仓：默认收货信息",
+        "deliveryAddress": "鄂州仓：默认收货信息",
         "terms": ["1、条款一", "2、条款二"],
         "applicant": "采购员",
     }
