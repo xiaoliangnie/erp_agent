@@ -93,6 +93,40 @@ class BrowserSession:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._context.storage_state(path=str(path))
 
+    def start_trace(self) -> bool:
+        ctx = self._context
+        if ctx is None:
+            return False
+        try:
+            ctx.tracing.start(screenshots=True, snapshots=True)
+            return True
+        except Exception:
+            return False
+
+    def stop_trace(self, path) -> bool:
+        ctx = self._context
+        if ctx is None:
+            return False
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            ctx.tracing.stop(path=str(path))
+            return True
+        except Exception:
+            logger.debug("ERP Playwright trace 未能保存", exc_info=True)
+            return False
+
+    def screenshot(self, path) -> bool:
+        page = self.page
+        if page is None or not hasattr(page, "screenshot"):
+            return False
+        try:
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(path), full_page=True)
+            return True
+        except Exception:
+            logger.debug("ERP 截图失败", exc_info=True)
+            return False
+
     def goto(self, url: str, *, timeout=60000):
         if self.page is None:
             raise ErpError("浏览器尚未启动")

@@ -30,8 +30,10 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.6.0';
+  const VERSION = '0.7.0';
   const DEFAULT_WRITE_DELAY_MS = 250;
+  const DEFAULT_WRITE_CONCURRENCY = 1;
+  const MAX_WRITE_CONCURRENCY = 8;
   const DEFAULT_FORBIDDEN = '取消|退款|关闭|Cancelled|Delete|Merged';
 
   function erp() {
@@ -58,6 +60,30 @@
 
   function sleep(ms) {
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
+  }
+
+  function writeConcurrency(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return DEFAULT_WRITE_CONCURRENCY;
+    return Math.max(1, Math.min(MAX_WRITE_CONCURRENCY, Math.floor(parsed)));
+  }
+
+  function mapPool(items, limit, worker) {
+    const results = new Array(items.length);
+    let cursor = 0;
+    function next() {
+      if (cursor >= items.length) return Promise.resolve();
+      const index = cursor;
+      cursor += 1;
+      return Promise.resolve(worker(items[index], index)).then(function (value) {
+        results[index] = value;
+        return next();
+      });
+    }
+    const width = Math.max(1, Math.min(writeConcurrency(limit), items.length));
+    const starters = [];
+    for (let i = 0; i < width; i += 1) starters.push(next());
+    return Promise.all(starters).then(function () { return results; });
   }
 
   function currentOrder(oid) {
@@ -359,6 +385,7 @@
    * @param {object[]} input.plans  通常来自 plan() 结果中 ok=true 的项
    * @param {boolean} input.confirm 必须为 true
    * @param {number} [input.delayMs=250]
+   * @param {number} [input.concurrency=1] 同页同时进行的 ChangeItem 路数
    * @param {function} [input.onProgress] (event) => void
    */
   async function execute(input) {
@@ -371,14 +398,13 @@
     if (!runnable.length) throw new Error('没有可执行的试算明细（plans 中 ok=true 为空）');
     const delayMs = Number(input.delayMs);
     const wait = Number.isFinite(delayMs) && delayMs >= 0 ? delayMs : DEFAULT_WRITE_DELAY_MS;
+    const concurrency = writeConcurrency(input.concurrency);
     const onProgress = typeof input.onProgress === 'function' ? input.onProgress : null;
-    const succeeded = [];
-    const failed = [];
-    for (let index = 0; index < runnable.length; index += 1) {
-      const planItem = runnable[index];
+    const started = Date.now();
+    const outcomes = await mapPool(runnable, concurrency, async function (planItem, index) {
+      if (concurrency === 1 && index > 0 && wait > 0) await sleep(wait);
       try {
         const item = await changeItem(planItem);
-        succeeded.push(item);
         if (onProgress) {
           onProgress({
             index: index + 1,
@@ -387,9 +413,9 @@
             o_id: planItem.o_id,
           });
         }
+        return { ok: true, item: item };
       } catch (error) {
         const item = { o_id: planItem.o_id, error: String(error) };
-        failed.push(item);
         if (onProgress) {
           onProgress({
             index: index + 1,
@@ -399,13 +425,22 @@
             error: String(error),
           });
         }
+        return { ok: false, item: item };
       }
-      if (index + 1 < runnable.length && wait > 0) await sleep(wait);
-    }
+    });
+    const succeeded = [];
+    const failed = [];
+    outcomes.forEach(function (row) {
+      if (!row) return;
+      if (row.ok) succeeded.push(row.item);
+      else failed.push(row.item);
+    });
     return {
       succeeded: succeeded,
       failed: failed,
       attempted: runnable.length,
+      concurrency: concurrency,
+      elapsedMs: Date.now() - started,
       finishedAt: new Date().toISOString(),
     };
   }
@@ -424,6 +459,7 @@
       plans: plans,
       confirm: options.confirm === true,
       delayMs: options.delayMs,
+      concurrency: options.concurrency,
       onProgress: options.onProgress,
     });
   }

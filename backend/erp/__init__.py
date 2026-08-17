@@ -3,8 +3,9 @@
 
 from .config import ALLOWED_COMMANDS, load_digital_worker, load_worker_secrets
 from .errors import ErpError, ErpUnknownResult
+from .keepalive import ErpKeepAlive, in_keepalive_window
 from .loop import DigitalWorkerLoop
-from .runtime import DigitalRuntime
+from .runtime import DigitalRuntime, public_worker_status
 from .session import playwright_available
 
 __all__ = [
@@ -12,8 +13,11 @@ __all__ = [
     "DigitalRuntime",
     "DigitalWorkerLoop",
     "ErpError",
+    "ErpKeepAlive",
     "ErpUnknownResult",
+    "in_keepalive_window",
     "load_digital_worker",
     "load_worker_secrets",
     "playwright_available",
+    "public_worker_status",
 ]

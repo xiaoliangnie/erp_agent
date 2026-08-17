@@ -56,7 +56,7 @@ from .business_time import business_today
 from .staff_names import WEB_OPERATOR_UNBOUND
 from .product_images import ProductImageError, ProductImageService
 from .order_source import OrderSourceError, fetch_exchange_order_items, fetch_exchange_orders
-from .erp import DigitalRuntime, DigitalWorkerLoop
+from .erp import DigitalRuntime, DigitalWorkerLoop, ErpKeepAlive, public_worker_status
 from .realtime_mirror import build_mirror_from_settings
 from .gb_standards import (
     build_gb_sync_from_settings,
@@ -91,7 +91,7 @@ LEGACY_PAGES = {
     "/换货": "/exchange",
     "/对话": "/chat",
 }
-# 用户脚本与可注入核心不属于单页应用，仍按原路径单独提供。
+# 换货核心给 Playwright 注入；油猴脚本已退役，路径仍提供以免旧书签 404。
 STATIC_FILES = {
     "/js/exchange-worker.user.js": FRONTEND / "js" / "exchange-worker.user.js",
     "/js/jst-order-exchange.core.js": FRONTEND / "js" / "jst-order-exchange.core.js",
@@ -124,14 +124,22 @@ EXCHANGE_DATABASE_PATH = resolve_repo_path(
     setting("EXCHANGE_DATABASE_PATH", "files/data/exchange_jobs.sqlite3"),
 )
 EXCHANGE = ExchangeService(EXCHANGE_DATABASE_PATH)
-DIGITAL_WORKER = DigitalWorkerLoop(
-    DigitalRuntime.from_settings(setting, root=ROOT),
-    EXCHANGE,
-    poll_seconds=float(setting("ERP_AI_POLL_SECONDS", "3") or 3),
-)
 PRODUCT_IMAGES = ProductImageService(
     resolve_repo_path(setting("PRODUCT_IMAGE_DATABASE_PATH", "files/data/product_image_jobs.sqlite3")),
     resolve_repo_path(setting("PRODUCT_IMAGE_CACHE_DIR", "files/data/product-images")),
+)
+DIGITAL_WORKER = DigitalWorkerLoop(
+    DigitalRuntime.from_settings(setting, root=ROOT),
+    EXCHANGE,
+    images=PRODUCT_IMAGES,
+    poll_seconds=float(setting("ERP_AI_POLL_SECONDS", "3") or 3),
+)
+ERP_KEEPALIVE = ErpKeepAlive(
+    DIGITAL_WORKER.runtime,
+    enabled=flag(setting("ERP_AI_KEEPALIVE_ENABLED", "true")),
+    start_time=setting("ERP_AI_KEEPALIVE_START", "09:30"),
+    end_time=setting("ERP_AI_KEEPALIVE_END", "18:30"),
+    interval_seconds=int(setting("ERP_AI_KEEPALIVE_INTERVAL_SECONDS", "180") or 180),
 )
 REALTIME_MIRROR, REALTIME_MIRROR_SCHEDULER = build_mirror_from_settings(
     setting, root=ROOT, env_path=REALTIME_ENV_PATH,
@@ -526,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             query = parse_qs(parsed.query)
             if path == "/api/exchange/worker/images/next":
-                return self.json_response({"job": PRODUCT_IMAGES.next(query.get("worker_id", [""])[0])})
+                return self.json_response({"job": None, "executor": "backend"})
             if path == "/api/exchange/products":
                 products = fetch_exchange_products(
                     REALTIME_ENV_PATH,
@@ -565,16 +573,11 @@ class Handler(BaseHTTPRequestHandler):
             if match:
                 return self.json_response(EXCHANGE.get_job(match.group(1)))
             if path == "/api/exchange/worker/jobs/next":
-                if DIGITAL_WORKER.claims_jobs:
-                    return self.json_response({"job": None, "executor": "backend"})
-                worker_id = query.get("worker_id", [""])[0]
-                return self.json_response({"job": EXCHANGE.next_job(worker_id)})
+                return self.json_response({"job": None, "executor": "backend"})
             if path == "/api/exchange/worker/searches/next":
-                worker_id = query.get("worker_id", [""])[0]
-                return self.json_response({"search": EXCHANGE.next_search(worker_id)})
+                return self.json_response({"search": None, "executor": "backend"})
             if path == "/api/exchange/worker/probes/next":
-                worker_id = query.get("worker_id", [""])[0]
-                return self.json_response({"probe": EXCHANGE.next_probe(worker_id)})
+                return self.json_response({"probe": None, "executor": "backend"})
             search_match = re.fullmatch(r"/api/exchange/searches/([a-f0-9]{24})", path)
             if search_match:
                 return self.json_response(EXCHANGE.get_search(search_match.group(1)))
@@ -1009,7 +1012,10 @@ class Handler(BaseHTTPRequestHandler):
             "realtimeMirror": _safe_status(REALTIME_MIRROR_SCHEDULER.status),
             "gbStandards": _safe_status(GB_STANDARDS_SCHEDULER.status),
             "exchange": _safe_status(EXCHANGE.status),
-            "erpWorker": _safe_status(DIGITAL_WORKER.status),
+            "erpWorker": _safe_status(lambda: public_worker_status({
+                **DIGITAL_WORKER.status(),
+                "keepAlive": ERP_KEEPALIVE.status(),
+            })),
             "agent": _safe_status(lambda: {
                 "enabled": AGENT.enabled, "available": AGENT.available,
                 "llm": AGENT.llm.status(), "tools": len(AGENT.registry.names()),
@@ -1167,9 +1173,14 @@ def main():
     MAINTENANCE.start()
     erp_status = DIGITAL_WORKER.start()
     if erp_status.get("running"):
-        logger.info("ERP Digital Worker 已启用：换货执行走后端 Playwright")
-    elif flag(setting("ERP_AI_ENABLED", "false")):
+        logger.info("ERP Digital Worker 已启用：换货、探测、搜 SKU、商品图片走后端 Playwright")
+    elif flag(setting("ERP_AI_ENABLED", "true")):
         logger.warning("ERP Digital Worker 未启动：%s", erp_status.get("lastError") or "未知原因")
+    keep_status = ERP_KEEPALIVE.start()
+    if keep_status.get("running"):
+        logger.info("ERP 登录态保活已启用：%s", keep_status.get("window"))
+    elif ERP_KEEPALIVE.enabled:
+        logger.info("ERP 登录态保活未启动：%s", keep_status.get("lastError") or "未配置")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1181,6 +1192,7 @@ def main():
         QUALITY_SCHEDULER.stop()
         MAINTENANCE.stop()
         DINGTALK_STREAM.stop()
+        ERP_KEEPALIVE.stop()
         DIGITAL_WORKER.stop()
         server.server_close()
 

@@ -8,6 +8,7 @@ from .errors import ErpError, ErpUnknownResult
 from ..paths import ROOT
 
 CORE_PATH = ROOT / "frontend" / "js" / "jst-order-exchange.core.js"
+CORE_VERSION = "0.7.0"
 
 
 def read_core(path: Path | None = None) -> str:
@@ -56,7 +57,7 @@ def ensure_order_page(page, order_list_url: str, core_js: str | None = None) -> 
     except Exception as exc:
         raise ErpError("订单列表页没有 _ACP，页面未就绪或选择器已变") from exc
     ready = _core_state(page)
-    if ready.get("ready"):
+    if ready.get("ready") and str(ready.get("version") or "") == CORE_VERSION:
         return ready
     script = core_js if core_js is not None else read_core()
     page.add_script_tag(content=script)
@@ -64,6 +65,47 @@ def ensure_order_page(page, order_list_url: str, core_js: str | None = None) -> 
     if not ready.get("ready"):
         raise ErpError("换货核心已注入但 ready() 为 false")
     return ready
+
+
+def load_order(page, oid: str) -> dict:
+    """回读一张订单的当前明细。失败返回 load_error，不抛，由核验层决定停或 unknown。"""
+    key = str(oid or "").strip()
+    if not key:
+        return {"o_id": "", "items": [], "load_error": "缺少内部单号"}
+    try:
+        result = page.evaluate(
+            """async (oid) => {
+                if (!window.JstOrderExchange) throw new Error('换货核心未注入');
+                return await window.JstOrderExchange.loadOrder(oid);
+            }""",
+            key,
+        )
+    except Exception as exc:
+        return {"o_id": key, "items": [], "load_error": str(exc)}
+    if not isinstance(result, dict):
+        return {"o_id": key, "items": [], "load_error": "回读结果不是对象"}
+    result.setdefault("o_id", key)
+    return result
+
+
+def search_sku(page, sku: str, *, limit: int = 500) -> dict:
+    """只读扫描当前订单页数据集，反查含该 SKU 的内部单号。"""
+    key = str(sku or "").strip()
+    if not key:
+        raise ErpError("搜索 SKU 不能为空")
+    try:
+        result = page.evaluate(
+            """async (input) => {
+                if (!window.JstOrderExchange) throw new Error('换货核心未注入');
+                return await window.JstOrderExchange.searchSku(input);
+            }""",
+            {"sku": key, "limit": max(1, min(int(limit or 500), 500))},
+        )
+    except Exception as exc:
+        raise ErpError(f"SKU 搜索失败：{exc}") from exc
+    if not isinstance(result, dict):
+        raise ErpError("SKU 搜索结果不是对象")
+    return result
 
 
 def plan_job(page, job: dict) -> dict:
@@ -79,25 +121,27 @@ def plan_job(page, job: dict) -> dict:
         raise ErpError(f"试算失败：{exc}") from exc
 
 
-def execute_job(page, job: dict, *, delay_ms: int = 250) -> dict:
+def execute_job(page, job: dict, *, delay_ms: int = 250, concurrency: int = 1) -> dict:
     """结果未知时抛 ErpUnknownResult，调用方不得重试。"""
     started = False
     payload = dict(job or {})
     plans = payload.get("plans") or (payload.get("plan") or {}).get("plans") or []
     if plans and not (payload.get("plan") or {}).get("plans"):
         payload["plan"] = {"plans": plans}
+    width = max(1, min(8, int(concurrency or 1)))
     try:
         started = True
         return page.evaluate(
-            """async ({job, delayMs}) => {
+            """async ({job, delayMs, concurrency}) => {
                 if (!window.JstOrderExchange) throw new Error('换货核心未注入');
                 return await window.JstOrderExchange.executeJob(job, {
                     confirm: true,
                     delayMs: delayMs,
+                    concurrency: concurrency,
                     plans: job.plans || (job.plan && job.plan.plans) || [],
                 });
             }""",
-            {"job": payload, "delayMs": delay_ms},
+            {"job": payload, "delayMs": delay_ms, "concurrency": width},
         )
     except Exception as exc:
         if started:

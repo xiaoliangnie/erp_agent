@@ -10,7 +10,7 @@ interface JobCardProps {
 
 function PlanTable({ job }: { job: ExchangeJob }) {
   const plan = job.plan;
-  if (!plan) return <div className="small">等待 ERP Worker 返回真实订单试算结果。</div>;
+  if (!plan) return <div className="small">等待 Digital Worker 返回真实订单试算结果。</div>;
   const replacement = job.rules.replacements[0];
   const typeLabel = (value?: string) => value === "same_style" ? "同款式换货" : value === "special_mapping" ? "特殊白名单映射" : "规则待核对";
   return (

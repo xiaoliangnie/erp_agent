@@ -310,7 +310,7 @@ export default function ContractPage() {
 
   async function syncImages() {
     if (!order || !missingImages) return;
-    say("已创建 ERP 商品图片同步任务，请保持已登录的聚水潭订单页和 Worker 在线。", "");
+    say("已创建 ERP 商品图片同步任务，由后端 Digital Worker 用登录态拉取。", "");
     try {
       const job = await publicApi.post<ProductImageJob>("/api/contracts/images/sync", {
         poId: order.purchaseOrderNo,

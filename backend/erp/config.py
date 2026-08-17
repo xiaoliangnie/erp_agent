@@ -9,6 +9,7 @@ from ..paths import resolve_repo_path
 DEFAULT_BASE_URL = "https://www.erp321.com/epaas"
 DEFAULT_ORDER_LIST_URL = "https://www.erp321.com/app/order/order/list.aspx"
 DEFAULT_STORAGE_STATE = "files/data/secrets/erp-ai-state.json"
+DEFAULT_EVIDENCE_DIR = "files/data/erp-evidence"
 WORKER_ID = "erp-ai-procurement"
 ALLOWED_COMMANDS = ("erp.exchange_items",)
 
@@ -32,16 +33,21 @@ def load_digital_worker(setting, *, root: Path | None = None) -> dict:
         setting("ERP_AI_STORAGE_STATE_PATH", DEFAULT_STORAGE_STATE) or DEFAULT_STORAGE_STATE
     ).strip()
     return {
-        "enabled": _flag(setting("ERP_AI_ENABLED", "false")),
+        "enabled": _flag(setting("ERP_AI_ENABLED", "true"), default=True),
         "workerId": WORKER_ID,
         "baseUrl": base or DEFAULT_BASE_URL,
         "orderListUrl": order_list or DEFAULT_ORDER_LIST_URL,
+        "ownerCoId": str(setting("ERP_AI_OWNER_CO_ID", "10235039") or "10235039").strip() or "10235039",
         "username": str(setting("ERP_AI_USERNAME", "") or "").strip(),
         "hasPassword": bool(password),
         "hasTotp": bool(totp),
         "headless": _flag(setting("ERP_AI_HEADLESS", "true"), default=True),
         "writeDelayMs": max(50, int(setting("ERP_AI_WRITE_DELAY_MS", "250") or 250)),
         "storageStatePath": str(resolve_repo_path(storage, root=root)),
+        "evidenceDir": str(resolve_repo_path(
+            setting("ERP_EVIDENCE_DIR", DEFAULT_EVIDENCE_DIR) or DEFAULT_EVIDENCE_DIR,
+            root=root,
+        )),
         "allowedCommands": list(ALLOWED_COMMANDS),
         "loginFields": {
             "account": "#login_id",

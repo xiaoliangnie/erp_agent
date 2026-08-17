@@ -109,12 +109,12 @@ def resolve_product_image(product: dict, *, sku: str, style: str,
         return {"path": str(cached), "source": "聚水潭接口缓存", "status": "ready", "error": ""}
     return {
         "path": "", "source": "", "status": "missing",
-        "error": "镜像库尚无此商品图片，且供应链 API / 聚水潭 Worker 尚未同步成功",
+        "error": "镜像库尚无此商品图片，且供应链 API / Digital Worker 尚未同步成功",
     }
 
 
 class ProductImageService:
-    """持久化只读图片同步任务；浏览器 worker 负责使用 ERP 登录态取图。"""
+    """持久化只读图片同步任务；由后端 Digital Worker 用 ERP 登录态取图。"""
 
     def __init__(
         self,

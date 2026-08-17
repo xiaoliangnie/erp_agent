@@ -273,7 +273,7 @@ export default function ExchangePage() {
     <>
       <TopBar
         title="订单 SKU 换货"
-        sub={connected && !online ? "ERP Worker 离线，任务不会执行" : "dry-run 试算，人工确认后才动 ERP"}
+        sub={connected && !online ? "Digital Worker 离线，任务不会执行" : "dry-run 试算，人工确认后才动 ERP"}
       />
       <main className="exchange-layout">
         {connected && pollStale ? (
@@ -283,7 +283,8 @@ export default function ExchangePage() {
         ) : null}
         {connected && !online ? (
           <div className="notice exchange-offline" role="alert">
-            ERP Worker 离线，换货任务不会执行。请打开已登录聚水潭的浏览器油猴脚本。
+            Digital Worker 离线，换货任务不会执行。请确认 server.py 已启动，并已用
+            scripts/run_erp_worker.py login 保存登录态。
           </div>
         ) : null}
         <section className="panel">
@@ -291,7 +292,7 @@ export default function ExchangePage() {
             <strong>新建换货任务</strong>
           </div>
           <p className="small" style={{ margin: "6px 0 16px" }}>
-            页面只提交规则和明确订单号。ERP Worker 会先读取真实订单并生成 dry-run，不会立即换货。
+            页面只提交规则和明确订单号。后端 Digital Worker 会先读取真实订单并生成 dry-run，不会立即换货。
           </p>
 
           <div className="credentials">
@@ -331,8 +332,8 @@ export default function ExchangePage() {
               {!connected
                 ? "尚未连接"
                 : online
-                  ? `${status?.onlineWorkers} 个 ERP Worker 在线`
-                  : "ERP Worker 离线，任务不会执行"}
+                  ? "Digital Worker 在线"
+                  : "Digital Worker 离线，任务不会执行"}
             </span>
           </div>
 

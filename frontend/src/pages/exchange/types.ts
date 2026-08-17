@@ -11,7 +11,7 @@ export type JobStatus =
   | "stuck";
 
 export const STATUS_LABELS: Record<JobStatus, string> = {
-  pending: "等待 Worker",
+  pending: "等待 Digital Worker",
   planning: "正在读取订单",
   awaiting_confirm: "等待人工确认",
   confirmed: "已确认待执行",

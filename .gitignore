@@ -20,6 +20,7 @@ files/data/*.log
 files/data/health_watch_state.json
 files/data/insole_written.json
 files/data/secrets/
+files/data/erp-evidence/
 files/config/staff_bindings.json
 files/config/供应商管理.xlsx
 files/config/*供应商*.xlsx

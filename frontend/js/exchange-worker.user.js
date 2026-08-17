@@ -1,3 +1,5 @@
+// 已退役：换货 / 探测 / 搜 SKU / 图片同步改由后端 Playwright DigitalWorkerLoop 执行。
+// 本脚本若仍安装，服务端领取接口会返回空（executor=backend）。
 // ==UserScript==
 // @name         采购 Agent · 聚水潭订单换货 Worker
 // @namespace    procurement-agent
