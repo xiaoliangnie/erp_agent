@@ -3,7 +3,7 @@
 采购数据服务、五个业务页面与采购助手 Agent。系统统一读取 `hanli.env` 指向的本地 MySQL
 镜像库，由供应链安全代理 API 增量维护订单和采购单数据。
 当前执行文档和 Agent 完成度见 `docs/开发.md`。系统怎么工作见 `docs/架构.md`。
-自训练预测模型的接入步骤见 `docs/预测.md`。外部接口见 `docs/接口参考.md`。
+自训练预测模型的口径与接入步骤见 `docs/预测.md`。外部接口见 `docs/接口参考.md`。
 Agent 与钉钉密钥模板见根目录 `.env.example`。
 
 ## 订单 SKU 换货
@@ -436,7 +436,7 @@ L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_action
 
 ## 销量预测与订货建议
 
-预测数字由模型工件给出，**LLM 只解释不改数字**。建议是确定性公式：
+预测数字由模型工件给出，**LLM 只解释不改数字**。覆盖窗口是 `lead_time_days`（从下单到货），不抄 ERP「建议/本次采购数」。建议是确定性公式；正式口径见 `docs/预测.md` §3。当前实现仍是旁路验证用：
 
 ```
 建议下单量 = 交期内预测需求(∑p50) + 安全库存(z×√∑σ²，σ 由 p90−p10 折算)
@@ -456,13 +456,13 @@ L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_action
 先用导出的 CSV 训练打通链路：
 
 ```bash
-# CSV 至少要有 SKU、日期、数量三列，列名和默认不同时用 --key-field/--date-field/--qty-field 指定
-.venv/bin/python scripts/train_forecast_model.py --csv 销量明细导出.csv --holdout-days 14
+# CSV 至少要有 SKU、日期、数量三列；F1 导出目录是 D:\Predict_DATA（不进镜像）
+.venv/bin/python scripts/train_forecast_model.py --csv D:/Predict_DATA/csv/销售出库明细.csv --holdout-days 14
 ```
 
 **接入自己训练好的模型**：继承 `Forecaster` 实现 `fit` / `predict`，训练时加
 `--forecaster 模块:类名`。工件的 `metadata.json` 会记下这个引用，服务端据此加载，
-调用方一行都不用改。完整说明和约束见 `docs/预测.md`。
+调用方一行都不用改。需求、F0 口径、ERP 对照和接入步骤见 `docs/预测.md`。
 
 ## 钉钉机器人
 

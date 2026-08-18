@@ -4,8 +4,8 @@
 
 服务端只读工件，训练完全离线（cron / 定时任务）。
 
-    # 用导出的销售明细 CSV 训练第一版 Baseline
-    .venv/bin/python scripts/train_forecast_model.py --csv data/snapshots/销售明细.csv
+    # 用 D:\Predict_DATA 里导出的销售明细 CSV 训练第一版 Baseline
+    .venv/bin/python scripts/train_forecast_model.py --csv D:/Predict_DATA/csv/销售出库明细.csv
 
     # 销售表进实时库后（.env 配好 FORECAST_SALES_TABLE）
     .venv/bin/python scripts/train_forecast_model.py --days 365

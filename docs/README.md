@@ -9,7 +9,7 @@
 |---|---|
 | [`开发.md`](开发.md) | 做什么、已拍板、代办、Agent 完成度 |
 | [`架构.md`](架构.md) | 现在系统怎么工作 |
-| [`预测.md`](预测.md) | 怎么换 Forecaster、下一阶段契约 |
+| [`预测.md`](预测.md) | 需求、F0 / F0.1 公式语义、ERP 对照、怎么换 Forecaster |
 | [`接口参考.md`](接口参考.md) | 聚水潭 `#_jt_data`、供应链代理 API |
 
 种子扫描报告仍写到 `reports/user_identity_analysis.md`（`scripts/seed_users.py` 生成，不是设计文档）。
