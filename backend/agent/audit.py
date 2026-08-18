@@ -6,12 +6,28 @@
 """
 from __future__ import annotations
 
+import hashlib
 import secrets
 
 from .store import AgentStore, dumps, loads, now
 
 
 SUMMARY_LIMIT = 2000
+JSON_STORE_LIMIT = 100_000
+
+
+def store_json(value, *, limit: int = JSON_STORE_LIMIT) -> str:
+    """过长时改成仍合法的摘要对象，禁止截断半截 JSON。"""
+    payload = value if value is not None else {}
+    text = dumps(payload)
+    if len(text) <= limit:
+        return text
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if isinstance(payload, dict):
+        return dumps({"truncated": True, "sha256": digest, "keys": list(payload)[:40]})
+    if isinstance(payload, list):
+        return dumps({"truncated": True, "sha256": digest, "length": len(payload)})
+    return dumps({"truncated": True, "sha256": digest})
 
 
 def summarize(value) -> str:
@@ -67,7 +83,7 @@ class AuditLog:
                     arguments_json, status, result_summary, error, duration_ms, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (run_id, session_id, pending_action_id, tool, risk, str(operator or "")[:120],
-                 str(user_id or "")[:80], channel, dumps(arguments or {})[:4000], status,
+                 str(user_id or "")[:80], channel, store_json(arguments or {}), status,
                  summarize(result), str(error)[:1000] if error else None, int(duration_ms), now()),
             )
 
@@ -85,7 +101,7 @@ class AuditLog:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (forecast_id, session_id, run_id, pending_action_id, str(operator or "")[:120],
                  str(user_id or "")[:80], model_name, model_version, dumps(list(keys)),
-                 dumps(inputs), dumps(output)[:200000], now()),
+                 store_json(inputs), store_json(output), now()),
             )
         return forecast_id
 
@@ -110,7 +126,7 @@ class AuditLog:
                    (channel, target, kind, idempotency_key, status, detail_json, error, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (channel, str(target or "")[:200], kind, idempotency_key, status,
-                 dumps(detail or {})[:20000], str(error)[:1000] if error else None, now()),
+                 store_json(detail or {}, limit=20000), str(error)[:1000] if error else None, now()),
             )
         return True
 

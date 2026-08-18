@@ -17,8 +17,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.app import (  # noqa: E402
-    DINGTALK_SENDER, DINGTALK_STREAM, REMINDER_NOTIFIER, REMINDER_SCHEDULER,
-    STAFF_DIRECTORY,
+    DINGTALK_SENDER, DINGTALK_STREAM, DROPSHIP_SCHEDULER, JOB_WORKER, OUTBOX,
+    QUALITY_SCHEDULER, REMINDER_NOTIFIER, REMINDER_SCHEDULER, STAFF_DIRECTORY,
 )
 from backend.dingtalk import DingTalkError, sdk_available  # noqa: E402
 
@@ -31,7 +31,7 @@ def main():
     parser = argparse.ArgumentParser(description="钉钉通道调试")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("status", help="Stream / 发送通道 / 催办 / 绑定人数")
+    sub.add_parser("status", help="Stream / 发送通道 / 催办 / 品控 / 代发 / 绑定人数")
     sub.add_parser("list", help="列出 staff_bindings")
 
     bind = sub.add_parser("bind", help="登记采购员 ↔ 钉钉 userId / 手机号")
@@ -39,6 +39,7 @@ def main():
     bind.add_argument("--user-id", default="", help="钉钉 userId；群内 @ 用")
     bind.add_argument("--mobile", default="", help="手机号；Webhook 机器人只能用这个 @")
     bind.add_argument("--note", default="")
+    bind.add_argument("--role", default="", help="viewer / operator / admin；管理员走这条命令可跳过审批")
 
     resolve = sub.add_parser("resolve-mobile", help="用手机号向钉钉反查 userId（需要应用机器人）")
     resolve.add_argument("--mobile", required=True)
@@ -57,6 +58,10 @@ def main():
             "sender": DINGTALK_SENDER.status(),
             "notifier": REMINDER_NOTIFIER.status(),
             "reminder": REMINDER_SCHEDULER.status(),
+            "quality": QUALITY_SCHEDULER.status(),
+            "dropship": DROPSHIP_SCHEDULER.status(),
+            "jobs": JOB_WORKER.status(),
+            "outbox": {"pending": OUTBOX.pending_count()},
             "bindings": len(STAFF_DIRECTORY.list()),
         })
         return
@@ -66,6 +71,7 @@ def main():
     if args.command == "bind":
         dump(STAFF_DIRECTORY.upsert(
             args.buyer, dingtalk_user_id=args.user_id, mobile=args.mobile, note=args.note,
+            role=args.role,
         ))
         return
     if args.command == "resolve-mobile":

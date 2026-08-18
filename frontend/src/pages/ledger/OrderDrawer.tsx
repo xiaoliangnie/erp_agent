@@ -88,9 +88,9 @@ export function OrderDrawer({ order, stamp, dict, today, onClose }: OrderDrawerP
               </div>
             </div>
             <div className="drawer-body">
-              <h4>四波提醒排期</h4>
+              <h4>跟单三档排期</h4>
               {!plan ? (
-                <div className="empty">这张单没有交期，四波提醒都排不出来 —— 先让供应商补交期。</div>
+                <div className="empty">这张单没有交期，三档提醒都排不出来 —— 先让供应商补交期。</div>
               ) : (
                 <div className="plan">
                   {plan.map(({ wave, day }) => {

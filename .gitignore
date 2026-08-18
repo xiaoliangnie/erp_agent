@@ -19,6 +19,7 @@ files/data/models/
 files/data/*.log
 files/data/health_watch_state.json
 files/data/insole_written.json
+files/data/dingtalk_session_webhooks.json
 files/data/secrets/
 files/data/erp-evidence/
 files/config/staff_bindings.json

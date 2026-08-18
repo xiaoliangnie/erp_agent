@@ -48,6 +48,14 @@ const emptyFilters = (today: string): Filters => ({
   pendingOnly: true,
 });
 
+/** 看最新年时带上更早的未关单；切历史年只看该年。 */
+function orderInYear(orderDate: string, activeYear: string, latestYear: string): boolean {
+  if (!activeYear) return true;
+  const year = orderDate.slice(0, 4);
+  if (year === activeYear) return true;
+  return Boolean(latestYear && activeYear === latestYear && year && year < activeYear);
+}
+
 /** 下拉里按拼音排序，但选中的值仍是字典下标。 */
 function sortedOptions(values: string[] | undefined): { index: number; label: string }[] {
   return (values ?? [])
@@ -58,7 +66,7 @@ function sortedOptions(values: string[] | undefined): { index: number; label: st
 export default function LedgerPage() {
   const [params, setParams] = useSearchParams();
   const year = params.get("year");
-  const { data, error, loading, reload } = usePayload<DeliveryData>("/api/delivery", year, decodeDelivery);
+  const { data, error, loading, reload } = usePayload<DeliveryData>("/api/delivery", null, decodeDelivery);
 
   if (loading) return <Loading label="正在读取交期数据…" />;
   if (error) return <LoadFailed message={error} onRetry={reload} />;
@@ -87,7 +95,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
   const [opened, setOpened] = useState<LedgerOrder | null>(null);
   const [pushNote, setPushNote] = useState("");
   const [pushing, setPushing] = useState(false);
-  const { credentials, update, remember, filled } = useCredentials("agent");
+  const { credentials, update, ensureBound, filled, bound } = useCredentials("agent");
 
   // 换年度是整页重取，筛选跟着回到初始值。
   useEffect(() => {
@@ -117,7 +125,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
     return orders.filter((order) => {
       const stamp = stamps.get(order.index);
       if (!stamp) return false;
-      if (activeYear && !order.date.startsWith(`${activeYear}-`)) return false;
+      if (activeYear && !orderInYear(order.date, activeYear, years[0] ?? "")) return false;
       if (filters.pendingOnly && stamp.done) return false;
       if (filters.buyer !== "" && order.buyer !== Number(filters.buyer)) return false;
       if (filters.supplier !== "" && order.supplier !== Number(filters.supplier)) return false;
@@ -127,7 +135,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
       if (filters.query && !order.haystack.includes(filters.query)) return false;
       return true;
     });
-  }, [orders, stamps, activeYear, filters]);
+  }, [orders, stamps, activeYear, years, filters]);
 
   const slice = useMemo(() => {
     const filtered = filters.wave
@@ -142,6 +150,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
 
   const needCount = slice.filter((order) => isUrgent(stamps.get(order.index)?.wave ?? "")).length;
   const pendingTotal = slice.reduce((sum, order) => sum + order.pending, 0);
+  const purchaseTotal = slice.reduce((sum, order) => sum + order.qty, 0);
 
   const waveTotals = useMemo(() => {
     let count = 0;
@@ -162,7 +171,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
   async function sendReminders() {
     if (needCount === 0 || pushing) return;
     if (!filled) {
-      setPushNote("请先填写 AGENT_API_TOKEN 和与钉钉/采购员一致的姓名，再发送提醒。");
+      setPushNote("请先填写 Token、姓名和钉钉私信里的网页身份码，再发送提醒。");
       return;
     }
     const who = buyerName ? `（仅 ${buyerName}）` : "";
@@ -171,13 +180,13 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
       filters.supplier || filters.query || filters.from || filters.to || filters.status
         ? "推送按采购员和档位走后台催办口径，供应商/搜索等其它筛选不会带上。"
         : "";
-    if (!window.confirm(`将把当前需催 ${needCount} 单发到钉钉采购群${who}${wave}。${extra}确定发送？`)) {
+    if (!window.confirm(`将把当前需催 ${needCount} 单私聊发给已绑定采购员${who}${wave}。未绑定的人不会发到群。${extra}确定发送？`)) {
       return;
     }
-    remember(credentials);
     setPushing(true);
     setPushNote("");
     try {
+      const auth = await ensureBound();
       const result = await agentApi.post<{
         sent?: boolean;
         skipped?: boolean;
@@ -185,28 +194,33 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
         today?: string;
         orderCount?: number;
         buyers?: string[];
+        unboundBuyers?: string[];
       }>(
         "/api/agent/reminders/push",
         {
-          operator: credentials.operator.trim(),
+          operator: auth.operator.trim(),
           today: filters.today,
           buyer: buyerName,
           buckets: waveBucket ? [waveBucket] : undefined,
         },
-        credentials,
+        auth,
       );
       if (result.skipped) {
         const already = (result.reason || "").includes("已经推送过");
         setPushNote(
           already
-            ? `当日已推（${result.today || filters.today}）。同一批催办成功后不会重复刷群。`
+            ? `当日已推（${result.today || filters.today}）。同一批催办成功后不会再发给同一个人。`
             : result.reason || "今天没有需要催办的采购单。",
         );
         return;
       }
       const count = result.orderCount ?? needCount;
       const people = (result.buyers || []).join("、");
-      setPushNote(`已发到钉钉群：${count} 单${people ? ` · ${people}` : ""}。`);
+      const unbound = (result.unboundBuyers || []).join("、");
+      setPushNote(
+        `已私聊已绑定采购员：${count} 单${people ? ` · ${people}` : ""}。`
+        + (unbound ? `未绑定未发：${unbound}。` : ""),
+      );
     } catch (error: unknown) {
       setPushNote(errorText(error));
     } finally {
@@ -328,8 +342,10 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
           清空筛选
         </button>
         <div className="slice-note">
-          {activeYear} 年（1 月 1 日起） · 当前切片 {int(slice.length)} 单 · 待入库 {int(pendingTotal)} 件 · 需催{" "}
-          {int(needCount)} 单
+          已确认待入库（不含返修）
+          {activeYear === (years[0] ?? "") ? " · 含跨年未关单" : activeYear ? ` · ${activeYear} 年` : ""}
+          {" "}
+          · 当前切片 {int(slice.length)} 单 · 采购 {int(purchaseTotal)} 件 · 待入库 {int(pendingTotal)} 件 · 需催 {int(needCount)} 单
         </div>
       </div>
 
@@ -338,11 +354,11 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
           <div className="card-head">
             <div>
               <p className="eyebrow">采购单 · 按最急的一波归档</p>
-              <h2>交期提醒 · 四波</h2>
+              <h2>交期提醒 · 跟单三档</h2>
               <div className="note">
-                以 {filters.today} 为今天。交期取 item_delivery_date，该行没填就退到最早预计到货日期；
-                一张单按所有待入库行里最早的交期归档，波次取最急的一档。 当前需催 {int(waveTotals.count)} 单 /{" "}
-                {int(waveTotals.qty)} 件。
+                以 {filters.today} 为今天。池子是全库已确认未完结，排除返修退货。交期取
+                item_delivery_date，该行没填就退到最早预计到货日期；一张单按所有待入库行里最早的交期归档，档位取最急的一档（≤10
+                天 / ≤3 天 / 已逾期）。当前需催 {int(waveTotals.count)} 单 / {int(waveTotals.qty)} 件。
               </div>
             </div>
             <div className="ledger-push">
@@ -360,6 +376,14 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
                   value={credentials.operator}
                   onChange={(event) => update({ operator: event.target.value })}
                 />
+                {bound ? null : (
+                  <input
+                    autoComplete="off"
+                    placeholder="钉钉私信 20 位网页身份码"
+                    value={credentials.bindCode ?? ""}
+                    onChange={(event) => update({ bindCode: event.target.value })}
+                  />
+                )}
               </div>
               <div className="push-actions">
                 <button
@@ -403,7 +427,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
               <p className="eyebrow">待入库数量 · 件</p>
               <h2>按采购员的催办量</h2>
               <div className="note">
-                每人一条，按提醒波次堆叠。右端是需催量（前四波合计，即 20 天内 + 已逾期）。
+                每人一条，按提醒档位堆叠。右端是需催量（跟单三档合计，即 10 天内 + 已逾期）。
               </div>
             </div>
           </div>
@@ -415,7 +439,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
             <div>
               <p className="eyebrow">明细 · 采购单</p>
               <h2>交期台账</h2>
-              <div className="note">点任意一行查看该单的商品明细与四波排期。</div>
+              <div className="note">点任意一行查看该单的商品明细与三档排期。</div>
             </div>
             <div className="ctrl">
               <span className="note">{int(slice.length)} 单</span>

@@ -2,21 +2,25 @@
 """抖音换鞋垫：尺码映射、定位分桶、意图、确认后串行写入。全程离线。"""
 import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from backend.agent import AgentRunner, AgentStore, AuditLog, PendingActions, SessionStore
 from backend.agent.intents import INSOLE_PROCESS, INSOLE_QUERY, classify_intent
+from backend.agent.router import needs_llm_review, route_message
 from backend.agent.permissions import CAPABILITY_INSOLE_PROCESS, check_capability
 from backend.agent.tools import PermissionDenied, ToolContext, build_registry
 from backend.dingtalk.identity import StaffDirectory
 from backend.dingtalk.stream import DingTalkStreamChannel
 from backend.exchange.insole import (
-    SOURCE_SKU, WRITTEN_REASON, classify_insole_row, execute_insole_orders,
-    format_insole_list, format_insole_result, load_executed_insole_writes,
-    load_insole_writes, locate_insole_orders, mm_from_props, remember_insole_writes,
-    resolve_insole_size, target_sku_for_mm,
+    RESERVED_REASON, SOURCE_SKU, WRITTEN_REASON, classify_insole_row,
+    execute_insole_orders, format_elapsed, format_insole_list, format_insole_result,
+    load_executed_insole_writes, load_insole_writes, load_reserved_insole_orders,
+    locate_insole_orders, mm_from_props, remember_insole_writes, resolve_insole_size,
+    target_sku_for_mm,
 )
 
 
@@ -77,6 +81,34 @@ class FakeLLM:
         raise AssertionError("固定意图不应调用 LLM")
 
 
+class ReviewLLM:
+    """鞋垫处理走 LLM 审核：先调 process_insole_orders，再组织确认话术。"""
+
+    configured = True
+    model = "fake-review"
+
+    def __init__(self):
+        self.calls = 0
+        self.seen = []
+
+    def status(self):
+        return {"configured": True, "model": self.model}
+
+    def chat(self, messages, *, tools=None, tool_choice="auto"):
+        self.calls += 1
+        self.seen.append({"tool_choice": tool_choice, "messages": messages})
+        if self.calls == 1:
+            return {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-insole",
+                    "type": "function",
+                    "function": {"name": "process_insole_orders", "arguments": "{}"},
+                }],
+            }
+        return {"content": "请核对清单后回复确认", "tool_calls": []}
+
+
 class FakeAudit:
     def __init__(self):
         self.keys = []
@@ -134,6 +166,17 @@ class MappingTests(unittest.TestCase):
         self.assertEqual("255", sized["shoe_mm"])
         self.assertEqual("XZ25401308-09907", sized["target_sku"])
 
+    def test_kuaishou_and_channels_props(self):
+        kuaishou = resolve_insole_size("布面款;39 (245)")
+        self.assertEqual("245", kuaishou["shoe_mm"])
+        self.assertEqual("XZ25401308-09905", kuaishou["target_sku"])
+        kuaishou = resolve_insole_size("网眼款;43 (265)")
+        self.assertEqual("265", kuaishou["shoe_mm"])
+        self.assertEqual("XZ25401308-09909", kuaishou["target_sku"])
+        channels = resolve_insole_size("网眼款;42")
+        self.assertEqual("260", channels["shoe_mm"])
+        self.assertEqual("XZ25401308-09908", channels["target_sku"])
+
     def test_status_buckets(self):
         base = {
             "o_id": "1", "so_id": "s", "shop": "抖音店", "has_source": True,
@@ -163,6 +206,96 @@ class LocateTests(unittest.TestCase):
         self.assertIn("11550002", reasons)
         skipped = {row["o_id"] for row in located["skipped"]}
         self.assertIn("11550003", skipped)
+
+    def test_default_pool_includes_kuaishou_and_channels(self):
+        extra = [
+            {
+                "o_id": "11553977", "so_id": "ks-1", "status": "WaitConfirm",
+                "shop_name": "快手-蜀黍家运动鞋服", "order_date": "2026-08-17",
+                "sku_id": SOURCE_SKU, "properties_value": "默认:默认", "qty": "1",
+            },
+            {
+                "o_id": "11553977", "so_id": "ks-1", "status": "WaitConfirm",
+                "shop_name": "快手-蜀黍家运动鞋服",
+                "sku_id": "SHOE-KS", "properties_value": "布面款;39 (245)", "qty": "1",
+            },
+            {
+                "o_id": "11553117", "so_id": "ks-2", "status": "Question",
+                "shop_name": "快手-蜀黍家运动鞋服",
+                "sku_id": SOURCE_SKU, "properties_value": "默认:默认", "qty": "1",
+            },
+            {
+                "o_id": "11553117", "so_id": "ks-2", "status": "Question",
+                "shop_name": "快手-蜀黍家运动鞋服",
+                "sku_id": "SHOE-KS2", "properties_value": "网眼款;43 (265)", "qty": "1",
+            },
+            {
+                "o_id": "11553023", "so_id": "wx-1", "status": "Question",
+                "shop_name": "微信视频号-蜀黍家通勤男鞋",
+                "sku_id": SOURCE_SKU, "properties_value": "默认:默认", "qty": "1",
+            },
+            {
+                "o_id": "11553023", "so_id": "wx-1", "status": "Question",
+                "shop_name": "微信视频号-蜀黍家通勤男鞋",
+                "sku_id": "SHOE-WX", "properties_value": "网眼款;42", "qty": "1",
+            },
+        ]
+        located = locate_insole_orders(lines=LINES + extra)
+        by_oid = {row["o_id"]: row for row in located["processable"]}
+        self.assertEqual("XZ25401308-09905", by_oid["11553977"]["target_sku"])
+        self.assertEqual("XZ25401308-09909", by_oid["11553117"]["target_sku"])
+        self.assertEqual("XZ25401308-09908", by_oid["11553023"]["target_sku"])
+        self.assertNotIn("11550003", by_oid)
+
+    def test_locate_skips_reserved_orders(self):
+        located = locate_insole_orders(
+            lines=LINES, shop="抖音",
+            reserved={"11549976": {"operator": "韩立", "action_id": "abc", "status": "pending"}},
+        )
+        self.assertEqual(["11550001"], located["oIds"])
+        skipped = {row["o_id"]: row["reason"] for row in located["skipped"]}
+        self.assertTrue(skipped["11549976"].startswith(RESERVED_REASON))
+        self.assertIn("韩立", skipped["11549976"])
+        self.assertIn("他人待确认或正在写入的 1 单", format_insole_list(located))
+
+    def test_load_reserved_skips_current_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "agent.sqlite3"
+            conn = sqlite3.connect(db)
+            conn.execute(
+                """
+                CREATE TABLE pending_actions (
+                    id TEXT, operator TEXT, status TEXT, tool TEXT,
+                    preview_json TEXT, arguments_json TEXT
+                )
+                """
+            )
+            conn.executemany(
+                """
+                INSERT INTO pending_actions
+                (id, operator, status, tool, preview_json, arguments_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    ("act-han", "韩立", "pending", "process_insole_orders",
+                     '{"oIds":["11549976"],"orders":[{"oId":"11549976"}]}',
+                     '{"o_ids":["11549976"]}'),
+                    ("act-lite", "利特", "confirmed", "process_insole_orders",
+                     '{"oIds":["11550001"]}', '{"o_ids":["11550001"]}'),
+                ],
+            )
+            conn.commit()
+            conn.close()
+            reserved = load_reserved_insole_orders(db, exclude_action_id="act-lite")
+            self.assertIn("11549976", reserved)
+            self.assertNotIn("11550001", reserved)
+            self.assertEqual("韩立", reserved["11549976"]["operator"])
+            own = load_reserved_insole_orders(db, viewer="利特")
+            self.assertIn("11549976", own)
+            self.assertNotIn("11550001", own)
+            other = load_reserved_insole_orders(db, viewer="韩立")
+            self.assertNotIn("11549976", other)
+            self.assertIn("11550001", other)
 
     def test_locate_skips_recently_written_orders(self):
         located = locate_insole_orders(
@@ -244,6 +377,48 @@ class LocateTests(unittest.TestCase):
 
 
 class ExecuteTests(unittest.TestCase):
+    def test_execute_holds_exclusive_across_plan_and_write(self):
+        events = []
+        lock = threading.RLock()
+        mid = threading.Event()
+        go = threading.Event()
+
+        class Runtime:
+            def exclusive(self):
+                return lock
+
+            def prepare(self):
+                events.append(f"p:{threading.current_thread().name}")
+                if threading.current_thread().name == "t1":
+                    mid.set()
+                    go.wait(2)
+
+            def run(self, command, payload):
+                events.append(f"r:{threading.current_thread().name}")
+                if payload.get("confirm"):
+                    return {"succeeded": [{"o_id": "1"}], "failed": [], "attempted": 1}
+                return {"plans": [{"o_id": "1", "ok": True}]}
+
+        runtime = Runtime()
+
+        def job(name, oid):
+            execute_insole_orders(runtime, [{"o_id": oid, "target_sku": "XZ25401308-09907"}])
+
+        first = threading.Thread(target=job, args=("t1", "1"), name="t1")
+        second = threading.Thread(target=job, args=("t2", "2"), name="t2")
+        first.start()
+        self.assertTrue(mid.wait(1))
+        second.start()
+        time.sleep(0.1)
+        self.assertEqual(["p:t1"], events)
+        go.set()
+        first.join(2)
+        second.join(2)
+        self.assertEqual("p:t1", events[0])
+        self.assertIn("p:t2", events)
+        self.assertLess(events.index("p:t1"), events.index("p:t2"))
+        self.assertLess(events.index("r:t1"), events.index("p:t2"))
+
     def test_groups_by_target_then_serial_execute(self):
         runtime = FakeErp()
         result = execute_insole_orders(runtime, [
@@ -252,10 +427,13 @@ class ExecuteTests(unittest.TestCase):
             {"o_id": "3", "target_sku": "XZ25401308-09908"},
         ])
         self.assertTrue(any(call.get("prepare") for call in runtime.calls))
-        self.assertEqual(2, len([
+        self.assertEqual(0, len([
             call for call in runtime.calls if not call.get("confirm") and not call.get("prepare")
         ]))
-        self.assertEqual(1, len([call for call in runtime.calls if call.get("confirm")]))
+        confirms = [call for call in runtime.calls if call.get("confirm")]
+        self.assertEqual(1, len(confirms))
+        self.assertEqual(50, confirms[0].get("delayMs"))
+        self.assertEqual(3, confirms[0].get("concurrency"))
         self.assertEqual(3, result["okCount"])
         self.assertEqual(0, result["failedCount"])
 
@@ -267,6 +445,21 @@ class ExecuteTests(unittest.TestCase):
         self.assertIn("成功 20", text)
         self.assertIn("其余 15 单已缩略", text)
 
+    def test_result_log_includes_elapsed(self):
+        self.assertEqual("11 秒", format_elapsed(11000))
+        self.assertEqual("1 分 3 秒", format_elapsed(63000))
+        self.assertEqual("1 小时 2 分", format_elapsed(3720000))
+        text = format_insole_result({
+            "okCount": 2, "skippedCount": 0, "failedCount": 0,
+            "elapsedMs": 63000,
+            "prepareMs": 48000,
+            "writeMs": 14000,
+            "log": [{"oId": "1", "targetSku": "XZ25401308-09907", "result": "ok"}],
+        })
+        self.assertIn("用时 1 分 3 秒", text)
+        self.assertIn("开页 48 秒", text)
+        self.assertIn("写入 14 秒", text)
+
 
 class IntentTests(unittest.TestCase):
     def test_query_and_process_and_exclusions(self):
@@ -275,9 +468,35 @@ class IntentTests(unittest.TestCase):
             INSOLE_PROCESS,
             classify_intent("查询一下现在抖音需要更换的鞋垫订单，进行处理").name,
         )
-        self.assertIsNone(classify_intent("品控 佰特 604264 鞋垫开胶 3 双"))
-        self.assertIsNone(classify_intent("把订单 11530151 里的 XZ25401308-101 换成 XZ25401308-09906"))
-        self.assertIsNone(classify_intent("今年逾期多少"))
+        self.assertEqual(INSOLE_PROCESS, classify_intent("进行处理").name)
+        self.assertEqual(INSOLE_PROCESS, classify_intent("处理这些").name)
+        also = classify_intent("218 单也需要进行换鞋垫的动作")
+        self.assertEqual(INSOLE_PROCESS, also.name)
+        self.assertNotIn("o_ids", also.arguments)
+        pasted = classify_intent(
+            "11553977\n11553117\n11553023\n这三单，也需要做下换鞋垫的动作",
+        )
+        self.assertEqual(INSOLE_PROCESS, pasted.name)
+        self.assertEqual(
+            ["11553977", "11553117", "11553023"],
+            pasted.arguments.get("o_ids"),
+        )
+        self.assertNotIn("shop", pasted.arguments)
+        status = classify_intent("11530151 还能不能发？里面是不是还挂着旧鞋垫码？")
+        self.assertNotEqual("locate_insole_orders", getattr(status, "tool", ""))
+        self.assertNotEqual("process_insole_orders", getattr(status, "tool", ""))
+        self.assertEqual({}, classify_intent("查询一下现在抖音需要更换的鞋垫订单").arguments)
+        process = classify_intent("218 单也需要进行换鞋垫的动作")
+        self.assertFalse(needs_llm_review(process))
+        self.assertFalse(needs_llm_review(classify_intent("查询一下现在抖音需要更换的鞋垫订单")))
+        self.assertEqual("workflow", route_message("218 单也需要进行换鞋垫的动作").route)
+        self.assertEqual({"shop": "快手"}, classify_intent("查询快手鞋垫订单").arguments)
+        quality = classify_intent("品控 佰特 604264 鞋垫开胶 3 双")
+        self.assertEqual("record_quality_issue", quality.tool)
+        exchange = classify_intent("把订单 11530151 里的 XZ25401308-101 换成 XZ25401308-09906")
+        self.assertEqual("submit_exchange_dry_run", exchange.tool)
+        overdue = classify_intent("今年逾期多少")
+        self.assertEqual("dashboard_summary", overdue.tool)
 
 
 class PermissionTests(unittest.TestCase):
@@ -348,6 +567,18 @@ class AgentInsoleTests(unittest.TestCase):
         self.assertIn("11549976", remembered)
         self.assertIn("11550001", remembered)
 
+    def test_other_user_cannot_process_reserved_orders(self):
+        with patch("backend.agent.tools.locate_insole_orders", return_value=locate_insole_orders(lines=LINES)):
+            first = self.runner.handle_intent(
+                "查询一下现在抖音需要更换的鞋垫订单，进行处理",
+                session_key="han", operator="韩立",
+            )
+        reserved = load_reserved_insole_orders(Path(self.tmp.name) / "agent.sqlite3")
+        self.assertIn("11549976", reserved)
+        located = locate_insole_orders(lines=LINES, shop="抖音", reserved=reserved)
+        self.assertEqual([], located["oIds"])
+        self.assertEqual(first["pendingActions"][0]["id"], reserved["11549976"]["action_id"])
+
     def test_repeat_process_reuses_pending_and_drops_older(self):
         with patch("backend.agent.tools.locate_insole_orders", return_value=locate_insole_orders(lines=LINES)):
             first = self.runner.handle_intent(
@@ -361,6 +592,53 @@ class AgentInsoleTests(unittest.TestCase):
         self.assertEqual(first["pendingActions"][0]["id"], second["pendingActions"][0]["id"])
         self.assertEqual(1, len(self.runner.actions.list(session_id=first["sessionId"])))
 
+    def test_repeat_process_sees_own_reserved_orders(self):
+        db = Path(self.tmp.name) / "agent.sqlite3"
+
+        def fake_locate(*_args, **kwargs):
+            return locate_insole_orders(
+                lines=LINES,
+                shop=kwargs.get("shop") or "抖音",
+                o_ids=kwargs.get("o_ids"),
+                reserved=kwargs.get("reserved") or {},
+                written=kwargs.get("written") or {},
+            )
+
+        self.runner.context.setting = (
+            lambda name, default="", path=str(db): path if name == "AGENT_DATABASE_PATH" else default
+        )
+        with patch("backend.agent.tools.locate_insole_orders", side_effect=fake_locate):
+            first = self.runner.handle_intent(
+                "查询一下现在抖音需要更换的鞋垫订单，进行处理",
+                session_key="p-own", operator="利特",
+            )
+            second = self.runner.handle_intent(
+                "查询一下现在抖音需要更换的鞋垫订单，进行处理",
+                session_key="p-own", operator="利特",
+            )
+        self.assertIn("11549976", first["reply"])
+        self.assertIn("11549976", second["reply"])
+        self.assertEqual(first["pendingActions"][0]["id"], second["pendingActions"][0]["id"])
+
+    def test_repeat_process_keeps_larger_pending(self):
+        full = locate_insole_orders(lines=LINES)
+        partial_lines = [row for row in LINES if str(row.get("o_id")) == "11550001"]
+        partial = locate_insole_orders(lines=partial_lines)
+        with patch(
+            "backend.agent.tools.locate_insole_orders",
+            side_effect=[full, partial],
+        ):
+            first = self.runner.handle_intent(
+                "查询一下现在抖音需要更换的鞋垫订单，进行处理",
+                session_key="p-keep", operator="利特",
+            )
+            second = self.runner.handle_intent(
+                "218 单也需要进行换鞋垫的动作",
+                session_key="p-keep", operator="利特",
+            )
+        self.assertEqual(first["pendingActions"][0]["id"], second["pendingActions"][0]["id"])
+        self.assertIn("11549976", second["reply"])
+
     def test_chat_short_circuits_intent_without_llm(self):
         with patch("backend.agent.tools.locate_insole_orders", return_value=locate_insole_orders(lines=LINES)):
             answer = self.runner.chat(
@@ -368,6 +646,19 @@ class AgentInsoleTests(unittest.TestCase):
                 session_key="c1", operator="利特",
             )
         self.assertEqual(INSOLE_QUERY, answer["intent"])
+        self.assertIn("11549976", answer["reply"])
+
+    def test_chat_process_short_circuits_without_llm(self):
+        llm = ReviewLLM()
+        self.runner.llm = llm
+        with patch("backend.agent.tools.locate_insole_orders", return_value=locate_insole_orders(lines=LINES)):
+            answer = self.runner.chat(
+                message="218 单也需要进行换鞋垫的动作",
+                session_key="c-review", operator="利特",
+            )
+        self.assertEqual(0, llm.calls)
+        self.assertEqual(INSOLE_PROCESS, answer["intent"])
+        self.assertEqual(1, len(answer["pendingActions"]))
         self.assertIn("11549976", answer["reply"])
 
 
@@ -380,7 +671,7 @@ class DingTalkInsoleTests(unittest.TestCase):
         self.erp = FakeErp()
         self.runner = AgentRunner(
             registry=build_registry(with_forecast=False, with_exchange=True, with_notifier=False),
-            llm=FakeLLM(),
+            llm=ReviewLLM(),
             sessions=SessionStore(self.store),
             actions=PendingActions(self.store),
             audit=AuditLog(self.store),
@@ -468,6 +759,7 @@ class DingTalkInsoleTests(unittest.TestCase):
         done = sender.replies[0]["text"]
         self.assertIn("【任务完成】", done)
         self.assertIn("成功 2", done)
+        self.assertIn("用时", done)
         self.assertIn("11549976", done)
         self.assertEqual(["u-lite"], sender.replies[0]["at"])
 

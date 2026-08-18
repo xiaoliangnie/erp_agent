@@ -1,6 +1,6 @@
 {
-  "version": 1,
-  "note": "P1-5 黄金回放。utterance 是员工原话；expect.kind = tools（应调工具）/ ask（必须追问、先不调写工具）/ refuse（说明做不了）。CI 用假 LLM 按 expect.tools 脚本回放 runner；ask/refuse 只断言不调工具。真模型联调后再加夜间集。",
+  "version": 2,
+  "note": "§38 黄金回放。每个已落地场景至少覆盖：正常 / 省略参数 / 模糊 / 错误 / 相邻干扰。utterance 是员工原话；expect.kind = tools / ask / refuse / agent。CI 用假 LLM 回放；能走确定性路由的句子不进模型。",
   "samples": {
     "po_id": "604264",
     "o_id": "11530151",
@@ -12,15 +12,18 @@
     {
       "id": "po-search-supplier",
       "category": "查询采购单",
+      "variant": "正常",
       "utterance": "最近有没有供应商甲的采购单？",
       "expect": {
         "kind": "tools",
+        "route": "exact_query",
         "tools": [{ "name": "search_purchase_orders", "arguments": { "query": "供应商甲" } }]
       }
     },
     {
       "id": "po-get-numeric",
       "category": "查询采购单",
+      "variant": "正常",
       "utterance": "看一下 604264 这张采购单，待入库还有多少？",
       "expect": {
         "kind": "tools",
@@ -28,8 +31,20 @@
       }
     },
     {
+      "id": "po-arrival-bare",
+      "category": "查询采购单",
+      "variant": "正常",
+      "utterance": "604264 到货了吗",
+      "expect": {
+        "kind": "tools",
+        "route": "exact_query",
+        "tools": [{ "name": "get_purchase_order", "arguments": { "po_id": "604264" } }]
+      }
+    },
+    {
       "id": "po-search-then-get",
       "category": "查询采购单",
+      "variant": "正常",
       "utterance": "利特名下未完成的采购单有哪些？先列单号。",
       "expect": {
         "kind": "tools",
@@ -39,6 +54,7 @@
     {
       "id": "po-dashboard-mine",
       "category": "查询采购单",
+      "variant": "正常",
       "utterance": "我今年采购金额和待入库大概多少？我是利特。",
       "expect": {
         "kind": "tools",
@@ -46,8 +62,64 @@
       }
     },
     {
+      "id": "po-omit",
+      "category": "查询采购单",
+      "variant": "省略参数",
+      "utterance": "查一下那张采购单",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["po_id"],
+        "must_not": ["get_purchase_order", "search_purchase_orders"]
+      }
+    },
+    {
+      "id": "po-fuzzy-bare",
+      "category": "查询采购单",
+      "variant": "模糊",
+      "utterance": "604264",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["id_type"],
+        "must_not": ["get_purchase_order", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "po-error-create",
+      "category": "查询采购单",
+      "variant": "错误",
+      "utterance": "创建采购单 604264",
+      "expect": {
+        "kind": "refuse",
+        "reason": "正式创建采购单还没开闸",
+        "must_not": ["get_purchase_order", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "po-adjacent-contract",
+      "category": "查询采购单",
+      "variant": "相邻干扰",
+      "utterance": "604264 到货了吗，顺便出合同",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["到货", "合同"],
+        "must_not": ["get_purchase_order", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "po-adjacent-arrival-only",
+      "category": "查询采购单",
+      "variant": "相邻干扰",
+      "utterance": "604264 到货了吗，别出合同",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "get_purchase_order", "arguments": { "po_id": "604264" } }],
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
       "id": "so-search-oid",
       "category": "查询订单信息",
+      "variant": "正常",
       "utterance": "内部订单 11530151 现在什么状态？",
       "expect": {
         "kind": "tools",
@@ -57,6 +129,7 @@
     {
       "id": "so-items",
       "category": "查询订单信息",
+      "variant": "正常",
       "utterance": "11530151 里都有哪些 SKU？",
       "expect": {
         "kind": "tools",
@@ -66,6 +139,7 @@
     {
       "id": "so-search-platform",
       "category": "查询订单信息",
+      "variant": "正常",
       "utterance": "帮我查一下平台单号是 20240812001 的那张单。",
       "expect": {
         "kind": "tools",
@@ -75,6 +149,7 @@
     {
       "id": "so-search-sku",
       "category": "查询订单信息",
+      "variant": "正常",
       "utterance": "哪些待发货订单里还有 XZ25401308-101？",
       "expect": {
         "kind": "tools",
@@ -83,8 +158,42 @@
       }
     },
     {
+      "id": "so-omit-items",
+      "category": "查询订单信息",
+      "variant": "省略参数",
+      "utterance": "里面有哪些 SKU",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["o_ids"],
+        "must_not": ["get_sales_order_items", "search_sales_orders"]
+      }
+    },
+    {
+      "id": "so-fuzzy-bare",
+      "category": "查询订单信息",
+      "variant": "模糊",
+      "utterance": "11530151",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["id_type"],
+        "must_not": ["search_sales_orders", "get_purchase_order"]
+      }
+    },
+    {
+      "id": "so-adjacent-overdue",
+      "category": "查询订单信息",
+      "variant": "相邻干扰",
+      "utterance": "11530151 逾期了吗",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_sales_orders", "arguments": { "query": "11530151" } }],
+        "must_not": ["delivery_reminders"]
+      }
+    },
+    {
       "id": "exc-status-by-sku",
       "category": "异常订单状态",
+      "variant": "正常",
       "utterance": "XZ25401308-101 要换成 09906 的异常单现在有多少张？先别改。",
       "expect": {
         "kind": "tools",
@@ -95,6 +204,7 @@
     {
       "id": "exc-status-one-order",
       "category": "异常订单状态",
+      "variant": "正常",
       "utterance": "11530151 还能不能发？里面是不是还挂着旧鞋垫码？",
       "expect": {
         "kind": "tools",
@@ -108,9 +218,11 @@
     {
       "id": "exc-handle-with-oid",
       "category": "处理异常订单",
+      "variant": "正常",
       "utterance": "把订单 11530151 里的 XZ25401308-101 换成 XZ25401308-09906。",
       "expect": {
         "kind": "tools",
+        "route": "workflow",
         "tools": [{
           "name": "submit_exchange_dry_run",
           "arguments": {
@@ -126,6 +238,7 @@
     {
       "id": "exc-handle-missing-oid",
       "category": "处理异常订单",
+      "variant": "省略参数",
       "utterance": "把 XZ25401308-101 都换成 XZ25401308-09906。",
       "expect": {
         "kind": "tools",
@@ -137,6 +250,7 @@
     {
       "id": "exc-ask-rule-type",
       "category": "处理异常订单",
+      "variant": "模糊",
       "utterance": "这批异常单帮我处理一下。",
       "expect": {
         "kind": "ask",
@@ -147,6 +261,7 @@
     {
       "id": "exc-refuse-address",
       "category": "处理异常订单",
+      "variant": "错误",
       "utterance": "这张单地址写错了，帮我改收货地址。",
       "expect": {
         "kind": "refuse",
@@ -157,6 +272,7 @@
     {
       "id": "exc-refuse-oversell",
       "category": "处理异常订单",
+      "variant": "错误",
       "utterance": "超卖了，备注也有问题，你看着处理。",
       "expect": {
         "kind": "refuse",
@@ -165,27 +281,41 @@
       }
     },
     {
+      "id": "exc-adjacent-insole",
+      "category": "处理异常订单",
+      "variant": "相邻干扰",
+      "utterance": "把鞋垫订单换成新码",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "locate_insole_orders", "arguments": {} }],
+        "must_not": ["submit_exchange_dry_run", "process_insole_orders"]
+      }
+    },
+    {
       "id": "rem-overdue-mine",
       "category": "交期催办",
+      "variant": "正常",
       "utterance": "我名下逾期的采购单有哪些？按待入库件数列一下。",
       "expect": {
         "kind": "tools",
-        "tools": [{ "name": "delivery_reminders", "arguments": { "buyer": "利特", "buckets": ["overdue"] } }],
+        "tools": [{ "name": "delivery_reminders", "arguments": { "buyer": "我名下", "buckets": ["overdue"] } }],
         "must_not": ["submit_exchange_dry_run"]
       }
     },
     {
-      "id": "rem-t10",
+      "id": "rem-d10",
       "category": "交期催办",
-      "utterance": "T-10 这一波要催哪些单？",
+      "variant": "正常",
+      "utterance": "剩 10 天这一档要催哪些单？",
       "expect": {
         "kind": "tools",
-        "tools": [{ "name": "delivery_reminders", "arguments": { "buckets": ["t10"] } }]
+        "tools": [{ "name": "delivery_reminders", "arguments": { "buckets": ["d10"] } }]
       }
     },
     {
       "id": "rem-send-pending",
       "category": "交期催办",
+      "variant": "正常",
       "utterance": "把现在该催的发给钉钉群，@ 对应采购员。",
       "expect": {
         "kind": "tools",
@@ -195,11 +325,56 @@
       }
     },
     {
+      "id": "rem-omit",
+      "category": "交期催办",
+      "variant": "省略参数",
+      "utterance": "催一下",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "delivery_reminders", "arguments": {} }]
+      }
+    },
+    {
+      "id": "rem-fuzzy",
+      "category": "交期催办",
+      "variant": "模糊",
+      "utterance": "逾期有哪些",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "delivery_reminders", "arguments": { "buckets": ["overdue"] } }],
+        "must_not": ["dashboard_summary"]
+      }
+    },
+    {
+      "id": "rem-error-address",
+      "category": "交期催办",
+      "variant": "错误",
+      "utterance": "催供应商改地址",
+      "expect": {
+        "kind": "refuse",
+        "reason": "不改地址",
+        "must_not": ["send_delivery_reminder", "submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "rem-adjacent-insole",
+      "category": "交期催办",
+      "variant": "相邻干扰",
+      "utterance": "我名下逾期的换成新鞋垫",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["催办", "鞋垫"],
+        "must_not": ["delivery_reminders", "process_insole_orders", "submit_exchange_dry_run"]
+      }
+    },
+    {
       "id": "contract-generate",
       "category": "合同",
+      "variant": "正常",
       "utterance": "给 604264 出一份专票采购合同。",
       "expect": {
         "kind": "tools",
+        "route": "workflow",
         "tools": [{
           "name": "generate_purchase_contract",
           "arguments": { "po_id": "604264", "invoice_type": "special_invoice" }
@@ -208,8 +383,31 @@
       }
     },
     {
+      "id": "contract-missing-invoice",
+      "category": "合同",
+      "variant": "省略参数",
+      "utterance": "给 604264 出合同。",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["invoice_type"],
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "contract-generate-alias",
+      "category": "合同",
+      "variant": "省略参数",
+      "utterance": "给 604264 生成合同",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["invoice_type"],
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
       "id": "contract-missing-master",
       "category": "合同",
+      "variant": "省略参数",
       "utterance": "给这张采购单出合同。供应商还没维护全称。",
       "expect": {
         "kind": "ask",
@@ -218,17 +416,205 @@
       }
     },
     {
+      "id": "contract-fuzzy",
+      "category": "合同",
+      "variant": "模糊",
+      "utterance": "生成合同",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["po_id", "invoice_type"],
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "contract-error-create",
+      "category": "合同",
+      "variant": "错误",
+      "utterance": "创建采购单再出合同",
+      "expect": {
+        "kind": "refuse",
+        "reason": "正式创建采购单还没开闸",
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "dropship-today",
+      "category": "代发",
+      "variant": "正常",
+      "utterance": "把今天的代发订单导出来。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "generate_dropship_workbook", "arguments": {} }],
+        "pending": true,
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "dropship-fuzzy",
+      "category": "代发",
+      "variant": "模糊",
+      "utterance": "代发表",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "generate_dropship_workbook", "arguments": {} }],
+        "pending": true,
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "dropship-error-create",
+      "category": "代发",
+      "variant": "错误",
+      "utterance": "创建代发采购单",
+      "expect": {
+        "kind": "refuse",
+        "reason": "正式创建采购单还没开闸",
+        "must_not": ["generate_dropship_workbook"]
+      }
+    },
+    {
+      "id": "dropship-adjacent-contract",
+      "category": "代发",
+      "variant": "相邻干扰",
+      "utterance": "今天的代发采购合同",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["代发", "合同"],
+        "must_not": ["generate_dropship_workbook", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "insole-query",
+      "category": "换鞋垫",
+      "variant": "正常",
+      "utterance": "查一下鞋垫订单有哪些待处理。",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "locate_insole_orders", "arguments": {} }],
+        "must_not": ["process_insole_orders", "submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "insole-process",
+      "category": "换鞋垫",
+      "variant": "正常",
+      "utterance": "鞋垫订单进行处理",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "process_insole_orders", "arguments": {} }],
+        "pending": true,
+        "must_not": ["submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "insole-fuzzy",
+      "category": "换鞋垫",
+      "variant": "模糊",
+      "utterance": "查一下鞋垫",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "locate_insole_orders", "arguments": {} }],
+        "must_not": ["process_insole_orders"]
+      }
+    },
+    {
+      "id": "insole-adjacent-po",
+      "category": "换鞋垫",
+      "variant": "相邻干扰",
+      "utterance": "查一下鞋垫采购单",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_purchase_orders", "arguments": { "query": "鞋垫" } }],
+        "must_not": ["locate_insole_orders", "process_insole_orders"]
+      }
+    },
+    {
+      "id": "insole-also-process-count",
+      "category": "换鞋垫",
+      "variant": "正常",
+      "utterance": "218 单也需要进行换鞋垫的动作",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "process_insole_orders", "arguments": {} }],
+        "pending": true,
+        "must_not": ["locate_insole_orders", "submit_exchange_dry_run"]
+      }
+    },
+    {
+      "id": "insole-pasted-oids",
+      "category": "换鞋垫",
+      "variant": "正常",
+      "utterance": "11553977\n11553117\n11553023\n这三单，也需要做下换鞋垫的动作",
+      "expect": {
+        "kind": "tools",
+        "tools": [{
+          "name": "process_insole_orders",
+          "arguments": { "o_ids": ["11553977", "11553117", "11553023"] }
+        }],
+        "pending": true,
+        "must_not": ["search_sales_orders", "submit_exchange_dry_run"]
+      }
+    },
+    {
       "id": "gb-lookup",
       "category": "国标",
+      "variant": "正常",
       "utterance": "毛绒玩具合同该填哪条执行标准？",
       "expect": {
         "kind": "tools",
-        "tools": [{ "name": "lookup_gb_standards", "arguments": { "query": "毛绒玩具" } }]
+        "route": "knowledge",
+        "tools": [{ "name": "lookup_gb_standards", "arguments": { "query": "毛绒玩具" } }],
+        "must_not": ["generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "gb-omit",
+      "category": "国标",
+      "variant": "省略参数",
+      "utterance": "该填哪条执行标准",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["query"],
+        "must_not": ["lookup_gb_standards", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "gb-status",
+      "category": "国标",
+      "variant": "模糊",
+      "utterance": "国标库有多少条",
+      "expect": {
+        "kind": "tools",
+        "route": "knowledge",
+        "tools": [{ "name": "gb_catalog_status", "arguments": {} }]
+      }
+    },
+    {
+      "id": "gb-error-barcode",
+      "category": "国标",
+      "variant": "错误",
+      "utterance": "国标码是条形码吗",
+      "expect": {
+        "kind": "ask",
+        "reason": "国标码是商品条码",
+        "must_not": ["lookup_gb_standards"]
+      }
+    },
+    {
+      "id": "gb-adjacent-sku",
+      "category": "国标",
+      "variant": "相邻干扰",
+      "utterance": "XZ25401308-101 用什么国标",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "lookup_gb_standards", "arguments": { "sku": "XZ25401308-101" } }],
+        "must_not": ["search_products"]
       }
     },
     {
       "id": "gaps-checklist",
       "category": "主数据缺口",
+      "variant": "正常",
       "utterance": "现在哪些供应商还没维护、哪些近期采购 SKU 没图？",
       "expect": {
         "kind": "tools",
@@ -236,13 +622,257 @@
       }
     },
     {
+      "id": "gaps-omit",
+      "category": "主数据缺口",
+      "variant": "省略参数",
+      "utterance": "主数据缺口",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "master_data_gaps", "arguments": {} }]
+      }
+    },
+    {
+      "id": "gaps-adjacent-contract",
+      "category": "主数据缺口",
+      "variant": "相邻干扰",
+      "utterance": "缺价的给 604264 出合同",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["缺口", "合同"],
+        "must_not": ["master_data_gaps", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "product-normal",
+      "category": "商品",
+      "variant": "正常",
+      "utterance": "查商品 XZ25401308-101",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_products", "arguments": { "query": "XZ25401308-101" } }]
+      }
+    },
+    {
+      "id": "product-omit",
+      "category": "商品",
+      "variant": "省略参数",
+      "utterance": "查商品",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["query"],
+        "must_not": ["search_products"]
+      }
+    },
+    {
+      "id": "product-fuzzy",
+      "category": "商品",
+      "variant": "模糊",
+      "utterance": "XZ25401308-101 是什么",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "search_products", "arguments": { "query": "XZ25401308-101" } }]
+      }
+    },
+    {
+      "id": "product-error-quote",
+      "category": "商品",
+      "variant": "错误",
+      "utterance": "XZ25401308-101 多少钱",
+      "expect": {
+        "kind": "refuse",
+        "reason": "历史报价还没开闸",
+        "must_not": ["search_products", "forecast_demand"]
+      }
+    },
+    {
+      "id": "rfq-ask-price",
+      "category": "询价",
+      "variant": "错误",
+      "utterance": "帮这个东西问个价",
+      "expect": {
+        "kind": "refuse",
+        "reason": "询价和找三家还没开闸",
+        "must_not": ["search_products", "order_suggestion"]
+      }
+    },
+    {
+      "id": "rfq-three-vendors",
+      "category": "询价",
+      "variant": "错误",
+      "utterance": "给 SKU XZ25401308-101 找三家询价",
+      "expect": {
+        "kind": "refuse",
+        "reason": "询价和找三家还没开闸",
+        "must_not": ["search_products"]
+      }
+    },
+    {
+      "id": "rfq-history",
+      "category": "询价",
+      "variant": "错误",
+      "utterance": "查一下以前这个东西多少钱",
+      "expect": {
+        "kind": "refuse",
+        "reason": "历史报价还没开闸",
+        "must_not": ["search_products"]
+      }
+    },
+    {
+      "id": "forecast-normal",
+      "category": "预测",
+      "variant": "正常",
+      "utterance": "XZ25401308-101 销量预测",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "forecast_demand", "arguments": { "keys": ["XZ25401308-101"] } }]
+      }
+    },
+    {
+      "id": "forecast-omit",
+      "category": "预测",
+      "variant": "省略参数",
+      "utterance": "给个订货建议",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["keys"],
+        "must_not": ["order_suggestion", "forecast_demand"]
+      }
+    },
+    {
+      "id": "forecast-suggest",
+      "category": "预测",
+      "variant": "模糊",
+      "utterance": "XZ25401308-101 该补多少",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "order_suggestion", "arguments": { "keys": ["XZ25401308-101"] } }]
+      }
+    },
+    {
+      "id": "forecast-error-create",
+      "category": "预测",
+      "variant": "错误",
+      "utterance": "创建采购单补货",
+      "expect": {
+        "kind": "refuse",
+        "reason": "正式创建采购单还没开闸",
+        "must_not": ["order_suggestion"]
+      }
+    },
+    {
+      "id": "forecast-adjacent-contract",
+      "category": "预测",
+      "variant": "相邻干扰",
+      "utterance": "XZ25401308-101 该补多少，顺便出合同",
+      "expect": {
+        "kind": "ask",
+        "ask_for": ["订货", "合同"],
+        "must_not": ["order_suggestion", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "quality-record",
+      "category": "品控",
+      "variant": "正常",
+      "utterance": "品控 佰特 604264 鞋垫开胶 3 双",
+      "expect": {
+        "kind": "tools",
+        "route": "workflow",
+        "tools": [{
+          "name": "record_quality_issue",
+          "arguments": { "description": "佰特 604264 鞋垫开胶 3 双", "po_id": "604264" }
+        }],
+        "pending": true,
+        "must_not": ["locate_insole_orders", "process_insole_orders"]
+      }
+    },
+    {
+      "id": "quality-query",
+      "category": "品控",
+      "variant": "省略参数",
+      "utterance": "品控查询",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "list_quality_issues", "arguments": { "query": "今天" } }]
+      }
+    },
+    {
+      "id": "quality-fuzzy",
+      "category": "品控",
+      "variant": "模糊",
+      "utterance": "查一下品控",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "list_quality_issues", "arguments": {} }]
+      }
+    },
+    {
+      "id": "quality-close",
+      "category": "品控",
+      "variant": "正常",
+      "utterance": "品控关闭 abcdef",
+      "expect": {
+        "kind": "tools",
+        "route": "workflow",
+        "tools": [{ "name": "resolve_quality_issue", "arguments": { "issue_id": "abcdef" } }],
+        "pending": true,
+        "must_not": ["record_quality_issue"]
+      }
+    },
+    {
+      "id": "quality-cancel",
+      "category": "品控",
+      "variant": "正常",
+      "utterance": "撤销品控 abcdef",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "cancel_quality_issue", "arguments": { "issue_id": "abcdef" } }],
+        "pending": true,
+        "must_not": ["record_quality_issue"]
+      }
+    },
+    {
+      "id": "quality-error-batch",
+      "category": "品控",
+      "variant": "错误",
+      "utterance": "把所有品控一键关闭",
+      "expect": {
+        "kind": "ask",
+        "reason": "不能批量关",
+        "must_not": ["resolve_quality_issue", "cancel_quality_issue"]
+      }
+    },
+    {
+      "id": "quality-push",
+      "category": "品控",
+      "variant": "正常",
+      "utterance": "发品控日报",
+      "expect": {
+        "kind": "tools",
+        "tools": [{ "name": "push_quality_report", "arguments": {} }],
+        "pending": true
+      }
+    },
+    {
       "id": "session-new-topic-anaphora",
       "category": "会话管理",
+      "variant": "错误",
       "utterance": "上次那个呢",
       "expect": {
         "kind": "ask",
         "reason": "跨 epoch 后上文指代不能当已查过的单号用，必须追问是哪张单。",
         "must_not": ["get_purchase_order", "generate_purchase_contract"]
+      }
+    },
+    {
+      "id": "agent-open-review",
+      "category": "开放分析",
+      "variant": "正常",
+      "utterance": "看看最近采购有什么需要我注意的",
+      "expect": {
+        "kind": "agent",
+        "route": "agent",
+        "must_not": ["delivery_reminders", "dashboard_summary"]
       }
     }
   ]

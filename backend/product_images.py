@@ -9,9 +9,10 @@ import re
 import secrets
 import sqlite3
 import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 from .paths import ROOT, local_dir, resolve_repo_path
@@ -151,11 +152,19 @@ class ProductImageService:
             _ensure_column(conn, "product_image_jobs", "claimed_at", "TEXT")
             _ensure_column(conn, "product_image_jobs", "attempts", "INTEGER NOT NULL DEFAULT 0")
 
-    def _connect(self):
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.database_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
+        try:
+            conn.execute("PRAGMA journal_mode = WAL")
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     @staticmethod
     def _claim_stamp(row) -> str | None:

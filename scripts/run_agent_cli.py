@@ -43,7 +43,10 @@ def main():
     args = parser.parse_args()
 
     if args.status:
-        from backend.app import DINGTALK_STREAM, REMINDER_NOTIFIER, REMINDER_SCHEDULER
+        from backend.app import (
+            DINGTALK_STREAM, DROPSHIP_SCHEDULER, JOB_WORKER, OUTBOX,
+            QUALITY_SCHEDULER, REMINDER_NOTIFIER, REMINDER_SCHEDULER, STAFF_DIRECTORY,
+        )
         print(json.dumps({
             "agent": AGENT.status(),
             "forecast": FORECAST.status(),
@@ -52,6 +55,11 @@ def main():
                 "notifier": REMINDER_NOTIFIER.status(),
                 "reminder": REMINDER_SCHEDULER.status(),
             },
+            "quality": QUALITY_SCHEDULER.status(),
+            "dropship": DROPSHIP_SCHEDULER.status(),
+            "jobs": JOB_WORKER.status(),
+            "outbox": {"pending": OUTBOX.pending_count()},
+            "bindings": len(STAFF_DIRECTORY.list()),
         }, ensure_ascii=False, indent=2))
         return
 

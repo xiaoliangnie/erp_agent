@@ -24,6 +24,7 @@ from .database import (
     fetch_contract_order,
     fetch_contract_order_choices,
     fetch_exchange_products,
+    fetch_followup_purchase_rows,
     fetch_realtime_purchase_rows,
     fetch_realtime_sync_state,
     fetch_realtime_years,
@@ -40,23 +41,33 @@ from .agent import (
     AgentDisabled,
     AgentStore,
     AuditLog,
+    JobQueue,
+    JobWorker,
     LLMError,
     MaintenanceScheduler,
     OperatorMemories,
+    Outbox,
     ToolError,
+    WorkItems,
     agent_database_path,
     build_agent,
     flag,
 )
 from .quality import QualityError, build_quality, report_link_valid
 from .delivery_reminders import build_reminders, filter_orders
-from .dingtalk import DailyReminderScheduler, DingTalkError, DingTalkStreamChannel, build_dingtalk
+from .dingtalk import (
+    DailyReminderScheduler, DingTalkError, DingTalkStreamChannel, build_dingtalk,
+    notify_pending_after_restart,
+)
 from .forecast import ForecastError, ForecastService, ForecastUnavailable
 from .business_time import business_today
-from .staff_names import WEB_OPERATOR_UNBOUND
+from .staff_names import WEB_OPERATOR_UNBOUND, buyer_names_equivalent
+from .agent.users import is_confirmed_admin_name
+from .agent.web_auth import WebAuth, WebAuthError
 from .product_images import ProductImageError, ProductImageService
 from .order_source import OrderSourceError, fetch_exchange_order_items, fetch_exchange_orders
 from .erp import DigitalRuntime, DigitalWorkerLoop, ErpKeepAlive, public_worker_status
+from .dropship.scheduler import DailyDropshipScheduler
 from .realtime_mirror import build_mirror_from_settings
 from .gb_standards import (
     build_gb_sync_from_settings,
@@ -85,11 +96,13 @@ LEGACY_PAGES = {
     "/合同生成.html": "/contract",
     "/换货.html": "/exchange",
     "/对话.html": "/chat",
+    "/工作台.html": "/workbench",
     "/看板": HOME,
     "/台账": "/ledger",
     "/合同": "/contract",
     "/换货": "/exchange",
     "/对话": "/chat",
+    "/工作台": "/workbench",
 }
 # 换货核心给 Playwright 注入；油猴脚本已退役，路径仍提供以免旧书签 404。
 STATIC_FILES = {
@@ -141,6 +154,18 @@ ERP_KEEPALIVE = ErpKeepAlive(
     end_time=setting("ERP_AI_KEEPALIVE_END", "18:30"),
     interval_seconds=int(setting("ERP_AI_KEEPALIVE_INTERVAL_SECONDS", "180") or 180),
 )
+DROPSHIP_SCHEDULER = DailyDropshipScheduler(
+    runtime=DIGITAL_WORKER.runtime,
+    root=ROOT,
+    env_path=REALTIME_ENV_PATH,
+    send_time=setting("DROPSHIP_SCHEDULE_TIME", "14:00"),
+    prepare_lead_minutes=int(setting("DROPSHIP_PREPARE_LEAD_MINUTES", "30") or 30),
+    enabled=flag(setting("DROPSHIP_SCHEDULE_ENABLED", "false")),
+    conversation_id=setting("DROPSHIP_GROUP_CONVERSATION_ID", "")
+    or setting("DINGTALK_GROUP_CONVERSATION_ID", ""),
+    oto_buyers=setting("DROPSHIP_OTO_BUYERS", "安安"),
+    oto_user_ids=setting("DROPSHIP_OTO_USER_IDS", ""),
+)
 REALTIME_MIRROR, REALTIME_MIRROR_SCHEDULER = build_mirror_from_settings(
     setting, root=ROOT, env_path=REALTIME_ENV_PATH,
 )
@@ -153,6 +178,8 @@ _cache = {}
 _source_state = {"source": None, "warning": None, "year": None}
 _cache_lock = threading.Lock()
 _year_locks = {}
+_followup_cache = {}
+_followup_lock = threading.Lock()
 
 
 def _year_lock(year: str):
@@ -216,32 +243,21 @@ def source_cache(requested_year=None):
                 return cached
         rows = fetch_realtime_purchase_rows(year, REALTIME_ENV_PATH)
         source = "供应链 API 本地实时镜像"
-        warning = None
         sync_state = fetch_realtime_sync_state(REALTIME_ENV_PATH)
-        if not sync_state["fresh"]:
-            warning = (
-                f"数据库镜像最后同步于 {sync_state['syncedAt'] or '未知时间'}"
-                + (f"，当前延迟约 {sync_state['syncLagMinutes']} 分钟" if sync_state["syncLagMinutes"] is not None else "")
-            )
-        if "purchase:failed" in sync_state.get("sourceStatus", ""):
-            failure_warning = "API 增量同步当前失败，请检查 Client 路由授权"
-            warning = f"{warning}；{failure_warning}" if warning else failure_warning
+        warning = _mirror_warning(sync_state)
         window_warning = purchase_window_warning(year)
         if window_warning:
             warning = f"{warning}；{window_warning}" if warning else window_warning
         dashboard = build_dashboard_payload(rows, source)
-        delivery = build_delivery_payload(rows, source)
-        for value in (dashboard, delivery):
-            value["meta"].update(
-                warning=warning, availableYears=years, selectedYear=year,
-                databaseNow=sync_state["databaseNow"], syncedAt=sync_state["syncedAt"],
-                syncLagMinutes=sync_state["syncLagMinutes"], fresh=sync_state["fresh"],
-                sourceStatus=sync_state.get("sourceStatus", ""),
-                timezone="Asia/Shanghai",
-            )
+        dashboard["meta"].update(
+            warning=warning, availableYears=years, selectedYear=year,
+            databaseNow=sync_state["databaseNow"], syncedAt=sync_state["syncedAt"],
+            syncLagMinutes=sync_state["syncLagMinutes"], fresh=sync_state["fresh"],
+            sourceStatus=sync_state.get("sourceStatus", ""),
+            timezone="Asia/Shanghai",
+        )
         today = business_today().isoformat()
         dashboard["meta"]["today"] = today
-        delivery["meta"]["today"] = today
         with _cache_lock:
             _cache[year] = {
                 # 年度明细从远程镜像读取可能耗时较长，TTL 应从构建完成时开始计算。
@@ -250,16 +266,67 @@ def source_cache(requested_year=None):
                 "meta": {"source": source, "year": year, "availableYears": years,
                          "warning": warning, "today": today, "rows": len(rows)},
                 "dashboard": dashboard,
-                "delivery": delivery,
             }
             trim_source_cache(_cache, now, keep_key=year)
             _source_state.update(source=source, warning=warning, year=year)
             return _cache[year]
 
 
+def _mirror_warning(sync_state):
+    warning = None
+    if not sync_state["fresh"]:
+        warning = (
+            f"数据库镜像最后同步于 {sync_state['syncedAt'] or '未知时间'}"
+            + (f"，当前延迟约 {sync_state['syncLagMinutes']} 分钟" if sync_state["syncLagMinutes"] is not None else "")
+        )
+    if "purchase:failed" in sync_state.get("sourceStatus", ""):
+        failure_warning = "API 增量同步当前失败，请检查 Client 路由授权"
+        warning = f"{warning}；{failure_warning}" if warning else failure_warning
+    return warning
+
+
+def followup_delivery_cache():
+    """交期台账：全库跟单池，不按年度截断。"""
+    now = time.monotonic()
+    with _cache_lock:
+        cached = _followup_cache.get("all")
+        if cached and cached["expires"] > now:
+            return cached
+    with _followup_lock:
+        now = time.monotonic()
+        with _cache_lock:
+            cached = _followup_cache.get("all")
+            if cached and cached["expires"] > now:
+                return cached
+        years = fetch_realtime_years(REALTIME_ENV_PATH)
+        rows = fetch_followup_purchase_rows(REALTIME_ENV_PATH)
+        source = "供应链 API 本地实时镜像 · 跟单池"
+        sync_state = fetch_realtime_sync_state(REALTIME_ENV_PATH)
+        warning = _mirror_warning(sync_state)
+        delivery = build_delivery_payload(rows, source)
+        delivery["meta"].update(
+            warning=warning, availableYears=years,
+            selectedYear=years[0] if years else "",
+            databaseNow=sync_state["databaseNow"], syncedAt=sync_state["syncedAt"],
+            syncLagMinutes=sync_state["syncLagMinutes"], fresh=sync_state["fresh"],
+            sourceStatus=sync_state.get("sourceStatus", ""),
+            timezone="Asia/Shanghai", pool="followup",
+        )
+        today = business_today().isoformat()
+        delivery["meta"]["today"] = today
+        cached = {
+            "expires": time.monotonic() + CACHE_TTL_SECONDS,
+            "delivery": delivery,
+            "rows": rows,
+        }
+        with _cache_lock:
+            _followup_cache["all"] = cached
+        return cached
+
+
 def payloads(requested_year=None):
     cached = source_cache(requested_year)
-    return cached["dashboard"], cached["delivery"]
+    return cached["dashboard"], followup_delivery_cache()["delivery"]
 
 
 def agent_rows(requested_year=None):
@@ -269,12 +336,28 @@ def agent_rows(requested_year=None):
     return cached["rows"], cached["meta"]
 
 
+def followup_rows(requested_year=None):
+    """跟单催办：全库已确认未完结，与交期台账共用跟单缓存。"""
+    del requested_year
+    cached = followup_delivery_cache()
+    return cached["rows"], {"source": "followup"}
+
+
 FORECAST = ForecastService.from_settings(setting, root=ROOT, env_path=REALTIME_ENV_PATH)
 AGENT_STORE = AgentStore(agent_database_path(setting, ROOT))
+WEB_AUTH = WebAuth(AGENT_STORE)
 AUDIT = AuditLog(AGENT_STORE)
+WEB_BIND_HINT = "请先到钉钉群里发「绑定网页」，把私信里的 20 位码填到网页"
 DINGTALK_SENDER, STAFF_DIRECTORY, REMINDER_NOTIFIER = build_dingtalk(
     setting=setting, store=AGENT_STORE, audit=AUDIT, flag=flag, root=ROOT,
 )
+DROPSHIP_SCHEDULER.sender = DINGTALK_SENDER
+DROPSHIP_SCHEDULER.audit = AUDIT
+DROPSHIP_SCHEDULER.directory = STAFF_DIRECTORY
+if not DROPSHIP_SCHEDULER.conversation_id:
+    DROPSHIP_SCHEDULER.conversation_id = str(
+        getattr(DINGTALK_SENDER, "group_conversation_id", "") or ""
+    )
 QUALITY, QUALITY_SCHEDULER = build_quality(
     setting=setting, store=AGENT_STORE, sender=DINGTALK_SENDER, root=ROOT,
     env_path=REALTIME_ENV_PATH, audit=AUDIT, flag=flag,
@@ -282,18 +365,38 @@ QUALITY, QUALITY_SCHEDULER = build_quality(
 MEMORIES = OperatorMemories(
     AGENT_STORE, enabled=flag(setting("AGENT_MEMORY_ENABLED", "false")),
 )
+WORK_ITEMS = WorkItems(AGENT_STORE)
+JOBS = JobQueue(AGENT_STORE)
+OUTBOX = Outbox(
+    AGENT_STORE,
+    sender=DINGTALK_SENDER if DINGTALK_SENDER.configured else None,
+)
+REMINDER_NOTIFIER.outbox = OUTBOX
+JOB_WORKER = JobWorker(
+    JOBS,
+    outbox=OUTBOX,
+    handlers={
+        "outbox_flush": lambda payload: {
+            "delivered": len(OUTBOX.deliver_due(limit=int((payload or {}).get("limit") or 20))),
+        },
+    },
+)
 AGENT = build_agent(
     setting=setting, root=ROOT, env_path=REALTIME_ENV_PATH, fetch_rows=agent_rows,
+    fetch_followup=followup_rows,
     exchange=EXCHANGE, erp=DIGITAL_WORKER.runtime, forecast=FORECAST,
     notifier=REMINDER_NOTIFIER if REMINDER_NOTIFIER.enabled else None,
     store=AGENT_STORE, audit=AUDIT, directory=STAFF_DIRECTORY,
     quality=QUALITY if QUALITY.enabled else None, memories=MEMORIES,
     mirror=REALTIME_MIRROR,
 )
+JOB_WORKER.expire = AGENT.actions.expire_due
+JOB_WORKER.handlers["pending_expire"] = lambda payload: {"expired": AGENT.actions.expire_due()}
 REMINDER_SCHEDULER = DailyReminderScheduler(
-    notifier=REMINDER_NOTIFIER, fetch_rows=agent_rows,
+    notifier=REMINDER_NOTIFIER, fetch_rows=agent_rows, fetch_followup=followup_rows,
     send_time=setting("DINGTALK_REMINDER_TIME", "08:30"),
     limit=int(setting("DINGTALK_REMINDER_LIMIT", "200") or 200),
+    profile="followup",
 )
 DINGTALK_STREAM = DingTalkStreamChannel(
     runner=AGENT, sender=DINGTALK_SENDER,
@@ -301,11 +404,35 @@ DINGTALK_STREAM = DingTalkStreamChannel(
     client_secret=setting("DINGTALK_CLIENT_SECRET", ""),
     audit=AUDIT, enabled=flag(setting("DINGTALK_ENABLED", "false")),
     directory=STAFF_DIRECTORY, quality=QUALITY, memories=MEMORIES,
+    admin_user_ids=[
+        item.strip() for item in setting("DINGTALK_ADMIN_USER_IDS", "").split(",")
+        if item.strip()
+    ],
 )
 MAINTENANCE = MaintenanceScheduler(
     store=AGENT_STORE, root=ROOT,
     retention_days=int(setting("AGENT_RETENTION_DAYS", "90") or 90),
 )
+
+
+def _principal_is_admin(principal: dict) -> bool:
+    bound = STAFF_DIRECTORY.find_binding(
+        operator=principal.get("operator") or "",
+        actor_id=principal.get("actorId") or "",
+    )
+    if bound.get("role") == "admin":
+        return True
+    return is_confirmed_admin_name(bound.get("buyerName") or principal.get("operator") or "")
+
+
+def _owns_record(principal: dict, *, operator="", user_id="", actor_id="", admin=False) -> bool:
+    if admin:
+        return True
+    if principal.get("userId") and user_id and principal["userId"] == user_id:
+        return True
+    if principal.get("actorId") and actor_id and principal["actorId"] == actor_id:
+        return True
+    return buyer_names_equivalent(principal.get("operator") or "", operator, include_nick=True)
 
 
 def _notify_gb_contract_changes(sync_result: dict) -> dict:
@@ -664,12 +791,35 @@ class Handler(BaseHTTPRequestHandler):
     def agent_operator(self, body=None):
         return str(self.headers.get("X-Agent-Operator") or (body or {}).get("operator") or "").strip()[:120]
 
+    def agent_web_token(self, body=None):
+        return str(self.headers.get("X-Agent-Web-Token") or (body or {}).get("webToken") or "").strip()
+
+    def agent_principal(self, body=None, *, required=False):
+        token = self.agent_web_token(body)
+        claimed = self.agent_operator(body)
+        session = WEB_AUTH.get_session(token) if token else {}
+        if session:
+            if claimed and not buyer_names_equivalent(
+                claimed, session["buyerName"], include_nick=True,
+            ):
+                raise ActionError("网页署名与已绑定身份不一致", 403)
+            return {
+                "operator": session["buyerName"],
+                "actorId": session["senderId"],
+                "userId": session["userId"],
+            }
+        if required:
+            raise ActionError(WEB_BIND_HINT, 401)
+        return {"operator": claimed, "actorId": "", "userId": ""}
+
     def agent_error(self, exc):
         """把各子系统的异常映射成稳定的 HTTP 状态。"""
         if isinstance(exc, AgentDisabled):
             return self.json_response({"ok": False, "error": str(exc)}, 503)
         if isinstance(exc, ActionError):
             return self.json_response({"ok": False, "error": str(exc)}, exc.status)
+        if isinstance(exc, WebAuthError):
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
         if isinstance(exc, ForecastUnavailable):
             return self.json_response({"ok": False, "error": str(exc)}, 503)
         if isinstance(exc, (LLMError, DingTalkError)):
@@ -695,33 +845,86 @@ class Handler(BaseHTTPRequestHandler):
                     "dingtalk": {**DINGTALK_STREAM.status(), "reminder": REMINDER_SCHEDULER.status(),
                                  "notifier": REMINDER_NOTIFIER.status()},
                     "reservedTools": RESERVED_TOOLS,
+                    "quality": QUALITY_SCHEDULER.status(),
+                    "dropship": DROPSHIP_SCHEDULER.status(),
+                    "jobs": JOB_WORKER.status(),
+                    "outbox": {"pending": OUTBOX.pending_count()},
                 })
+            if path == "/api/forecast/status":
+                return self.json_response({"ok": True, **FORECAST.status()})
+            principal = self.agent_principal(required=True)
+            admin = _principal_is_admin(principal)
+            if path == "/api/agent/workbench":
+                return self.json_response(WORK_ITEMS.assemble(
+                    actions=AGENT.actions,
+                    exchange=EXCHANGE,
+                    quality=QUALITY,
+                    jobs=JOBS,
+                    outbox=OUTBOX,
+                    operator="" if admin else principal["operator"],
+                    limit=int(query.get("limit", ["50"])[0] or 50),
+                ))
             if path == "/api/agent/actions":
-                return self.json_response({"actions": AGENT.pending(
-                    session_id=query.get("session_id", [None])[0],
-                    limit=query.get("limit", ["20"])[0],
-                )})
+                kwargs = {
+                    "session_id": query.get("session_id", [None])[0],
+                    "limit": query.get("limit", ["20"])[0],
+                }
+                if not admin:
+                    kwargs.update(
+                        operator=principal["operator"],
+                        actor_id=principal["actorId"],
+                        user_id=principal["userId"],
+                    )
+                return self.json_response({"actions": AGENT.pending(**kwargs)})
             match = re.fullmatch(r"/api/agent/actions/([a-f0-9]{24})", path)
             if match:
-                return self.json_response(AGENT.actions.get(match.group(1)))
+                action = AGENT.actions.get(match.group(1))
+                if not _owns_record(
+                    principal, operator=action.get("operator") or "",
+                    user_id=action.get("userId") or "", actor_id=action.get("actorId") or "",
+                    admin=admin,
+                ):
+                    raise ActionError("无权查看该待确认动作", 403)
+                return self.json_response(action)
             match = re.fullmatch(r"/api/agent/sessions/([a-f0-9]{24})/messages", path)
             if match:
+                session = AGENT.sessions.get(match.group(1))
+                if not session:
+                    raise ActionError("会话不存在", 404)
+                if not _owns_record(
+                    principal, operator=session.get("operator") or "",
+                    user_id=session.get("userId") or "", admin=admin,
+                ):
+                    raise ActionError("无权查看该会话", 403)
                 return self.json_response({"messages": AGENT.sessions.transcript(
                     match.group(1), limit=int(query.get("limit", ["50"])[0] or 50)
                 )})
-            if path == "/api/agent/audit/runs":
-                return self.json_response({"runs": AUDIT.recent_runs(
-                    limit=int(query.get("limit", ["20"])[0] or 20)
-                )})
-            if path == "/api/agent/audit/tools":
+            if path in ("/api/agent/audit/runs", "/api/agent/audit/tools"):
+                if not admin:
+                    raise ActionError("只有管理员可以查看审计", 403)
+                if path.endswith("/runs"):
+                    return self.json_response({"runs": AUDIT.recent_runs(
+                        limit=int(query.get("limit", ["20"])[0] or 20)
+                    )})
                 return self.json_response({"tools": AUDIT.recent_tools(
                     limit=int(query.get("limit", ["50"])[0] or 50)
                 )})
             if path == "/api/agent/staff":
-                return self.json_response({"bindings": STAFF_DIRECTORY.list()})
+                bindings = STAFF_DIRECTORY.list()
+                if not admin:
+                    bindings = [
+                        item for item in bindings
+                        if (principal["actorId"] and item.get("dingtalkUserId") == principal["actorId"])
+                        or buyer_names_equivalent(
+                            principal["operator"], item.get("buyerName") or "", include_nick=True,
+                        )
+                    ]
+                return self.json_response({"bindings": bindings})
             if path == "/api/agent/reminders":
-                rows, meta = agent_rows(query.get("year", [None])[0])
-                reminders = build_reminders(rows, query.get("today", [None])[0])
+                rows, meta = followup_rows()
+                reminders = build_reminders(
+                    rows, query.get("today", [None])[0], profile="followup",
+                )
                 orders, matched = filter_orders(
                     reminders,
                     buckets=query.get("bucket") or None,
@@ -733,8 +936,6 @@ class Handler(BaseHTTPRequestHandler):
                     "totals": reminders["totals"], "buckets": reminders["buckets"],
                     "byBuyer": reminders["byBuyer"], "matched": matched, "orders": orders,
                 })
-            if path == "/api/forecast/status":
-                return self.json_response({"ok": True, **FORECAST.status()})
             self.send_error(404, "Not Found")
         except Exception as exc:
             self.agent_error(exc)
@@ -744,47 +945,13 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             body = self.read_json_body(max_size=2 * 1024 * 1024)
-            operator = self.agent_operator(body)
-            if path == "/api/agent/chat":
-                return self.json_response(AGENT.chat(
-                    message=body.get("message") or "",
-                    session_key=str(body.get("sessionKey") or body.get("sessionId") or operator or "web"),
-                    operator=operator,
-                    channel="web",
-                ))
-            match = re.fullmatch(r"/api/agent/actions/([a-f0-9]{24})/(confirm|cancel)", path)
-            if match:
-                action_id, action = match.groups()
-                if action == "confirm":
-                    return self.json_response(AGENT.confirm(action_id, operator, channel="web"))
-                return self.json_response(AGENT.cancel(action_id, operator))
-            match = re.fullmatch(r"/api/agent/sessions/([a-f0-9]{24})/reset", path)
-            if match:
-                return self.json_response(AGENT.sessions.reset(match.group(1)))
-            if path == "/api/agent/staff":
-                return self.json_response(STAFF_DIRECTORY.upsert(
-                    body.get("buyerName") or body.get("buyer_name") or "",
-                    dingtalk_user_id=body.get("dingtalkUserId") or "",
-                    mobile=body.get("mobile") or "",
-                    note=body.get("note") or "",
-                    aliases=body.get("aliases") or (),
-                ), 201)
-            if path == "/api/agent/quality/report":
-                if not STAFF_DIRECTORY.known_operator(operator):
-                    raise ActionError(WEB_OPERATOR_UNBOUND, 403)
-                return self.json_response(QUALITY_SCHEDULER.run_once(operator=operator or "web"))
-            if path == "/api/agent/reminders/push":
-                if not STAFF_DIRECTORY.known_operator(operator):
-                    raise ActionError(WEB_OPERATOR_UNBOUND, 403)
-                buckets = body.get("buckets")
-                if buckets is not None and not isinstance(buckets, list):
-                    raise ValueError("buckets 必须是数组")
-                return self.json_response(REMINDER_SCHEDULER.run_once(
-                    today=body.get("today"),
-                    buyer=str(body.get("buyer") or "").strip(),
-                    buckets=buckets,
-                    operator=operator or "web",
-                ))
+            if path == "/api/agent/web-bind":
+                result = WEB_AUTH.consume_code(
+                    operator=self.agent_operator(body),
+                    code=str(body.get("code") or body.get("bindCode") or ""),
+                    directory=STAFF_DIRECTORY,
+                )
+                return self.json_response({"ok": True, **result})
             if path == "/api/forecast/predict":
                 return self.json_response(FORECAST.predict(
                     body.get("keys") or body.get("skus") or [],
@@ -802,6 +969,74 @@ class Handler(BaseHTTPRequestHandler):
                 ))
             if path == "/api/forecast/reload":
                 return self.json_response({"ok": True, **FORECAST.reload()})
+            principal = self.agent_principal(body, required=True)
+            operator = principal["operator"]
+            actor_id = principal["actorId"]
+            if path == "/api/agent/chat":
+                return self.json_response(AGENT.chat(
+                    message=body.get("message") or "",
+                    session_key=str(body.get("sessionKey") or body.get("sessionId") or operator or "web"),
+                    operator=operator,
+                    channel="web",
+                    actor_id=actor_id,
+                ))
+            match = re.fullmatch(r"/api/agent/actions/([a-f0-9]{24})/(confirm|cancel)", path)
+            if match:
+                action_id, action = match.groups()
+                if action == "confirm":
+                    return self.json_response(AGENT.confirm(
+                        action_id, operator, channel="web", actor_id=actor_id,
+                    ))
+                return self.json_response(AGENT.cancel(
+                    action_id, operator, channel="web", actor_id=actor_id,
+                ))
+            match = re.fullmatch(r"/api/agent/sessions/([a-f0-9]{24})/reset", path)
+            if match:
+                session = AGENT.sessions.get(match.group(1))
+                if not session:
+                    raise ActionError("会话不存在", 404)
+                if not _owns_record(
+                    principal, operator=session.get("operator") or "",
+                    user_id=session.get("userId") or "",
+                    admin=_principal_is_admin(principal),
+                ):
+                    raise ActionError("无权重置该会话", 403)
+                return self.json_response(AGENT.sessions.reset(match.group(1)))
+            if path == "/api/agent/staff":
+                if not _principal_is_admin(principal):
+                    raise ActionError("只有管理员可以改员工绑定", 403)
+                return self.json_response(STAFF_DIRECTORY.upsert(
+                    body.get("buyerName") or body.get("buyer_name") or "",
+                    dingtalk_user_id=body.get("dingtalkUserId") or "",
+                    mobile=body.get("mobile") or "",
+                    note=body.get("note") or "",
+                    aliases=body.get("aliases") or (),
+                ), 201)
+            match = re.fullmatch(r"/api/agent/quality/([a-f0-9]{6})/(resolve|cancel)", path)
+            if match:
+                issue_id, decision = match.groups()
+                return self.json_response(WORK_ITEMS.decide_quality(
+                    QUALITY, issue_id=issue_id, decision=decision, operator=operator,
+                    resolution=str(body.get("resolution") or ""),
+                    directory=STAFF_DIRECTORY,
+                ))
+            if path == "/api/agent/quality/report":
+                if not STAFF_DIRECTORY.known_operator(operator):
+                    raise ActionError(WEB_OPERATOR_UNBOUND, 403)
+                return self.json_response(QUALITY_SCHEDULER.run_once(operator=operator or "web"))
+            if path == "/api/agent/reminders/push":
+                if not STAFF_DIRECTORY.known_operator(operator):
+                    raise ActionError(WEB_OPERATOR_UNBOUND, 403)
+                buckets = body.get("buckets")
+                if buckets is not None and not isinstance(buckets, list):
+                    raise ValueError("buckets 必须是数组")
+                return self.json_response(REMINDER_SCHEDULER.run_once(
+                    today=body.get("today"),
+                    buyer=str(body.get("buyer") or "").strip(),
+                    buckets=buckets,
+                    operator=operator or "web",
+                    profile="followup",
+                ))
             self.send_error(404, "Not Found")
         except Exception as exc:
             self.agent_error(exc)
@@ -992,19 +1227,17 @@ class Handler(BaseHTTPRequestHandler):
         try:
             with connect(REALTIME_ENV_PATH, autocommit=True) as conn:
                 with conn.cursor() as cursor:
-                    cursor.execute(f"SELECT COUNT(*) AS total FROM `{REALTIME_ITEM_TABLE}`")
-                    status = cursor.fetchone()
-            payload["rows"] = status["total"]
+                    cursor.execute("SELECT 1")
+                    cursor.fetchone()
         except Exception as exc:
             payload.update({"ok": False, "database": "unavailable", "error": type(exc).__name__})
-        else:
-            try:
-                sync = fetch_realtime_sync_state(REALTIME_ENV_PATH)
-                payload["syncedAt"] = sync.get("syncedAt") or ""
-                payload["syncLagMinutes"] = sync.get("syncLagMinutes")
-            except Exception:
-                payload["syncedAt"] = ""
-                payload["syncLagMinutes"] = None
+        try:
+            sync = fetch_realtime_sync_state(REALTIME_ENV_PATH)
+            payload["syncedAt"] = sync.get("syncedAt") or ""
+            payload["syncLagMinutes"] = sync.get("syncLagMinutes")
+        except Exception:
+            payload.setdefault("syncedAt", "")
+            payload.setdefault("syncLagMinutes", None)
         payload.update({
             "activeSource": _source_state["source"] or "供应链 API 本地实时镜像",
             "activeYear": _source_state["year"],
@@ -1016,6 +1249,8 @@ class Handler(BaseHTTPRequestHandler):
                 **DIGITAL_WORKER.status(),
                 "keepAlive": ERP_KEEPALIVE.status(),
             })),
+            "jobs": _safe_status(JOB_WORKER.status),
+            "outbox": _safe_status(lambda: {"pending": OUTBOX.pending_count()}),
             "agent": _safe_status(lambda: {
                 "enabled": AGENT.enabled, "available": AGENT.available,
                 "llm": AGENT.llm.status(), "tools": len(AGENT.registry.names()),
@@ -1027,6 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
                 "sender": _safe_status(DINGTALK_SENDER.status),
             },
             "quality": _safe_status(QUALITY_SCHEDULER.status),
+            "dropship": _safe_status(DROPSHIP_SCHEDULER.status),
         })
         self.json_response(payload, 200 if payload["ok"] else 503)
 
@@ -1041,8 +1277,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, path, year):
         try:
-            dashboard, delivery = payloads(year)
-            self.json_response(dashboard if path.endswith("dashboard") else delivery)
+            if path.endswith("delivery"):
+                self.json_response(followup_delivery_cache()["delivery"])
+                return
+            self.json_response(source_cache(year)["dashboard"])
         except Exception as exc:
             logger.exception("API error")
             self.json_response({"ok": False, "error": "采购数据暂时不可用"}, 503)
@@ -1147,6 +1385,21 @@ def main():
         )
     else:
         logger.info("Agent 未启用（AGENT_ENABLED 或模型凭证未就绪），/api/agent/chat 返回 503")
+    restart_pending = list(getattr(AGENT, "restart_pending", None) or [])
+    restart_ttl = int(getattr(AGENT, "restart_confirm_seconds", 300) or 300)
+    if restart_pending:
+        JOBS.enqueue("pending_expire", {}, delay_seconds=restart_ttl + 10, max_attempts=3)
+        restart_notify = notify_pending_after_restart(
+            restart_pending,
+            sender=DINGTALK_SENDER if DINGTALK_SENDER.configured else None,
+            directory=STAFF_DIRECTORY,
+            audit=AUDIT,
+            ttl_seconds=restart_ttl,
+        )
+        logger.warning(
+            "进程重启补发待确认：%s 条，已私聊 %s，跳过 %s",
+            restart_notify["count"], restart_notify["sent"], restart_notify["skipped"],
+        )
     stream_status = DINGTALK_STREAM.start()
     if stream_status.get("running"):
         logger.info("钉钉 Stream 已启动（企业内部应用机器人长连）")
@@ -1170,7 +1423,15 @@ def main():
     if flag(setting("QUALITY_REPORT_ENABLED", "false")) and REMINDER_NOTIFIER.enabled:
         QUALITY_SCHEDULER.start()
         logger.info("每日品控日报已启用：%s", QUALITY_SCHEDULER.status()["sendTime"])
+    DROPSHIP_SCHEDULER.start()
+    if DROPSHIP_SCHEDULER.enabled:
+        logger.info(
+            "每日代发已启用：%s 备表、%s 发群并私聊（不覆盖已填表）",
+            DROPSHIP_SCHEDULER.status()["prepareTime"],
+            DROPSHIP_SCHEDULER.status()["sendTime"],
+        )
     MAINTENANCE.start()
+    JOB_WORKER.start()
     erp_status = DIGITAL_WORKER.start()
     if erp_status.get("running"):
         logger.info("ERP Digital Worker 已启用：换货、探测、搜 SKU、商品图片走后端 Playwright")
@@ -1178,7 +1439,7 @@ def main():
         logger.warning("ERP Digital Worker 未启动：%s", erp_status.get("lastError") or "未知原因")
     keep_status = ERP_KEEPALIVE.start()
     if keep_status.get("running"):
-        logger.info("ERP 登录态保活已启用：%s", keep_status.get("window"))
+        logger.info("ERP 登录态随服务启停（浏览器 + cookie，不固定订单页）")
     elif ERP_KEEPALIVE.enabled:
         logger.info("ERP 登录态保活未启动：%s", keep_status.get("lastError") or "未配置")
     try:
@@ -1190,7 +1451,9 @@ def main():
         GB_STANDARDS_SCHEDULER.stop()
         REMINDER_SCHEDULER.stop()
         QUALITY_SCHEDULER.stop()
+        DROPSHIP_SCHEDULER.stop()
         MAINTENANCE.stop()
+        JOB_WORKER.stop()
         DINGTALK_STREAM.stop()
         ERP_KEEPALIVE.stop()
         DIGITAL_WORKER.stop()

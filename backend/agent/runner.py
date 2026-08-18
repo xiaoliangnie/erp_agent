@@ -17,8 +17,11 @@ from .audit import AuditLog, summarize
 from .llm import LLMClient, LLMError
 from .sessions import SessionStore, encode_tool_result
 from ..staff_names import VIEWER_WRITE_DENIED, WEB_OPERATOR_UNBOUND
-from .context import resolve_request_context
-from .intents import INSOLE_PROCESS, INSOLE_QUERY, classify_intent
+from .context import identity_block, resolve_request_context
+from .intents import INSOLE_PROCESS, INSOLE_QUERY, KIND_ASK, KIND_REFUSE, intent_calls
+from .router import intent_review_hint, needs_llm_review, route_message
+from .session_commands import parse_session_command
+from .working_set import extract_working_set, format_working_set
 from .permissions import CAPABILITY_INSOLE_PROCESS, check_capability
 from .tools import (
     RISK_LEVELS, PermissionDenied, ToolContext, ToolError, ToolRegistry,
@@ -44,12 +47,11 @@ SYSTEM_PROMPT = """你是「蜀黍家」采购供应链助手，服务对象是�
   含源 SKU，可加店铺/日期）和订单明细；结果不唯一就列出候选并追问，不允许猜测。
   参数明确后调用 submit_exchange_dry_run，仍需员工确认登记，dry-run 完成后还要在换货页
   二次确认，才会实际修改 ERP。
-- 员工说查询或处理「抖音鞋垫订单」时：先 locate_insole_orders 列出内部单号、平台单号、
-  状态、店铺、鞋码和目标 SKU；要处理再调用 process_insole_orders。确认前必须把订单信息
-  讲清楚。半码按码数舍去小数后映射，不得把 Delivering 加进执行清单。
-  已有待确认动作时不要再次调用 process_insole_orders。员工回复「确认」后由后端串行写 ERP，
-  写完钉钉会再发一条【任务完成】结果日志。不要叫员工去换货页，不要说你没有确认入口或
-  不能主动通知，也不要让员工靠反复查询来猜是否写完。
+- 员工说查询或处理「鞋垫订单」（含抖音/快手/视频号）时：固定原话由后端直接分派，不要再审一遍。
+  查询用 locate_insole_orders；要处理用 process_insole_orders。未识别的说法才由你选工具。
+  半码按码数舍去小数后映射，不得把 Delivering 加进执行清单。
+  已有待确认动作时不要再次调用 process_insole_orders，让员工直接回「确认」。
+  员工回复「确认」后由后端串行写 ERP，写完钉钉会再发【任务完成】。不要叫员工去换货页。
 - 「异常订单」第一期只处理 SKU 替换：同款换规格、指定源→目标、已维护的白名单跨款。
   备注异常、超卖、地址错误等没有配置规则，说明做不了，不得自行定义、筛选或拿换货硬套。
   采购逾期走催办工具，不要和订单换货混用。
@@ -58,6 +60,8 @@ SYSTEM_PROMPT = """你是「蜀黍家」采购供应链助手，服务对象是�
   候选有多条（例如现行与即将实施并存）时列出要点，说明合同页按明细勾选，不要擅自指定一条。
 - 问供应商未维护、近期采购 SKU 没图、票种缺价、分类未映射国标目录时，用 master_data_gaps，
   不要逐张单猜测或编造主数据。
+- 员工要「代发订单」「今天的代发表」时，用 generate_dropship_workbook。确认后才抓 ERP，
+  不改单据；不要声称已经导出完成。收货明文只进 Excel，不要在对话里复述姓名、手机或地址。
 - 回答用中文，简洁、可执行；多条结果按紧急程度组织，必要时给出下一步动作。
 
 业务口径：
@@ -81,9 +85,9 @@ class AgentRunner:
     def __init__(self, *, registry: ToolRegistry, llm: LLMClient, sessions: SessionStore,
                  actions: PendingActions, audit: AuditLog, context: ToolContext,
                  max_steps: int = 8, enabled: bool = True, directory=None,
-                 memories=None, summary_enabled: bool = False,
+                 memories=None, users=None, summary_enabled: bool = False,
                  summary_trigger: int = 40, summary_keep: int = 20,
-                 max_tool_calls: int = 5):
+                 max_tool_calls: int = 5, busy_timeout: float = 45):
         self.registry = registry
         self.llm = llm
         self.sessions = sessions
@@ -93,11 +97,21 @@ class AgentRunner:
         self.max_steps = max(1, int(max_steps))
         self.enabled = bool(enabled)
         self.directory = directory
+        self.users = users
         self.memories = memories
         self.summary_enabled = bool(summary_enabled)
         self.summary_trigger = max(1, int(summary_trigger))
         self.summary_keep = max(1, int(summary_keep))
         self.max_tool_calls = max(1, int(max_tool_calls))
+        self.busy_timeout = max(0.0, float(busy_timeout))
+
+    def _request_context(self, *, operator: str = "", channel: str = "web",
+                         actor_id: str = "", session_key: str = "",
+                         session_id: str = ""):
+        return resolve_request_context(
+            self.directory, users=self.users, operator=operator, channel=channel,
+            actor_id=actor_id, session_key=session_key, session_id=session_id,
+        )
 
     def _web_staff_allowed(self, operator: str, channel: str) -> bool:
         """网页 L1/L2 必须对上员工绑定表；钉钉渠道和未注入目录时不拦（离线测试仍可用）。"""
@@ -166,44 +180,173 @@ class AgentRunner:
             raise ValueError("消息内容不能为空")
         if len(message) > 4000:
             raise ValueError("单条消息不能超过 4000 字")
-        if not self.available:
-            raise AgentDisabled("Agent 未启用或尚未配置模型（AGENT_ENABLED / AGENT_MODEL / 对应供应商凭证）")
-
-        session = self.sessions.ensure(channel, session_key, operator)
-        session_id = session["id"]
-        with self.sessions.lock_for(session_id):
+        request = self._request_context(
+            operator=operator, channel=channel, actor_id=actor_id, session_key=session_key,
+        )
+        operator = request.operator or operator
+        session = self.sessions.ensure(
+            channel, session_key, operator, user_id=request.user_id,
+        )
+        lock = self.sessions.lock_for(session["id"])
+        if not lock.acquire(timeout=self.busy_timeout):
+            return self._busy_reply(session, request)
+        try:
+            command = parse_session_command(message)
+            if command is not None:
+                return self._apply_session_command(command, message, session, request)
+            if not self.available:
+                raise AgentDisabled("Agent 未启用或尚未配置模型（AGENT_ENABLED / AGENT_MODEL / 对应供应商凭证）")
             return self._chat_locked(
                 message=message, session=session, operator=operator,
                 channel=channel, actor_id=actor_id, session_key=session_key,
+                request=request,
             )
+        finally:
+            lock.release()
 
-    def _chat_locked(self, *, message, session, operator, channel, actor_id, session_key) -> dict:
+    def handle_session_command(self, message: str, *, session_key: str, operator: str = "",
+                               channel: str = "web", actor_id: str = "") -> dict | None:
+        """新话题 / 记住 / 忘记。未识别返回 None。不依赖模型是否启用。"""
+        message = str(message or "").strip()
+        command = parse_session_command(message)
+        if command is None:
+            return None
+        request = self._request_context(
+            operator=operator, channel=channel, actor_id=actor_id, session_key=session_key,
+        )
+        session = self.sessions.ensure(
+            channel, session_key, request.operator or operator, user_id=request.user_id,
+        )
+        lock = self.sessions.lock_for(session["id"])
+        if not lock.acquire(timeout=self.busy_timeout):
+            return self._busy_reply(session, request)
+        try:
+            return self._apply_session_command(command, message, session, request)
+        finally:
+            lock.release()
+
+    def _apply_session_command(self, command: dict, message: str, session: dict,
+                               request) -> dict:
+        session_id = session["id"]
+        run_id = self.audit.start_run(
+            session_id=session_id, channel=request.channel,
+            operator=request.operator, user_id=request.user_id,
+            request=message, model="session",
+        )
+        self.sessions.add_message(session_id, "user", message, run_id=run_id)
+        try:
+            reply = self._session_command_reply(command, request)
+        except ValueError as exc:
+            reply = str(exc)
+        if command.get("name") == "new_topic":
+            self.sessions.rotate(session_id)
+        else:
+            self.sessions.add_message(session_id, "assistant", reply, run_id=run_id)
+        self.audit.finish_run(run_id, status="ok", reply=reply, steps=0, duration_ms=0)
+        return self._command_payload(session_id, run_id, request, reply)
+
+    def _session_command_reply(self, command: dict, request) -> str:
+        name = command.get("name")
+        if name == "new_topic":
+            return "已开新话题，历史在网页端可查。"
+        if name == "remember":
+            if not self.memories or not self.memories.enabled:
+                return "记忆未开启。请联系维护人打开 AGENT_MEMORY_ENABLED。"
+            if not self._memory_allowed(request):
+                return "请先绑定采购员姓名再记偏好。网页填绑定姓名，钉钉回复「绑定 利特」。"
+            item = self.memories.remember(
+                request.operator, command.get("content") or "",
+                user_id=request.user_id,
+            )
+            return f"已记住：{item['content']}。可说「忘记 {item['content'][:20]}」删掉。"
+        if name == "forget":
+            if not self.memories or not self.memories.enabled:
+                return "记忆未开启。"
+            if not self._memory_allowed(request):
+                return "请先绑定采购员姓名再改记忆。"
+            removed = self.memories.forget(
+                request.operator, command.get("keyword") or "",
+                user_id=request.user_id,
+            )
+            if not removed:
+                return "没有匹配的记忆。"
+            return "已忘记：" + "、".join(item["content"] for item in removed)
+        return "无法处理该会话指令。"
+
+    def _memory_allowed(self, request) -> bool:
+        if not request.operator and not request.user_id:
+            return False
+        if self.directory is None:
+            return bool(request.operator)
+        if request.actor_id and self.directory.get_by_dingtalk_user_id(request.actor_id):
+            return True
+        return bool(request.operator and self.directory.known_operator(request.operator))
+
+    def _memory_prompt(self, request) -> str:
+        if not (self.memories and self.memories.enabled):
+            return ""
+        if not self._memory_allowed(request):
+            return ""
+        return self.memories.prompt_block(request.operator, user_id=request.user_id)
+
+    def _busy_reply(self, session: dict, request) -> dict:
+        payload = self._command_payload(session["id"], "", request, "上一条还在处理，请稍后再发。")
+        payload["ok"] = False
+        payload["busy"] = True
+        return payload
+
+    def _command_payload(self, session_id: str, run_id: str, request, reply: str) -> dict:
+        return {
+            "ok": True,
+            "sessionId": session_id,
+            "runId": run_id,
+            "operator": request.operator,
+            "userId": request.user_id,
+            "traceId": request.trace_id,
+            "role": request.role,
+            "buyerNames": list(request.buyer_names),
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+            "reply": reply,
+            "steps": [],
+            "pendingActions": [],
+        }
+
+    def _chat_locked(self, *, message, session, operator, channel, actor_id, session_key,
+                     request=None) -> dict:
         session_id = session["id"]
         operator = operator or session.get("operator") or ""
-        request = resolve_request_context(
-            self.directory, operator=operator, channel=channel, actor_id=actor_id,
-            session_key=session_key,
+        request = request or self._request_context(
+            operator=operator, channel=channel, actor_id=actor_id, session_key=session_key,
+            session_id=session_id,
         )
         operator = request.operator or operator
         run_id = self.audit.start_run(
             session_id=session_id, channel=channel, operator=operator,
             user_id=request.user_id, request=message, model=self.llm.model,
         )
+        snapshot = extract_working_set(
+            self.sessions.history(session_id),
+            self.actions.list(session_id=session_id, status="pending"),
+        )
         self.sessions.add_message(session_id, "user", message, run_id=run_id)
-        intent = classify_intent(message)
-        if intent is not None:
-            return self._dispatch_intent(intent, session, request, run_id)
-        memory = ""
-        if self.memories and self.memories.enabled and self.directory and operator:
-            if self.directory.known_operator(operator):
-                memory = self.memories.prompt_block(operator)
+        decision = route_message(message, working_set=snapshot)
+        if decision.intent is not None and not needs_llm_review(decision.intent):
+            return self._dispatch_intent(
+                decision.intent, session, request, run_id, route=decision.route,
+            )
+        memory = self._memory_prompt(request)
+        system = self.system_prompt(
+            operator, channel, role=request.role, buyer_names=request.buyer_names,
+        )
+        if decision.intent is not None and needs_llm_review(decision.intent):
+            system = system + "\n\n" + intent_review_hint(decision.intent)
         messages = self.sessions.context_messages(
             session_id,
-            system=self.system_prompt(
-                operator, channel, role=request.role, buyer_names=request.buyer_names,
-            ),
+            system=system,
+            identity=identity_block(request),
             memory=memory,
             summary=self.sessions.latest_summary(session_id),
+            working_set=format_working_set(snapshot),
         )
         steps: list[dict] = []
         pending: list[dict] = []
@@ -212,6 +355,7 @@ class AgentRunner:
         try:
             reply = self._loop(
                 messages, steps, pending, session_id, run_id, request, usage,
+                require_tool_until_pending=needs_llm_review(decision.intent),
             )
         except (LLMError, ToolError, ValueError) as exc:
             self.audit.finish_run(run_id, status="failed", steps=len(steps),
@@ -232,7 +376,7 @@ class AgentRunner:
                               prompt_tokens=usage["prompt_tokens"],
                               completion_tokens=usage["completion_tokens"])
         self._maybe_summarize(session_id)
-        return {
+        payload = {
             "ok": True,
             "sessionId": session_id,
             "runId": run_id,
@@ -246,64 +390,122 @@ class AgentRunner:
             "steps": steps,
             "pendingActions": pending,
         }
+        if decision.intent is not None:
+            payload["intent"] = decision.intent.name
+            payload["intentKind"] = decision.intent.kind
+            payload["route"] = decision.route
+        return payload
 
     def handle_intent(self, message: str, *, session_key: str, operator: str = "",
                       channel: str = "web", actor_id: str = "") -> dict | None:
         """固定意图不走 LLM。未识别返回 None，由调用方再走 chat。"""
         message = str(message or "").strip()
-        intent = classify_intent(message)
-        if intent is None:
+        first = route_message(message)
+        if first.intent is None:
             return None
-        session = self.sessions.ensure(channel, session_key, operator)
+        request = self._request_context(
+            operator=operator, channel=channel, actor_id=actor_id, session_key=session_key,
+        )
+        session = self.sessions.ensure(
+            channel, session_key, request.operator or operator, user_id=request.user_id,
+        )
         with self.sessions.lock_for(session["id"]):
-            request = resolve_request_context(
-                self.directory, operator=operator or session.get("operator") or "",
-                channel=channel, actor_id=actor_id, session_key=session_key,
-            )
             run_id = self.audit.start_run(
                 session_id=session["id"], channel=channel,
                 operator=request.operator or operator, user_id=request.user_id,
                 request=message, model="intent",
             )
-            self.sessions.add_message(session["id"], "user", message, run_id=run_id)
-            return self._dispatch_intent(intent, session, request, run_id)
-
-    def _dispatch_intent(self, intent, session, request, run_id) -> dict:
-        started = time.monotonic()
-        tool_name = "locate_insole_orders" if intent.name == INSOLE_QUERY else "process_insole_orders"
-        if intent.name not in {INSOLE_QUERY, INSOLE_PROCESS}:
-            tool_name = ""
-        result, action = ({"error": f"未实现的意图 {intent.name}"}, None)
-        if tool_name:
-            result, action = self._invoke(
-                {"function": {
-                    "name": tool_name,
-                    "arguments": json.dumps(intent.arguments or {}, ensure_ascii=False),
-                }},
-                session["id"], run_id, request,
+            snapshot = extract_working_set(
+                self.sessions.history(session["id"]),
+                self.actions.list(session_id=session["id"], status="pending"),
             )
-        if isinstance(result, dict) and result.get("error"):
-            reply = str(result["error"])
-            status = "error"
-            pending = []
-        elif action:
-            preview = action.get("preview") or {}
-            reply = str(preview.get("markdown") or action.get("title") or "请核对订单后确认。")
-            note = preview.get("note")
-            if note:
-                reply = f"{reply}\n{note}"
-            status = "awaiting_confirm"
-            pending = [action]
-        else:
+            self.sessions.add_message(session["id"], "user", message, run_id=run_id)
+            decision = route_message(message, working_set=snapshot)
+            intent = decision.intent or first.intent
+            return self._dispatch_intent(
+                intent, session, request, run_id, route=decision.route or first.route,
+            )
+
+    def _dispatch_intent(self, intent, session, request, run_id, *, route="") -> dict:
+        started = time.monotonic()
+        if getattr(intent, "kind", "invoke") in {KIND_ASK, KIND_REFUSE}:
+            reply = str(intent.reply or "需要补充信息后再办。")
+            self.sessions.add_message(session["id"], "assistant", reply, run_id=run_id)
+            self.audit.finish_run(
+                run_id, status="ok", reply=reply, steps=0,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return {
+                "ok": True,
+                "sessionId": session["id"],
+                "runId": run_id,
+                "operator": request.operator,
+                "userId": request.user_id,
+                "traceId": request.trace_id,
+                "role": request.role,
+                "buyerNames": list(request.buyer_names),
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0},
+                "reply": reply,
+                "steps": [],
+                "pendingActions": [],
+                "intent": intent.name,
+                "intentKind": intent.kind,
+                "route": route,
+            }
+        calls = intent_calls(intent)
+        if not calls:
+            fallback = (
+                "locate_insole_orders" if intent.name == INSOLE_QUERY
+                else "process_insole_orders" if intent.name == INSOLE_PROCESS
+                else ""
+            )
+            if fallback:
+                calls = [(fallback, dict(intent.arguments or {}))]
+        if not calls:
+            result, action = {"error": f"未实现的意图 {intent.name}"}, None
+            calls = [("", {})]
+        replies = []
+        steps = []
+        pending = []
+        status = "ok"
+        result, action = {}, None
+        for tool_name, arguments in calls:
+            if not tool_name:
+                result = {"error": f"未实现的意图 {intent.name}"}
+                action = None
+            else:
+                result, action = self._invoke(
+                    {"function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(arguments or {}, ensure_ascii=False),
+                    }},
+                    session["id"], run_id, request,
+                )
+            if isinstance(result, dict) and result.get("error"):
+                replies.append(str(result["error"]))
+                status = "error"
+                steps.append({"tool": tool_name or intent.name, "status": "error"})
+                break
+            if action:
+                preview = action.get("preview") or {}
+                chunk = str(preview.get("markdown") or action.get("title") or "请核对订单后确认。")
+                note = preview.get("note")
+                if note:
+                    chunk = f"{chunk}\n{note}"
+                replies.append(chunk)
+                pending.append(action)
+                status = "awaiting_confirm"
+                steps.append({"tool": tool_name or intent.name, "status": status})
+                break
             data = result.get("data") if isinstance(result, dict) else None
-            reply = ""
+            chunk = ""
             if isinstance(data, dict):
-                reply = str(data.get("markdown") or "")
-            if not reply and isinstance(result, dict):
-                reply = str(result.get("summary") or "没有待处理的鞋垫订单。")
-            status = "ok"
-            pending = []
-        steps = [{"tool": tool_name or intent.name, "status": status}]
+                chunk = str(data.get("markdown") or "")
+            if not chunk and isinstance(result, dict):
+                chunk = str(result.get("summary") or result.get("message") or "已按你的要求调用工具。")
+            replies.append(chunk)
+            steps.append({"tool": tool_name or intent.name, "status": "ok"})
+        reply = "\n\n".join(item for item in replies if item)
         self.sessions.add_message(session["id"], "assistant", reply, run_id=run_id)
         self.audit.finish_run(
             run_id, status="ok" if status != "error" else "failed",
@@ -325,18 +527,36 @@ class AgentRunner:
             "steps": steps,
             "pendingActions": pending,
             "intent": intent.name,
+            "intentKind": getattr(intent, "kind", "invoke"),
+            "route": route,
         }
 
-    def _loop(self, messages, steps, pending, session_id, run_id, request, usage) -> str:
+    def _loop(self, messages, steps, pending, session_id, run_id, request, usage,
+              *, require_tool_until_pending: bool = False) -> str:
         for step in range(self.max_steps):
-            answer = self.llm.chat(messages, tools=self.registry.schemas())
+            tool_choice = "required" if require_tool_until_pending and not pending else "auto"
+            answer = self.llm.chat(
+                messages, tools=self.registry.schemas(), tool_choice=tool_choice,
+            )
             self._add_usage(answer.get("usage"), usage)
             tool_calls = answer.get("tool_calls") or []
             if len(tool_calls) > self.max_tool_calls:
                 tool_calls = tool_calls[:self.max_tool_calls]
             if not tool_calls:
+                if require_tool_until_pending and not pending:
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            "还没有待确认动作。必须调用 process_insole_orders，"
+                            "不要只口头让员工确认。"
+                        ),
+                    })
+                    continue
                 content = str(answer.get("content") or "").strip()
-                return content or "本轮模型没有给出可展示的回复，请换个说法再问一次。"
+                return self._with_pending_preview(
+                    content or "本轮模型没有给出可展示的回复，请换个说法再问一次。",
+                    pending,
+                )
             assistant_message = {"role": "assistant", "content": answer.get("content") or "",
                                  "tool_calls": tool_calls}
             messages.append(assistant_message)
@@ -365,7 +585,28 @@ class AgentRunner:
                 messages.append(tool_message)
                 self.sessions.add_message(session_id, "tool", tool_message["content"], run_id=run_id,
                                           name=tool_message["name"], tool_call_id=tool_message["tool_call_id"])
-        return "这轮需要的工具调用超过了步数上限，请把问题拆小一点再问（比如只问一个采购单或一个档位）。"
+        return self._with_pending_preview(
+            "这轮需要的工具调用超过了步数上限，请把问题拆小一点再问（比如只问一个采购单或一个档位）。",
+            pending,
+        )
+
+    @staticmethod
+    def _with_pending_preview(reply: str, pending: list) -> str:
+        """模型话术可以审核，清单数字必须用工具预览原文。"""
+        chunks = []
+        for action in pending or []:
+            preview = action.get("preview") or {}
+            markdown = str(preview.get("markdown") or "").strip()
+            note = str(preview.get("note") or "").strip()
+            if markdown:
+                chunks.append(markdown)
+            if note and note not in markdown:
+                chunks.append(note)
+        text = str(reply or "").strip()
+        extra = "\n".join(chunks)
+        if extra and extra not in text:
+            return f"{extra}\n\n{text}" if text else extra
+        return text
 
     def _invoke(self, call, session_id, run_id, request):
         """执行一次工具调用；L1/L2 只登记待确认动作。"""
@@ -395,7 +636,9 @@ class AgentRunner:
                     raise ToolError(WEB_OPERATOR_UNBOUND)
                 if channel == "dingtalk" and self.directory is not None:
                     if not actor_id or not self.directory.get_by_dingtalk_user_id(actor_id):
-                        raise ToolError("还没绑定采购员姓名。回复「绑定 利特」或「绑定 利特、李佳冬（利特）」。")
+                        raise ToolError(
+                            "还没绑定采购员姓名。请到群里发「绑定 利特」或「绑定 利特、李佳冬（利特）」，管理员同意后生效。"
+                        )
                 preview = tool.preview(arguments, ctx) if tool.preview else {}
                 if not isinstance(preview, dict):
                     preview = {"value": preview}
@@ -489,11 +732,26 @@ class AgentRunner:
         if not opens:
             return None
         wanted = set(arguments.get("o_ids") or [])
-        keep = next(
-            (item for item in opens
-             if set((item.get("arguments") or {}).get("o_ids") or []) == wanted),
-            None,
-        )
+
+        def pending_oids(item: dict) -> set[str]:
+            preview_ids = (item.get("preview") or {}).get("oIds") or []
+            argument_ids = (item.get("arguments") or {}).get("o_ids") or []
+            return {str(oid) for oid in (preview_ids or argument_ids) if oid}
+
+        def pending_size(item: dict) -> int:
+            preview = item.get("preview") or {}
+            return int(preview.get("processableCount") or len(pending_oids(item)))
+
+        if not wanted:
+            keep = max(opens, key=pending_size)
+            self._cancel_extra_insole(opens, keep["id"], operator, actor_id)
+            return keep
+        keep = next((item for item in opens if pending_oids(item) == wanted), None)
+        if keep is None:
+            keep = next(
+                (item for item in opens if wanted <= pending_oids(item)),
+                None,
+            )
         if keep:
             self._cancel_extra_insole(opens, keep["id"], operator, actor_id)
             return keep
@@ -536,11 +794,13 @@ class AgentRunner:
                 raise ActionError("还没绑定采购员姓名，不能确认。请先回复「绑定 姓名」。", 403)
         action = self.actions.get(action_id)
         tool = self.registry.get(action["tool"])
-        request = resolve_request_context(
-            self.directory, operator=operator, channel=channel, actor_id=actor_id,
+        request = self._request_context(
+            operator=operator, channel=channel, actor_id=actor_id,
         )
-        if request.role == "viewer":
-            raise ActionError(VIEWER_WRITE_DENIED, 403)
+        try:
+            self._assert_tool_allowed(tool, request)
+        except PermissionDenied as exc:
+            raise ActionError(str(exc), 403) from exc
         session_id = action.get("sessionId") or ""
         if session_id:
             with self.sessions.lock_for(session_id):
@@ -592,8 +852,8 @@ class AgentRunner:
         if channel == "dingtalk" and self.directory is not None:
             if not actor_id or not self.directory.get_by_dingtalk_user_id(actor_id):
                 raise ActionError("还没绑定采购员姓名，不能取消。请先回复「绑定 姓名」。", 403)
-        request = resolve_request_context(
-            self.directory, operator=operator, channel=channel, actor_id=actor_id,
+        request = self._request_context(
+            operator=operator, channel=channel, actor_id=actor_id,
         )
         if request.role == "viewer":
             raise ActionError(VIEWER_WRITE_DENIED, 403)
@@ -634,5 +894,9 @@ class AgentRunner:
         bucket["prompt_tokens"] += int(incoming.get("prompt_tokens") or 0)
         bucket["completion_tokens"] += int(incoming.get("completion_tokens") or 0)
 
-    def pending(self, *, session_id: str | None = None, limit: int = 20) -> list[dict]:
-        return self.actions.list(session_id=session_id, limit=limit)
+    def pending(self, *, session_id: str | None = None, limit: int = 20,
+                operator: str = "", actor_id: str = "", user_id: str = "") -> list[dict]:
+        return self.actions.list(
+            session_id=session_id, limit=limit,
+            operator=operator, actor_id=actor_id, user_id=user_id,
+        )

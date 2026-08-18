@@ -24,7 +24,7 @@
 .ledger-push .credentials-grid { min-width: min(100%, 360px); }
 .ledger-push .push-actions { display: flex; gap: 8px; align-items: center; }
 
-/* ── 四波提醒档位卡 ───────────────────────────────────────── */
+/* ── 跟单三档档位卡 ───────────────────────────────────────── */
 .tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(158px, 1fr)); gap: 10px; }
 .tier {
   text-align: left; background: transparent; cursor: pointer;
@@ -70,7 +70,7 @@
 .eta-cell .alt { font-size: 10.5px; color: var(--text-muted); }
 .left { font-weight: 600; font-variant-numeric: tabular-nums; }
 
-/* 四波提醒时间轴 */
+/* 跟单三档时间轴 */
 .waves { display: inline-flex; align-items: center; gap: 3px; vertical-align: middle; }
 .waves i {
   width: 15px; height: 15px; border-radius: 50%; display: grid; place-items: center;
@@ -83,7 +83,7 @@
 
 .pager .sp { flex: 1 1 auto; }
 
-/* 抽屉里的四波排期 */
+/* 抽屉里的三档排期 */
 .plan { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 4px; }
 .plan .step { border: 1px solid var(--border); border-left: 3px solid var(--deemph); border-radius: 9px; padding: 8px 11px 9px; }
 .plan .step .s-k { font-size: 11px; font-weight: 600; color: var(--text-secondary); }

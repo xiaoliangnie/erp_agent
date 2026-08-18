@@ -2,12 +2,32 @@
 """会话与消息持久化：渠道 + 会话键唯一，网页和钉钉共用同一张表。"""
 from __future__ import annotations
 
+import re
 import secrets
 import threading
 from datetime import datetime, timezone
 from typing import Any
 
+from .session_commands import parse_session_command
 from .store import AgentStore, dumps, loads, now
+
+SUMMARY_LIMIT = 800
+_SUMMARY_REPLACEMENTS = (
+    (re.compile(r"\d[\d,]*\.?\d*\s*元"), "[金额已省略]"),
+    (re.compile(r"\d[\d,]*\s*件"), "[数量已省略]"),
+    (re.compile(r"\d{4}-\d{2}-\d{2}"), "[日期已省略]"),
+    (re.compile(r"(待入库|已入库|逾期)\s*\d+"), r"\1[数量已省略]"),
+    (re.compile(r"\d[\d,]*\.?\d*\s*%"), "[比例已省略]"),
+    (re.compile(r"(交期|到货日|预计到货)[：:\s]+[^\s，。；;]+"), r"\1：[日期已省略]"),
+)
+
+
+def sanitize_summary(text: str) -> str:
+    """摘要只留单号/SKU/结论；金额、数量、日期、交期不能当当前事实。"""
+    cleaned = str(text or "").strip()
+    for pattern, replacement in _SUMMARY_REPLACEMENTS:
+        cleaned = pattern.sub(replacement, cleaned)
+    return cleaned[:SUMMARY_LIMIT]
 
 
 class SessionStore:
@@ -34,13 +54,15 @@ class SessionStore:
                 self._session_locks[session_id] = lock
             return lock
 
-    def ensure(self, channel: str, session_key: str, operator: str = "") -> dict:
+    def ensure(self, channel: str, session_key: str, operator: str = "",
+               user_id: str = "") -> dict:
         """按渠道和会话键取会话；空闲超时则 epoch+1，不删消息。"""
         channel = str(channel or "web").strip()[:40] or "web"
         session_key = str(session_key or "").strip()[:200]
         if not session_key:
             raise ValueError("会话键不能为空")
         operator = str(operator or "").strip()[:120]
+        user_id = str(user_id or "").strip()[:80]
         stamp = now()
         with self.store.write(immediate=True) as conn:
             row = conn.execute(
@@ -49,30 +71,38 @@ class SessionStore:
             ).fetchone()
             if row:
                 epoch = int(row["epoch"] or 0)
+                rotated = False
                 if self.idle_minutes and _stale(row["updated_at"], self.idle_minutes):
                     epoch += 1
+                    rotated = True
+                stored_user = row["user_id"] if "user_id" in row.keys() else ""
+                next_user = user_id or stored_user
+                next_title = "" if rotated else (row["title"] or "")
                 conn.execute(
                     """UPDATE agent_sessions
-                       SET updated_at = ?, operator = ?, epoch = ? WHERE id = ?""",
-                    (stamp, operator or row["operator"], epoch, row["id"]),
+                       SET updated_at = ?, operator = ?, epoch = ?, user_id = ?, title = ?
+                       WHERE id = ?""",
+                    (stamp, operator or row["operator"], epoch, next_user, next_title, row["id"]),
                 )
                 return {
                     **dict(row),
                     "operator": operator or row["operator"],
+                    "user_id": next_user,
+                    "title": next_title,
                     "epoch": epoch,
                     "updated_at": stamp,
                 }
             session_id = secrets.token_hex(12)
             conn.execute(
                 """INSERT INTO agent_sessions
-                   (id, channel, session_key, operator, created_at, updated_at, epoch)
-                   VALUES (?, ?, ?, ?, ?, ?, 0)""",
-                (session_id, channel, session_key, operator, stamp, stamp),
+                   (id, channel, session_key, operator, user_id, created_at, updated_at, epoch)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 0)""",
+                (session_id, channel, session_key, operator, user_id, stamp, stamp),
             )
             return {
                 "id": session_id, "channel": channel, "session_key": session_key,
-                "operator": operator, "title": "", "created_at": stamp, "updated_at": stamp,
-                "epoch": 0,
+                "operator": operator, "user_id": user_id, "title": "",
+                "created_at": stamp, "updated_at": stamp, "epoch": 0,
             }
 
     def rotate(self, session_id: str) -> dict:
@@ -84,10 +114,32 @@ class SessionStore:
                 raise ValueError("会话不存在")
             epoch = int(row["epoch"] or 0) + 1
             conn.execute(
-                "UPDATE agent_sessions SET epoch = ?, updated_at = ? WHERE id = ?",
+                "UPDATE agent_sessions SET epoch = ?, title = '', updated_at = ? WHERE id = ?",
                 (epoch, stamp, session_id),
             )
         return {"ok": True, "sessionId": session_id, "epoch": epoch}
+
+    def get(self, session_id: str) -> dict:
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            return {}
+        with self.store.read() as conn:
+            row = conn.execute(
+                "SELECT * FROM agent_sessions WHERE id = ?", (session_id,),
+            ).fetchone()
+        if row is None:
+            return {}
+        return {
+            "id": row["id"],
+            "channel": row["channel"],
+            "sessionKey": row["session_key"],
+            "operator": row["operator"],
+            "userId": row["user_id"] if "user_id" in row.keys() else "",
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+            "epoch": int(row["epoch"] or 0),
+            "title": row["title"] if "title" in row.keys() else "",
+        }
 
     def reset(self, session_id: str) -> dict:
         return self.rotate(session_id)
@@ -116,6 +168,15 @@ class SessionStore:
                 (session_id, run_id, role, str(content or ""), name, tool_call_id,
                  dumps(tool_calls) if tool_calls else None, now(), epoch),
             )
+            if role == "user":
+                title = str(content or "").strip()
+                if title and parse_session_command(title) is None:
+                    conn.execute(
+                        """UPDATE agent_sessions
+                           SET title = CASE WHEN title = '' THEN ? ELSE title END
+                           WHERE id = ?""",
+                        (title[:40], session_id),
+                    )
 
     def current_epoch(self, session_id: str) -> int:
         with self.store.read() as conn:
@@ -140,7 +201,8 @@ class SessionStore:
         return drop_dangling_tool_calls(messages)
 
     def context_messages(self, session_id: str, *, system: str, memory: str = "",
-                         summary: str = "") -> list[dict[str, Any]]:
+                         summary: str = "", identity: str = "",
+                         working_set: str = "") -> list[dict[str, Any]]:
         """按字符预算从新到旧组装上下文。"""
         epoch = self.current_epoch(session_id)
         with self.store.read() as conn:
@@ -161,10 +223,18 @@ class SessionStore:
             if message.get("role") == "tool" and message.get("tool_call_id"):
                 current_turn_tools.add(message["tool_call_id"])
         prefix = [{"role": "system", "content": system}]
+        if identity:
+            prefix.append({"role": "system", "content": identity})
         if memory:
             prefix.append({"role": "system", "content": memory})
-        if summary:
-            prefix.append({"role": "system", "content": "此前会话摘要（不含金额/数量/日期）：\n" + summary})
+        cleaned_summary = sanitize_summary(summary)
+        if cleaned_summary:
+            prefix.append({
+                "role": "system",
+                "content": "此前会话摘要（不含金额/数量/日期，编号只作指代）：\n" + cleaned_summary,
+            })
+        if working_set:
+            prefix.append({"role": "system", "content": working_set})
         used = sum(len(str(item.get("content") or "")) for item in prefix)
         selected: list[dict[str, Any]] = []
         for message in reversed(raw):
@@ -224,7 +294,7 @@ class SessionStore:
                 """INSERT INTO agent_session_summaries
                    (session_id, epoch, upto_message_id, content, created_at)
                    VALUES (?, ?, ?, ?, ?)""",
-                (session_id, epoch, int(upto_message_id), str(content or "")[:800], now()),
+                (session_id, epoch, int(upto_message_id), sanitize_summary(content), now()),
             )
 
     def latest_summary(self, session_id: str) -> str:
@@ -235,7 +305,7 @@ class SessionStore:
                    WHERE session_id=? AND epoch=? ORDER BY id DESC LIMIT 1""",
                 (session_id, epoch),
             ).fetchone()
-        return str(row["content"]) if row else ""
+        return sanitize_summary(str(row["content"])) if row else ""
 
     def transcript(self, session_id: str, limit: int = 50) -> list[dict]:
         """给页面展示的对话记录，可跨 epoch。"""

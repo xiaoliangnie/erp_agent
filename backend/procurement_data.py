@@ -152,6 +152,10 @@ def build_dashboard_payload(rows, source="MySQL · purchase_order_lines"):
     return {
         "meta": {"source": source, "generated": business_now().strftime("%Y-%m-%d %H:%M"),
                  "rows": len(lines), "orders": len(orders), "minDate": min_date, "maxDate": max_date},
+        "columns": {
+            "orders": list(DASHBOARD_ORDER_COLUMNS),
+            "lines": list(DASHBOARD_LINE_COLUMNS),
+        },
         "dict": dicts, "orders": orders, "lines": lines,
     }
 
@@ -207,5 +211,9 @@ def build_delivery_payload(rows, source="MySQL · purchase_order_lines"):
                  "etaMin": etas[0] if etas else "", "etaMax": etas[-1] if etas else "",
                  "etaCoverage": round(covered / len(lines), 4) if lines else 0,
                  "today": max_date},
+        "columns": {
+            "orders": list(DELIVERY_ORDER_COLUMNS),
+            "lines": list(DELIVERY_LINE_COLUMNS),
+        },
         "dict": dicts, "orders": orders, "lines": lines,
     }

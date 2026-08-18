@@ -606,7 +606,30 @@ class KeepAliveTests(unittest.TestCase):
         result = keeper.tick(now=datetime(2026, 8, 17, 10, 0, tzinfo=BUSINESS_TIMEZONE))
         self.assertEqual("写入中", result["reason"])
 
-    def test_after_hours_closes_browser_once(self):
+    def test_after_hours_still_keeps_session(self):
+        calls = []
+
+        class Runtime:
+            def try_exclusive(self):
+                return True
+
+            def release_exclusive(self):
+                calls.append("release")
+
+            def keep_session(self):
+                calls.append("keep")
+                return {"ok": True}
+
+            def close_browser(self):
+                calls.append("close")
+
+        keeper = ErpKeepAlive(Runtime(), interval_seconds=30)
+        night = datetime(2026, 8, 17, 22, 0, tzinfo=BUSINESS_TIMEZONE)
+        result = keeper.tick(now=night)
+        self.assertTrue(result.get("ok"))
+        self.assertEqual(["keep", "release"], calls)
+
+    def test_stop_closes_browser(self):
         calls = []
 
         class Runtime:
@@ -621,12 +644,9 @@ class KeepAliveTests(unittest.TestCase):
 
         keeper = ErpKeepAlive(Runtime())
         keeper._warmed = True
-        first = keeper.tick(now=datetime(2026, 8, 17, 18, 31, tzinfo=BUSINESS_TIMEZONE))
-        self.assertTrue(first.get("closed"))
+        keeper.stop()
         self.assertEqual(["close", "release"], calls)
-        second = keeper.tick(now=datetime(2026, 8, 17, 19, 0, tzinfo=BUSINESS_TIMEZONE))
-        self.assertTrue(second.get("skipped"))
-        self.assertEqual(["close", "release"], calls)
+        self.assertFalse(keeper._warmed)
 
     def test_keep_session_does_not_open_order_list(self):
         class Session:

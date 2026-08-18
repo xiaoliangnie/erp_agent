@@ -312,6 +312,59 @@ def fetch_realtime_purchase_rows(year, env_path="hanli.env"):
     return [{column_map[key]: value for key, value in row.items()} for row in records]
 
 
+FOLLOWUP_COLUMN_MAP = {
+    "purchase_order_no": "采购单号", "sku_code": "商品编码",
+    "quantity": "数量", "purchase_date": "采购日期",
+    "status": "状态", "erp_status": "erp_status",
+    "buyer": "采购员", "earliest_arrival_date": "最早预计到货日期",
+    "unit_price": "基本售价", "amount": "基本金额",
+    "item_delivery_date": "item_delivery_date",
+    "in_quantity": "item_in_qty", "supplier": "item_supplier_id",
+    "warehouse": "仓储方", "labels": "标签", "remark": "备注",
+    "color_spec": "颜色及规格", "spu": "item_sku_other_1",
+    "category": "item_sku_other_3", "external_order_no": "外部单号",
+    "audit_date": "审核日期",
+}
+
+
+def fetch_followup_purchase_rows(env_path="hanli.env"):
+    """跟单池：全库 ``Confirmed``、仍有待入库、排除返修退货。不按年度截断。"""
+    sql = f"""
+        SELECT
+            m.po_id AS purchase_order_no,
+            i.sku_id AS sku_code,
+            COALESCE(i.qty, 0) AS quantity,
+            LEFT(m.po_date, 10) AS purchase_date,
+            '已确认' AS status,
+            m.status AS erp_status,
+            COALESCE(m.purchaser_name, '') AS buyer,
+            LEFT(COALESCE(i.delivery_date, ''), 10) AS earliest_arrival_date,
+            COALESCE(i.price, 0) AS unit_price,
+            COALESCE(i.amount, i.qty * i.price, 0) AS amount,
+            LEFT(COALESCE(i.delivery_date, ''), 10) AS item_delivery_date,
+            COALESCE(i.in_qty, 0) AS in_quantity,
+            COALESCE(NULLIF(m.seller, ''), CONCAT('供应商 ', m.supplier_id), '未知') AS supplier,
+            COALESCE(m.wms_co_name, '') AS warehouse,
+            COALESCE(JSON_UNQUOTE(JSON_EXTRACT(m.source_payload, '$.labels')), '') AS labels,
+            COALESCE(m.remark, '') AS remark,
+            COALESCE(i.properties_value, '') AS color_spec,
+            COALESCE(NULLIF(i.name, ''), i.sku_id, '未命名') AS spu,
+            '未分类' AS category,
+            COALESCE(m.so_id, '') AS external_order_no,
+            LEFT(COALESCE(m.confirm_date, ''), 19) AS audit_date
+        FROM `{REALTIME_MAIN_TABLE}` AS m
+        STRAIGHT_JOIN `{REALTIME_ITEM_TABLE}` AS i ON i.po_id = m.po_id
+        WHERE m.status = 'Confirmed'
+          AND COALESCE(i.qty, 0) > COALESCE(i.in_qty, 0)
+          AND COALESCE(JSON_UNQUOTE(JSON_EXTRACT(m.source_payload, '$.labels')), '')
+              NOT LIKE '%%返修退货%%'
+          AND COALESCE(m.remark, '') NOT LIKE '%%返修采购单%%'
+        ORDER BY m.po_date, m.po_id, i.poi_id
+    """
+    records = read_query(env_path, sql, retries=2)
+    return [{FOLLOWUP_COLUMN_MAP[key]: value for key, value in row.items() if key in FOLLOWUP_COLUMN_MAP} for row in records]
+
+
 def load_contract_order_fixture(path, po_id=None):
     """从 JSON 夹具读取一张采购单，形状与 `fetch_contract_order` 相同。"""
     data = json.loads(Path(path).read_text(encoding="utf-8"))

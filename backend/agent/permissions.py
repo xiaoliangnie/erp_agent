@@ -46,7 +46,7 @@ def check_capability(
                 binding = getter(actor_id) or {}
             if not actor_id or not binding:
                 raise PermissionDenied(
-                    "还没绑定采购员姓名。回复「绑定 利特」或「绑定 利特、李佳冬（利特）」。",
+                    "还没绑定采购员姓名。请到群里发「绑定 利特」或「绑定 利特、李佳冬（利特）」，管理员同意后生效。",
                     role=role, permission="write", channel=channel,
                 )
         elif operator and hasattr(directory, "get"):

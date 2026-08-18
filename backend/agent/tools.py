@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import time
 from dataclasses import dataclass, replace
 from datetime import date, timedelta
 from pathlib import Path
@@ -20,12 +21,16 @@ from typing import Any, Callable
 from ..business_time import business_today
 from ..contracts import INVOICE_LABELS, generate_contract, get_contract_options
 from ..database import fetch_contract_order_choices, fetch_exchange_products
-from ..delivery_reminders import BUCKET_ORDER, URGENT_BUCKETS, build_reminders, filter_orders, reminder_markdown
+from ..delivery_reminders import (
+    FOLLOWUP_ORDER, FOLLOWUP_URGENT, build_reminders, filter_orders, reminder_markdown,
+)
 from ..gb_standards import catalog_status, family_ids_for, lookup_product_standards
 from ..exchange.insole import (
-    DEFAULT_SHOP, execute_insole_orders, format_insole_list, load_written_insole_orders,
+    execute_insole_orders, format_insole_list,
+    load_reserved_insole_orders, load_written_insole_orders,
     locate_insole_orders, public_order, remember_insole_writes, sync_insole_mirror,
 )
+from ..paths import resolve_repo_path
 from ..order_source import OrderSourceError, fetch_exchange_order_items, fetch_exchange_orders
 from ..procurement_data import day, integer, number, text
 from ..product_images import resolve_product_image
@@ -70,6 +75,7 @@ class ToolContext:
     env_path: str
     root: Path
     fetch_rows: Callable[..., tuple]
+    fetch_followup: Callable[..., tuple] | None = None
     exchange: Any = None
     erp: Any = None
     forecast: Any = None
@@ -99,6 +105,12 @@ class ToolContext:
         """取一年的采购明细行；缓存策略由注入的 `fetch_rows` 决定。"""
         return self.fetch_rows(year)
 
+    def followup_rows(self):
+        """跟单池：全库已确认未完结。未注入时回退 `fetch_rows`。"""
+        if self.fetch_followup is not None:
+            return self.fetch_followup()
+        return self.fetch_rows(None)
+
 
 @dataclass(frozen=True)
 class Tool:
@@ -112,6 +124,8 @@ class Tool:
     permission: str = ""
     side_effect: str = ""
     channels: tuple[str, ...] = ()
+    domain: str = ""
+    concurrency_mode: str = ""
 
     def __post_init__(self):
         if not self.permission:
@@ -372,8 +386,8 @@ def _get_purchase_order(arguments, ctx):
 
 
 def _delivery_reminders(arguments, ctx):
-    rows, meta = ctx.rows(arguments.get("year"))
-    reminders = build_reminders(rows, arguments.get("today"))
+    rows, meta = ctx.followup_rows()
+    reminders = build_reminders(rows, arguments.get("today"), profile="followup")
     buckets = arguments.get("buckets") or ([arguments["bucket"]] if arguments.get("bucket") else None)
     orders, matched = filter_orders(
         reminders,
@@ -398,7 +412,7 @@ def _delivery_reminders(arguments, ctx):
             "matched": matched,
             "returned": len(orders),
             "orders": orders,
-            "note": "交期取 item_delivery_date，为空退到最早预计到货日期；只统计仍有待入库数量的明细行",
+            "note": "跟单三档：已确认未完结、排除返修；交期取 item_delivery_date，为空退到最早预计到货日期；只统计仍有待入库数量的明细行",
         },
         truncated=matched > len(orders),
         hint="不要用换货工具处理采购逾期；只要一张单用 get_purchase_order",
@@ -906,18 +920,71 @@ def _exchange_payload(arguments):
     }
 
 
+def _lookup_orders_for_impact(ctx, o_ids) -> list | None:
+    if ctx.setting is None:
+        return None
+    try:
+        from ..order_source import fetch_exchange_orders
+    except Exception:
+        return None
+    found = []
+    try:
+        for oid in list(o_ids or [])[:20]:
+            result = fetch_exchange_orders(ctx.setting, ctx.env_path, query=str(oid), limit=5)
+            for order in result.get("orders") or []:
+                if str(order.get("oId") or "") == str(oid):
+                    found.append(order)
+                    break
+    except Exception:
+        return None
+    return found
+
+
+def _exchange_impact(arguments, ctx, payload) -> dict:
+    from ..exchange.impact import assess_exchange_impact
+    products = None
+    try:
+        source = str(arguments.get("source_sku") or "").strip()
+        target = str(arguments.get("target_sku") or "").strip()
+        found = []
+        if target:
+            found.extend(fetch_exchange_products(ctx.env_path, query=target, limit=20))
+        if source:
+            found.extend(fetch_exchange_products(ctx.env_path, query=source, limit=20))
+        products = found
+    except Exception:
+        products = None
+    open_jobs = []
+    if ctx.exchange is not None:
+        try:
+            open_jobs = ctx.exchange.list_jobs(limit=100)
+        except Exception:
+            open_jobs = []
+    return assess_exchange_impact(
+        payload,
+        products=products,
+        orders=_lookup_orders_for_impact(ctx, (payload.get("targets") or {}).get("o_ids") or []),
+        open_jobs=open_jobs,
+    )
+
+
 def _exchange_preview(arguments, ctx):
     payload = _exchange_payload({**arguments, "env_path": ctx.env_path})
     if ctx.exchange is None:
         raise ToolError("换货子系统尚未启用")
     rules, targets = ctx.exchange.validate_submission(payload)
     status = ctx.exchange.status()
+    impact = _exchange_impact(arguments, ctx, payload)
+    if impact.get("decision") == "block":
+        first = (impact.get("blockers") or [{}])[0]
+        raise ToolError(first.get("message") or "换货影响分析阻断，不能进入预览")
     return {
         "sourceSku": rules["replacements"][0]["from"],
         "targetSku": rules["replacements"][0]["to"],
         "orderCount": len(targets["o_ids"]),
         "oIds": targets["o_ids"][:50],
         "onlineWorkers": status.get("onlineWorkers", 0),
+        "impact": impact,
         "note": "确认后只登记 dry-run 任务；真实换货仍需在换货页核对试算清单后二次确认",
     }
 
@@ -958,13 +1025,52 @@ def _insole_written(ctx) -> dict:
     return load_written_insole_orders(ctx.setting, root=ctx.root)
 
 
+def _insole_reserved(ctx) -> dict:
+    if ctx.setting is None:
+        return {}
+    db = resolve_repo_path(
+        ctx.setting("AGENT_DATABASE_PATH", "files/data/agent.sqlite3"),
+        root=ctx.root,
+    )
+    return load_reserved_insole_orders(
+        db, exclude_action_id=ctx.action_id, viewer=ctx.operator,
+    )
+
+
+def _insole_shop(arguments) -> str:
+    return str(arguments.get("shop") or "").strip()
+
+
+def _frozen_insole_orders(arguments, written: dict, reserved: dict) -> list[dict]:
+    rows = []
+    for item in arguments.get("orders") or []:
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get("oId") or item.get("o_id") or "").strip()
+        target = str(item.get("targetSku") or item.get("target_sku") or "").strip()
+        if not oid or not target:
+            continue
+        if oid in written or oid in reserved:
+            continue
+        rows.append({
+            "o_id": oid,
+            "so_id": str(item.get("soId") or item.get("so_id") or ""),
+            "status": str(item.get("status") or ""),
+            "shop": str(item.get("shop") or ""),
+            "target_sku": target,
+            "source_sku": str(item.get("sourceSku") or item.get("source_sku") or ""),
+        })
+    return rows
+
+
 def _locate_insole(arguments, ctx):
-    shop = str(arguments.get("shop") or DEFAULT_SHOP).strip() or DEFAULT_SHOP
+    shop = _insole_shop(arguments)
     try:
         located = locate_insole_orders(
             ctx.setting, ctx.env_path,
             shop=shop, o_ids=_optional_oids(arguments.get("o_ids")),
-            written=_insole_written(ctx), root=ctx.root,
+            written=_insole_written(ctx), reserved=_insole_reserved(ctx),
+            root=ctx.root,
         )
     except (OrderSourceError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
@@ -972,7 +1078,7 @@ def _locate_insole(arguments, ctx):
     parked = [public_order(row) for row in located["parked"]]
     return tool_envelope(
         summary=(
-            f"抖音鞋垫待处理 {located['processableCount']} 单，"
+            f"鞋垫待处理 {located['processableCount']} 单，"
             f"暂不处理 {located['parkedCount']} 单"
         ),
         data={
@@ -993,21 +1099,28 @@ def _locate_insole(arguments, ctx):
 
 
 def _insole_preview(arguments, ctx):
-    shop = str(arguments.get("shop") or DEFAULT_SHOP).strip() or DEFAULT_SHOP
+    shop = _insole_shop(arguments)
     try:
         located = locate_insole_orders(
             ctx.setting, ctx.env_path,
             shop=shop, o_ids=_optional_oids(arguments.get("o_ids")),
-            written=_insole_written(ctx), root=ctx.root,
+            written=_insole_written(ctx), reserved=_insole_reserved(ctx),
+            root=ctx.root,
         )
     except (OrderSourceError, ValueError) as exc:
         raise ToolError(str(exc)) from exc
     arguments["o_ids"] = list(located["oIds"])
     arguments["shop"] = shop
+    arguments["orders"] = [
+        {"oId": row["o_id"], "targetSku": row.get("target_sku") or "",
+         "soId": row.get("so_id") or "", "status": row.get("status") or "",
+         "shop": row.get("shop") or ""}
+        for row in located["processable"]
+    ]
     if not located["processable"]:
         raise ToolError(
             format_insole_list(located)
-            + "\n没有可处理的抖音鞋垫订单（需要 Question / WaitConfirm；半码按码数舍去小数后映射）。"
+            + "\n没有可处理的鞋垫订单（需要 Question / WaitConfirm；半码按码数舍去小数后映射）。"
         )
     return {
         "shop": shop,
@@ -1023,21 +1136,40 @@ def _insole_preview(arguments, ctx):
 
 
 def _process_insole(arguments, ctx):
-    shop = str(arguments.get("shop") or DEFAULT_SHOP).strip() or DEFAULT_SHOP
+    shop = _insole_shop(arguments)
     o_ids = _optional_oids(arguments.get("o_ids"))
-    if not o_ids:
-        raise ToolError("没有可执行的订单清单，请先定位并确认")
     written = _insole_written(ctx)
-    try:
-        located = locate_insole_orders(
-            ctx.setting, ctx.env_path, shop=shop, o_ids=o_ids,
-            written=written, root=ctx.root,
-        )
-    except (OrderSourceError, ValueError) as exc:
-        raise ToolError(str(exc)) from exc
+    reserved = _insole_reserved(ctx)
+    started = time.monotonic()
+    frozen = _frozen_insole_orders(arguments, written, reserved)
+    if frozen:
+        located = {
+            "processable": frozen,
+            "parked": [],
+            "skipped": [],
+            "processableCount": len(frozen),
+            "parkedCount": 0,
+            "skippedCount": 0,
+            "oIds": [row["o_id"] for row in frozen],
+            "shop": shop,
+            "sourceSku": "",
+            "sync": {},
+        }
+    else:
+        if not o_ids:
+            raise ToolError("没有可执行的订单清单，请先定位并确认")
+        try:
+            located = locate_insole_orders(
+                ctx.setting, ctx.env_path, shop=shop, o_ids=o_ids,
+                written=written, reserved=reserved, root=ctx.root,
+            )
+        except (OrderSourceError, ValueError) as exc:
+            raise ToolError(str(exc)) from exc
     if not located["processable"]:
         if any(oid in written for oid in o_ids):
             raise ToolError("这些订单已经写入过，镜像尚未跟上，不再重复执行")
+        if any(oid in reserved for oid in o_ids):
+            raise ToolError("这些订单已有他人待确认或正在写入，本批不再重复执行")
         raise ToolError("确认时这些订单已不可处理（可能已换过或状态变了）")
     try:
         result = execute_insole_orders(ctx.erp, located["processable"])
@@ -1079,22 +1211,46 @@ def _process_insole(arguments, ctx):
         "skippedCount": result["skippedCount"],
         "failedCount": result["failedCount"],
         "attempted": result["attempted"],
+        "elapsedMs": int((time.monotonic() - started) * 1000),
+        "prepareMs": result.get("prepareMs"),
+        "writeMs": result.get("writeMs"),
         "oIds": [row["o_id"] for row in located["processable"]],
         "failed": result.get("failed") or [],
         "log": log,
+        "reconciliation": result.get("reconciliation") or {},
+        "evidence": result.get("evidence") or {},
     }
 
 
 def _reminder_selection(arguments, ctx):
-    rows, meta = ctx.rows(arguments.get("year"))
-    reminders = build_reminders(rows, arguments.get("today"))
-    buckets = arguments.get("buckets") or list(URGENT_BUCKETS)
+    rows, meta = ctx.followup_rows()
+    reminders = build_reminders(rows, arguments.get("today"), profile="followup")
+    buckets = arguments.get("buckets") or list(FOLLOWUP_URGENT)
     orders, matched = filter_orders(
         reminders, buckets=buckets,
         buyer=scoped_buyers(arguments.get("buyer"), ctx),
         limit=_limit(arguments.get("limit"), 100, 500),
     )
     return reminders, orders, matched, meta
+
+
+def _freeze_reminder_orders(orders) -> list[dict]:
+    frozen = []
+    for item in orders or []:
+        if not isinstance(item, dict):
+            continue
+        frozen.append({
+            "purchaseOrderNo": item.get("purchaseOrderNo") or "",
+            "buyer": item.get("buyer") or "",
+            "supplier": item.get("supplier") or "",
+            "bucket": item.get("bucket") or "",
+            "waveLabel": item.get("waveLabel") or "",
+            "deliveryDate": item.get("deliveryDate") or "",
+            "remainingDays": item.get("remainingDays"),
+            "purchaseQty": item.get("purchaseQty", 0),
+            "pendingQty": item.get("pendingQty", 0),
+        })
+    return frozen
 
 
 def _reminder_preview(arguments, ctx):
@@ -1104,27 +1260,43 @@ def _reminder_preview(arguments, ctx):
     if not orders:
         raise ToolError("当前口径下没有需要催办的采购单，不发送空提醒")
     buyers = sorted({item["buyer"] for item in orders})
+    targets = ctx.notifier.describe_targets(buyers)
+    frozen = _freeze_reminder_orders(orders)
+    arguments["today"] = reminders["today"]
+    arguments["orders"] = frozen
+    arguments["poIds"] = [item["purchaseOrderNo"] for item in frozen if item["purchaseOrderNo"]]
+    arguments["buyers"] = buyers
+    arguments["atUserIds"] = list(targets.get("atUserIds") or [])
     return {
         "today": reminders["today"],
-        "orderCount": len(orders),
+        "orderCount": len(frozen),
         "matched": matched,
         "buyers": buyers,
-        "targets": ctx.notifier.describe_targets(buyers),
-        "pendingQty": sum(item["pendingQty"] for item in orders),
-        "text": reminder_markdown(reminders, orders)[:3000],
+        "poIds": arguments["poIds"],
+        "targets": targets,
+        "purchaseQty": sum(item.get("purchaseQty", 0) for item in frozen),
+        "pendingQty": sum(item["pendingQty"] for item in frozen),
+        "text": reminder_markdown(reminders, frozen)[:3000],
+        "note": "确认后按这份清单和收件人发送，不再重查跟单池。清单过期请重新发起。",
     }
 
 
 def _send_reminder(arguments, ctx):
     if ctx.notifier is None:
         raise ToolError("钉钉推送尚未启用")
-    reminders, orders, _, _ = _reminder_selection(arguments, ctx)
+    frozen = _freeze_reminder_orders(arguments.get("orders") or [])
+    if frozen:
+        reminders = {"today": arguments.get("today") or ""}
+        orders = frozen
+    else:
+        reminders, orders, _, _ = _reminder_selection(arguments, ctx)
     if not orders:
         raise ToolError("当前口径下没有需要催办的采购单，不发送空提醒")
     return ctx.notifier.send_reminders(
         reminders, orders,
         idempotency_key=f"agent-action-{ctx.action_id}" if ctx.action_id else None,
         operator=ctx.operator,
+        at_user_ids=arguments.get("atUserIds") or None,
     )
 
 
@@ -1135,8 +1307,8 @@ YEAR_PARAM = {"type": "string", "description": "统计年度，四位数字；�
 TODAY_PARAM = {"type": "string", "description": "以哪天为今天计算剩余天数，YYYY-MM-DD；缺省服务器当天"}
 BUCKETS_PARAM = {
     "type": "array",
-    "items": {"type": "string", "enum": list(BUCKET_ORDER)},
-    "description": "催办档位：overdue 逾期 / t1 剩0-1天 / t10 剩2-10天 / t20 剩11-20天 / later 暂不提醒 / unscheduled 未排期；缺省为需催的四波",
+    "items": {"type": "string", "enum": list(FOLLOWUP_ORDER)},
+    "description": "催办档位：overdue 已逾期 / d3 剩≤3天 / d10 剩≤10天 / later 暂不提醒 / unscheduled 未排期；缺省为需催三档",
 }
 
 
@@ -1196,6 +1368,55 @@ def _push_quality_preview(arguments, ctx):
     return {"today": today, "count": len(issues), "note": "将把当日品控日报发到钉钉群"}
 
 
+def _resolve_quality_issue(arguments, ctx):
+    ledger = _quality_or_error(ctx)
+    return ledger.resolve(
+        str(arguments.get("issue_id") or "").strip(),
+        str(arguments.get("resolution") or "").strip(),
+    )
+
+
+def _resolve_quality_preview(arguments, ctx):
+    return {
+        "issue_id": str(arguments.get("issue_id") or "").strip(),
+        "resolution": str(arguments.get("resolution") or "").strip(),
+        "note": "确认后关闭该品控记录，不改 ERP。",
+    }
+
+
+def _cancel_quality_issue(arguments, ctx):
+    ledger = _quality_or_error(ctx)
+    return ledger.cancel(str(arguments.get("issue_id") or "").strip())
+
+
+def _cancel_quality_preview(arguments, ctx):
+    return {
+        "issue_id": str(arguments.get("issue_id") or "").strip(),
+        "note": "确认后撤销该品控记录，不改 ERP。",
+    }
+
+
+def _dropship_preview(arguments, ctx):
+    from ..dropship.workbook import dropship_filename
+    return {
+        "pool": "代发订单未安排",
+        "filename": dropship_filename(),
+        "note": "将打开 ERP 揭开收货并写入当日 Excel，约需数分钟。不改 ERP 单据。",
+    }
+
+
+def _generate_dropship_workbook(arguments, ctx):
+    runtime = ctx.erp
+    if runtime is None:
+        raise ToolError("ERP Digital Worker 未装配。请先 scripts/run_erp_worker.py login")
+    from ..dropship.export import export_today_dropship, public_export_result
+    try:
+        payload = export_today_dropship(runtime, root=ctx.root, env_path=ctx.env_path)
+    except Exception as exc:
+        raise ToolError(str(exc)) from exc
+    return public_export_result(payload)
+
+
 def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True,
                    with_quality=False) -> ToolRegistry:
     """按已启用的子系统装配工具注册表。"""
@@ -1211,7 +1432,11 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
     ))
     registry.register(Tool(
         name="get_purchase_order",
-        description="按采购单号读取单头与全部商品明细：供应商、采购员、交期、数量、已入库、待入库、ERP 单价、已维护的票种价格，以及该行已保存的执行标准（GB/T…，不是商品条码）。要看该类有哪些候选国标请用 lookup_gb_standards。",
+        description=(
+            "按采购单号读取单头与全部商品明细：供应商、采购员、交期、数量、已入库、待入库、ERP 单价、已维护的票种价格，以及该行已保存的执行标准（GB/T…，不是商品条码）。"
+            "问到货/待入库用这个；催逾期采购单用 delivery_reminders；看板金额用 dashboard_summary；"
+            "要看出库订单用 search_sales_orders。要看该类有哪些候选国标请用 lookup_gb_standards。"
+        ),
         parameters={"type": "object", "properties": {
             "po_id": {"type": "string", "description": "ERP 采购单号，纯数字"},
         }, "required": ["po_id"]},
@@ -1219,19 +1444,25 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
     ))
     registry.register(Tool(
         name="delivery_reminders",
-        description="按四波催办口径（T-20 / T-10 / T-1 / 逾期）汇总仍有待入库数量的采购单，可按档位、采购员、供应商过滤。",
+        description=(
+            "按跟单三档（剩≤10天 / ≤3天 / 已逾期）汇总已确认未完结、排除返修的采购单，可按档位、采购员、供应商过滤。"
+            "只看采购交期，不要用来查销售订单、换货或看板金额。发到钉钉用 send_delivery_reminder。"
+        ),
         parameters={"type": "object", "properties": {
             "buckets": BUCKETS_PARAM,
             "buyer": {"type": "string", "description": "采购员姓名，支持部分匹配；填「我名下」只看绑定人"},
             "supplier": {"type": "string", "description": "供应商名称，支持部分匹配"},
             "limit": {"type": "integer", "description": "返回采购单条数，默认 30"},
-            "year": YEAR_PARAM, "today": TODAY_PARAM,
+            "today": TODAY_PARAM,
         }},
         risk="L0", handler=_delivery_reminders,
     ))
     registry.register(Tool(
         name="dashboard_summary",
-        description="采购看板统计：单数、明细行数、采购金额、数量、已入库、待入库、入库率，以及采购员/供应商/品类金额 Top。",
+        description=(
+            "采购看板统计：单数、明细行数、采购金额、数量、已入库、待入库、入库率，以及采购员/供应商/品类金额 Top。"
+            "问今年买了多少、入库率用这个；列逾期采购单用 delivery_reminders；查某一张单用 get_purchase_order。"
+        ),
         parameters={"type": "object", "properties": {
             "year": YEAR_PARAM,
             "buyer": {"type": "string", "description": "只看某个采购员；填「我名下」只看绑定人"},
@@ -1375,6 +1606,18 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
         risk="L1", handler=_generate_contract, preview=_contract_preview,
         title=lambda args: f"生成采购合同 {args.get('po_id', '')}（{INVOICE_LABELS.get(str(args.get('invoice_type')), '')}）",
     ))
+    registry.register(Tool(
+        name="generate_dropship_workbook",
+        description=(
+            "抓取 ERP「代发订单未安排」并生成当日 YYMMDD-代发.xlsx。"
+            "会先给出文件名供员工确认；确认后打开 Digital Worker 揭开收货并写入，约需数分钟。"
+            "不改 ERP 单据。问「导出代发」「今天的代发表」时用。"
+        ),
+        parameters={"type": "object", "properties": {}},
+        risk="L1", handler=_generate_dropship_workbook, preview=_dropship_preview,
+        title=lambda args: "生成代发订单 Excel",
+        side_effect="file",
+    ))
     if with_exchange:
         registry.register(Tool(
             name="submit_exchange_dry_run",
@@ -1394,13 +1637,13 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
         registry.register(Tool(
             name="locate_insole_orders",
             description=(
-                "查询抖音订单里仍挂着旧鞋垫 SKU（XZ25401308-101）的清单，"
+                "查询抖音/快手/视频号订单里仍挂着旧鞋垫 SKU（XZ25401308-101）的清单，"
                 "按同单鞋子毫米数映射目标鞋垫。只读，不写 ERP。"
                 "默认只把 Question / WaitConfirm 标为待处理；Delivering 只列出。"
-                "半码按码数舍去小数后映射。员工说「查一下抖音要换的鞋垫订单」时用这个。"
+                "半码按码数舍去小数后映射。员工说「查一下要换的鞋垫订单」时用这个。"
             ),
             parameters={"type": "object", "properties": {
-                "shop": {"type": "string", "description": "店铺关键词，默认抖音"},
+                "shop": {"type": "string", "description": "店铺关键词，默认抖音+快手+视频号"},
                 "o_ids": {"type": "array", "items": {"type": "string"},
                           "description": "可选：只看这些内部订单号"},
             }},
@@ -1409,31 +1652,38 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
         registry.register(Tool(
             name="process_insole_orders",
             description=(
-                "按定位清单串行更换抖音鞋垫。必须先给出订单信息供员工确认；"
+                "按定位清单串行更换鞋垫（抖音/快手/视频号）。必须先给出订单信息供员工确认；"
                 "员工回复「确认」后由后端写入 ERP，不要叫员工去换货页，不要再次调用本工具。"
                 "不要把 Delivering 加进执行清单。指定源→目标的普通换货仍用 submit_exchange_dry_run。"
             ),
             parameters={"type": "object", "properties": {
-                "shop": {"type": "string", "description": "店铺关键词，默认抖音"},
+                "shop": {"type": "string", "description": "店铺关键词，默认抖音+快手+视频号"},
                 "o_ids": {"type": "array", "items": {"type": "string"},
                           "description": "要处理的内部订单号；缺省为当前全部可处理单"},
+                "orders": {"type": "array", "items": {"type": "object"},
+                           "description": "预览冻结的订单（含目标鞋垫），确认时不再重查全库"},
             }},
             risk="L2", handler=_process_insole, preview=_insole_preview,
-            title=lambda args: "处理抖音鞋垫订单",
+            title=lambda args: "处理鞋垫订单",
             side_effect="erp",
         ))
     if with_notifier:
         registry.register(Tool(
             name="send_delivery_reminder",
-            description="把交期催办清单发到钉钉采购群并 @ 对应采购员。对外动作，确认前会先给出完整清单。",
+            description="把交期催办清单私聊发给已绑定采购员。未绑定的人跳过，不发群。对外动作，确认前会先给出完整清单。",
             parameters={"type": "object", "properties": {
                 "buckets": BUCKETS_PARAM,
                 "buyer": {"type": "string", "description": "只催某个采购员；填「我名下」只看绑定人"},
                 "limit": {"type": "integer", "description": "最多包含多少张采购单，默认 100"},
-                "year": YEAR_PARAM, "today": TODAY_PARAM,
+                "today": TODAY_PARAM,
+                "orders": {"type": "array", "items": {"type": "object"},
+                           "description": "预览冻结的催办清单，确认时不再重查"},
+                "poIds": {"type": "array", "items": {"type": "string"}},
+                "buyers": {"type": "array", "items": {"type": "string"}},
+                "atUserIds": {"type": "array", "items": {"type": "string"}},
             }},
             risk="L2", handler=_send_reminder, preview=_reminder_preview,
-            title=lambda args: "发送交期催办到钉钉群",
+            title=lambda args: "发送交期催办到已绑定采购员",
         ))
     if with_quality:
         registry.register(Tool(
@@ -1463,5 +1713,24 @@ def build_registry(*, with_forecast=True, with_exchange=True, with_notifier=True
             parameters={"type": "object", "properties": {}},
             risk="L2", handler=_push_quality_report, preview=_push_quality_preview,
             title=lambda args: "发送品控日报",
+        ))
+        registry.register(Tool(
+            name="resolve_quality_issue",
+            description="关闭一条品控记录。必须有 6 位编号；确认后才改台账，不改 ERP。",
+            parameters={"type": "object", "properties": {
+                "issue_id": {"type": "string", "description": "品控编号，6 位十六进制"},
+                "resolution": {"type": "string", "description": "关闭说明，可空"},
+            }, "required": ["issue_id"], "additionalProperties": False},
+            risk="L1", handler=_resolve_quality_issue, preview=_resolve_quality_preview,
+            title=lambda args: f"关闭品控 {args.get('issue_id', '')}",
+        ))
+        registry.register(Tool(
+            name="cancel_quality_issue",
+            description="撤销一条品控记录。必须有 6 位编号；确认后才改台账。已关闭的不能再撤销当新登记。",
+            parameters={"type": "object", "properties": {
+                "issue_id": {"type": "string", "description": "品控编号，6 位十六进制"},
+            }, "required": ["issue_id"], "additionalProperties": False},
+            risk="L1", handler=_cancel_quality_issue, preview=_cancel_quality_preview,
+            title=lambda args: f"撤销品控 {args.get('issue_id', '')}",
         ))
     return registry

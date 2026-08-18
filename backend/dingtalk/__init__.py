@@ -7,13 +7,15 @@ from pathlib import Path
 
 from .identity import StaffDirectory
 from .reminders import DailyReminderScheduler, ReminderNotifier
+from .restart import notify_pending_after_restart
 from .sender import DingTalkError, DingTalkSender
 from .stream import DingTalkStreamChannel, sdk_available
 
 
 __all__ = [
     "DailyReminderScheduler", "DingTalkError", "DingTalkSender", "DingTalkStreamChannel",
-    "ReminderNotifier", "StaffDirectory", "build_dingtalk", "sdk_available",
+    "ReminderNotifier", "StaffDirectory", "build_dingtalk", "notify_pending_after_restart",
+    "sdk_available",
 ]
 
 
@@ -26,6 +28,10 @@ def build_dingtalk(*, setting, store, audit, flag, root=None):
     if not flag(setting("DINGTALK_ENABLED", "false")):
         sender = DingTalkSender()
     else:
+        session_store = None
+        if root:
+            from ..paths import local_dir
+            session_store = local_dir("data", root=root) / "dingtalk_session_webhooks.json"
         sender = DingTalkSender(
             webhook_url=setting("DINGTALK_WEBHOOK_URL", ""),
             webhook_secret=setting("DINGTALK_WEBHOOK_SECRET", ""),
@@ -33,11 +39,13 @@ def build_dingtalk(*, setting, store, audit, flag, root=None):
             client_secret=setting("DINGTALK_CLIENT_SECRET", ""),
             robot_code=setting("DINGTALK_ROBOT_CODE", ""),
             group_conversation_id=setting("DINGTALK_GROUP_CONVERSATION_ID", ""),
+            session_store_path=session_store,
         )
     directory = StaffDirectory(store)
     if root:
         from ..paths import local_dir
         directory.seed_from_json(local_dir("config", root=root) / "staff_bindings.json")
+    directory.promote_builtin_admins()
     notifier = ReminderNotifier(
         sender=sender, directory=directory, audit=audit,
         title=setting("DINGTALK_REMINDER_TITLE", "采购交期催办"),

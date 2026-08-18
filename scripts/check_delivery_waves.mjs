@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * 核对四波催办口径：waves.ts 边界、ledger/model.ts 逐行回退、
+ * 核对跟单三档催办口径：waves.ts 边界、ledger/model.ts 逐行回退、
  * tests/fixtures/delivery_waves.json。挂在 npm run build 前面，
  * 与 Python tests.test_delivery_reminders 共用同一份夹具。
  */
@@ -17,10 +17,9 @@ const modelSource = fs.readFileSync(path.join(root, "frontend/src/pages/ledger/m
 
 function waveOfDays(days) {
   if (days === null) return "none";
-  if (days < 0) return "w4";
-  if (days <= 1) return "w3";
-  if (days <= 10) return "w2";
-  if (days <= 20) return "w1";
+  if (days < 0) return "overdue";
+  if (days <= 3) return "d3";
+  if (days <= 10) return "d10";
   return "far";
 }
 
@@ -45,10 +44,9 @@ function earliestDueDate(lines) {
 const errors = [];
 
 if (!/if \(days === null\) return "none"/.test(wavesSource)
-    || !/if \(days < 0\) return "w4"/.test(wavesSource)
-    || !/if \(days <= 1\) return "w3"/.test(wavesSource)
-    || !/if \(days <= 10\) return "w2"/.test(wavesSource)
-    || !/if \(days <= 20\) return "w1"/.test(wavesSource)) {
+    || !/if \(days < 0\) return "overdue"/.test(wavesSource)
+    || !/if \(days <= 3\) return "d3"/.test(wavesSource)
+    || !/if \(days <= 10\) return "d10"/.test(wavesSource)) {
   errors.push("waves.ts waveOfDays 边界与契约不一致");
 }
 
@@ -85,7 +83,7 @@ if (wave !== mixed.expected.wave) {
 }
 
 if (errors.length) {
-  console.error("四波催办口径契约不一致：");
+  console.error("跟单三档催办口径契约不一致：");
   for (const line of errors) console.error("  " + line);
   process.exit(1);
 }

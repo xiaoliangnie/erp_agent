@@ -107,12 +107,20 @@ class ExchangeService:
         self._lock = threading.RLock()
         self._init_schema()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.database_path, timeout=10)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA journal_mode = WAL")
-        return conn
+        try:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _init_schema(self) -> None:
         with self._connect() as conn:

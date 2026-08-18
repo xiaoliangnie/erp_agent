@@ -170,6 +170,112 @@ CREATE TABLE IF NOT EXISTS operator_memories (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_operator_memories ON operator_memories(operator, active, updated_at);
+CREATE TABLE IF NOT EXISTS work_items (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source_table TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    operator TEXT NOT NULL DEFAULT '',
+    user_id TEXT NOT NULL DEFAULT '',
+    tool TEXT NOT NULL DEFAULT '',
+    risk TEXT NOT NULL DEFAULT '',
+    summary_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (source_table, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_work_items_status ON work_items(status, updated_at);
+CREATE TABLE IF NOT EXISTS jobs (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 5,
+    available_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_until TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_queue ON jobs(status, available_at, created_at);
+CREATE TABLE IF NOT EXISTS outbox_messages (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL,
+    idempotency_key TEXT UNIQUE,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    result_json TEXT,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    delivered_at TEXT,
+    lease_token TEXT NOT NULL DEFAULT '',
+    lease_until TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_due ON outbox_messages(status, next_attempt_at);
+CREATE TABLE IF NOT EXISTS users (
+    user_id TEXT PRIMARY KEY,
+    real_name TEXT NOT NULL DEFAULT '',
+    nickname TEXT NOT NULL DEFAULT '',
+    canonical_name TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    erp_buyer_aliases_json TEXT NOT NULL DEFAULT '[]',
+    dingtalk_userid TEXT NOT NULL DEFAULT '',
+    dingtalk_unionid TEXT NOT NULL DEFAULT '',
+    mobile TEXT NOT NULL DEFAULT '',
+    department TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    source TEXT NOT NULL DEFAULT 'purchase_order_seed',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_users_canonical ON users(canonical_name);
+CREATE INDEX IF NOT EXISTS idx_users_dingtalk ON users(dingtalk_userid);
+CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
+CREATE TABLE IF NOT EXISTS bind_requests (
+    id TEXT PRIMARY KEY,
+    sender_id TEXT NOT NULL,
+    sender_name TEXT NOT NULL DEFAULT '',
+    names_json TEXT NOT NULL,
+    status TEXT NOT NULL,
+    requested_at TEXT NOT NULL,
+    decided_at TEXT,
+    decided_by TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    conversation_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bind_requests_status ON bind_requests(status, requested_at);
+CREATE TABLE IF NOT EXISTS web_bind_codes (
+    id TEXT PRIMARY KEY,
+    code_hash TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL DEFAULT '',
+    sender_id TEXT NOT NULL,
+    buyer_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_web_bind_codes_hash ON web_bind_codes(code_hash);
+CREATE TABLE IF NOT EXISTS web_sessions (
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL DEFAULT '',
+    sender_id TEXT NOT NULL DEFAULT '',
+    buyer_name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_web_sessions_hash ON web_sessions(token_hash);
 """
 
 COLUMN_MIGRATIONS = (
@@ -184,6 +290,18 @@ COLUMN_MIGRATIONS = (
     ("pending_actions", "user_id", "TEXT NOT NULL DEFAULT ''"),
     ("forecast_runs", "user_id", "TEXT NOT NULL DEFAULT ''"),
     ("staff_bindings", "role", "TEXT NOT NULL DEFAULT 'operator'"),
+    ("agent_sessions", "user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("operator_memories", "user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("staff_bindings", "user_id", "TEXT NOT NULL DEFAULT ''"),
+    ("bind_requests", "conversation_id", "TEXT NOT NULL DEFAULT ''"),
+    ("outbox_messages", "lease_token", "TEXT NOT NULL DEFAULT ''"),
+    ("outbox_messages", "lease_until", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "lease_token", "TEXT NOT NULL DEFAULT ''"),
+    ("jobs", "lease_until", "TEXT NOT NULL DEFAULT ''"),
+)
+
+INDEX_MIGRATIONS = (
+    "CREATE INDEX IF NOT EXISTS idx_operator_memories_user ON operator_memories(user_id, active, updated_at)",
 )
 
 
@@ -226,6 +344,8 @@ class AgentStore:
         with self.write() as conn:
             conn.executescript(SCHEMA)
             _migrate_columns(conn)
+            for statement in INDEX_MIGRATIONS:
+                conn.execute(statement)
 
     def _open(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.database_path, timeout=10)

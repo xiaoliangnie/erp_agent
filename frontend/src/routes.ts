@@ -1,5 +1,5 @@
 /**
- * 五个页面的路径与导航标题，只写一处。
+ * 页面路径与导航标题，只写一处。
  *
  * 路径用 ASCII：中文路径在地址栏、日志和分享链接里会变成 percent-encoding，
  * 不好读也不好搜。页面标题仍用中文业务叫法。
@@ -10,6 +10,7 @@ export const ROUTES = {
   contract: "/contract",
   exchange: "/exchange",
   chat: "/chat",
+  workbench: "/workbench",
 } as const;
 
 export interface NavItem {
@@ -25,4 +26,5 @@ export const NAV_ITEMS: NavItem[] = [
   { path: ROUTES.contract, label: "采购合同", keepsYear: false },
   { path: ROUTES.exchange, label: "订单换货", keepsYear: false },
   { path: ROUTES.chat, label: "采购助手", keepsYear: false },
+  { path: ROUTES.workbench, label: "工作台", keepsYear: false },
 ];

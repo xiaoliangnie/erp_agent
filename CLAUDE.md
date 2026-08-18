@@ -2,14 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-采购看板 / 交期提醒台账 / 采购合同生成 / 订单换货 / 采购助手对话。一个 Vite + React + TS
-单页应用（五条路由）+ 一个 Python 标准库 HTTP 服务。数据源是
+采购看板 / 交期提醒台账 / 采购合同生成 / 订单换货 / 代发订单 / 采购助手对话 / 工作台。一个 Vite + React + TS
+单页应用（六条路由）+ 一个 Python 标准库 HTTP 服务。数据源是
 供应链安全代理 API 维护的本地可写 MySQL 镜像。业务术语、文件名、注释和文档一律用中文，改动时保持一致。
 
 `AGENTS.md` 有提交与代码风格约定；`README.md` 记录全部业务口径；
-`docs/README.md` 是文档索引。当前执行文档是 `docs/开发.md`（含已拍板）。
-Agent 完成度看 `docs/Agent进度.md`：完成、部分完成、新增或取消一项能力时必须改那份表。
-架构在 `docs/architecture/`，预测在 `docs/预测.md`，旧方案在 `docs/archive/`。
+`docs/README.md` 是文档索引。现行文档四份：`docs/开发.md`（执行、已拍板、Agent 完成度）、
+`docs/架构.md`（当前系统）、`docs/预测.md`、`docs/接口参考.md`。旧方案在 `docs/archive/`。
+完成、部分完成、新增或取消一项 Agent 能力时必须改 `docs/开发.md` 的完成度表。
 本地文件（配置 / 模板 / 运行时 / 生成物）在 `files/` 下。
 
 ## 常用命令
@@ -30,13 +30,17 @@ npm run typecheck                                # tsc --noEmit，build 里也�
 python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py   # 快速语法检查
 
 # 离线用例。`discover` 用不了：tests/ 不是包，要按模块名列出
-.venv/bin/python -m unittest tests.test_agent tests.test_forecast tests.test_delivery_reminders tests.test_exchange tests.test_order_source tests.test_product_images tests.test_realtime_mirror tests.test_gb_standards tests.test_contract_gb tests.test_dingtalk tests.test_codex_oauth tests.test_health_watch tests.test_payload_contract tests.test_http_auth tests.test_contracts tests.test_source_cache tests.test_quality tests.test_supplier_master tests.test_erp tests.test_insole
+.venv/bin/python -m unittest tests.test_agent tests.test_identity tests.test_forecast tests.test_delivery_reminders tests.test_exchange tests.test_order_source tests.test_product_images tests.test_realtime_mirror tests.test_gb_standards tests.test_contract_gb tests.test_dingtalk tests.test_codex_oauth tests.test_health_watch tests.test_payload_contract tests.test_http_auth tests.test_contracts tests.test_source_cache tests.test_quality tests.test_supplier_master tests.test_erp tests.test_insole tests.test_dropship
 .venv/bin/python -m unittest tests.test_contracts   # 离线夹具；CONTRACT_LIVE_TESTS=1 才连库
 .venv/bin/python -m unittest tests.test_agent.ConfirmFlowTests   # 单个类
 
 .venv/bin/python scripts/generate_purchase_contract.py \
  --po-id 604264 --invoice-type special_invoice --output files/outputs/采购合同-604264.xlsx
 
+.venv/bin/python scripts/generate_dropship_workbook.py      # 只刷新 代发订单模板.xlsx，不覆盖当日已填表
+
+.venv/bin/python scripts/seed_users.py                      # 扫描采购员，写分析报告
+.venv/bin/python scripts/seed_users.py --live --seed        # 从镜像库种子 users
 .venv/bin/python scripts/run_agent_cli.py --status          # Agent / 预测 / 钉钉 子系统状态
 .venv/bin/python scripts/run_erp_worker.py status           # Digital Worker 配置（不启动浏览器）
 .venv/bin/python scripts/run_erp_worker.py login            # 有头登录并保存 storage_state
@@ -94,12 +98,12 @@ Agent 工具（`agent_rows()`）共用这一份，短时间内不会重复压库
 实时库连不上就直接报错，**不回退旧库**——避免员工把历史快照当成实时数据。
 国标目录由 `backend/gb_standards.py` 写入同一镜像库的 `gb_standards` 表，不经过供应链代理。
 
-### 前端：一个单页应用，五条路由
+### 前端：一个单页应用，六条路由
 
 ```
 frontend/index.html · frontend/src/main.tsx     Vite 入口，root 是 frontend/
-  → src/App.tsx                                 五个页面按 React.lazy 分块
-  → src/routes.ts                                /dashboard /ledger /contract /exchange /chat
+  → src/App.tsx                                 六个页面按 React.lazy 分块
+  → src/routes.ts                                /dashboard /ledger /contract /exchange /chat /workbench
                                                  路径用 ASCII 且只写这一处，标题仍是中文
   → src/pages/<page>/                            每页一个目录：Page + 视图模型 + 局部 CSS
   → src/api/client.ts                            publicApi / exchangeApi / agentApi
@@ -112,7 +116,7 @@ frontend/index.html · frontend/src/main.tsx     Vite 入口，root 是 frontend
 在 `LEGACY_PAGES` 里 302 到新路由。`dist/` 不存在时页面返回 503 并提示先构建，接口不受影响。
 
 改前端用 `npm run dev`（Vite 把 `/api` 代理到 8777），**不要**直接改 `frontend/dist/`。
-新增页面文件不再需要在后端登记白名单，但新增油猴脚本一类的非 SPA 资源要加进 `STATIC_FILES`。
+新增页面文件不再需要在后端登记白名单，但新增非 SPA 静态资源（如换货核心 JS）要加进 `STATIC_FILES`。
 
 ### 中文列名是内部契约
 
@@ -125,13 +129,13 @@ frontend/index.html · frontend/src/main.tsx     Vite 入口，root 是 frontend
 ### 位置数组 payload 与下标常量
 
 payload 是 `{meta, dict, orders, lines}`，`orders`/`lines` 是纯位置数组，字典维度只存下标。
-下标常量现在只有两处，改列顺序同步这两处即可：
+列名常量现在只有两处，改列顺序同步这两处即可：
 
-- `backend/procurement_data.py` 的 `DASHBOARD_*_COLUMNS` / `DELIVERY_*_COLUMNS`
-- `frontend/src/data/payload.ts` 的同名列数组；宽度由列名长度得出
+- `backend/procurement_data.py` 的 `DASHBOARD_*_COLUMNS` / `DELIVERY_*_COLUMNS`（响应带 `columns`）
+- `frontend/src/data/payload.ts` 的同名列数组
 
-`payload.ts` 的 `decodeDashboard` / `decodeDelivery` 会校验数组宽度并把位置数组转成命名字段，
-页面组件拿到的是对象，不再各写一份下标。宽度不符会直接抛错，而不是静默错位。
+`payload.ts` 的 `decodeDashboard` / `decodeDelivery` 按列名解码；后端下发的 `columns` 与前端不一致、
+或旧缓存列数不符，都会直接抛错，而不是静默错位。
 
 离线快照链路（`frontend/data/*.js` + `scripts/build_*.py` + adapters 回退）已下线，
 旧实现留在 `legacy/`。**现在只有一份转换实现**（`procurement_data.py`），
@@ -141,7 +145,7 @@ payload 是 `{meta, dict, orders, lines}`，`orders`/`lines` 是纯位置数组�
 
 采购看板走 `最早预计到货日期`（预计到货），交期提醒台账走 `item_delivery_date`（与供应商
 约定的交期），该行为空才退到预计到货日。两列覆盖率和最远日期都不一样，不要"统一"。
-四波提醒（T-20 / T-10 / T-1 / 逾期）的完整口径见 `README.md`，改动要同步更新那里。
+交期台账与钉钉催办走跟单三档（≤10 天 / ≤3 天 / 已逾期）；采购看板的到货档位仍按预计到货日分档。完整口径见 `README.md`，改动要同步更新那里。
 
 ### 合同生成
 
@@ -202,8 +206,23 @@ L0 直接执行。**L1/L2 一律不直接执行**：`runner._invoke` 把它转�
 重复确认回放已有结果。确认人必须是发起人。改这段逻辑要同时看 `tests/test_agent.py`
 的 `ConfirmFlowTests`。
 
+发给模型的上下文在 `sessions.context_messages` 里按层组装：系统规则 → 身份/渠道 →
+操作员记忆 → 消毒后的摘要 → 当前业务对象快照（只含单号/SKU/待确认编号）→ 近讯。
+「新话题 / 记住 / 忘记」走 `runner.handle_session_command`，网页和钉钉同一套。
+固定业务原话先走 `intents.classify_intent`（抽槽后拒答 / 追问 / 调工具），未识别再进
+LLM 工具循环。L1/L2 仍经 `pending_actions`。不要在意图层猜 `o_id` 或改工具数字。
+能写死的原话先走 `intents.classify_intent`（抽槽后拒答 / 追问 / 调已注册工具），
+未识别再进 LLM 工具循环。L1/L2 仍进 `pending_actions`，禁止猜 `o_id`。
+记忆按 `user_id` 存，注入前扫描控制字符和注入句；`AGENT_MEMORY_ENABLED` /
+`AGENT_SUMMARY_ENABLED` 默认关。同会话忙时回「上一条还在处理」。
+
 Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方案 §10 一致，
 连接和建表集中在 `backend/agent/store.py` 一处。迁 MySQL 只换这一层，**P2、专用机器落地后再做**。
+
+ERP 写入走 `DigitalRuntime.run("erp.exchange_items")`：写入前快照、写入后
+`loadOrder` 回读 SKU，对不上不记成功；已经是目标 SKU 则跳过改单。JSON 证据落
+`files/data/erp-evidence/`（`ERP_EVIDENCE_DIR`）。结果未知抛 `ErpUnknownResult`，不得重试。
+正式建单和其他出库仍关闭。
 
 ### 预测子系统的边界
 
@@ -215,11 +234,12 @@ Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方�
 `FORECAST_INVENTORY_*` 配置。**库存缺失时 `order_suggestion` 直接报错说明缺哪些 SKU，
 不用 0 兜底**——与合同生成同一哲学。在途待入库已可用（采购明细 数量 − 已入库）。
 
-### 四波催办口径只有一份实现
+### 跟单三档催办口径只有一份实现
 
-`backend/delivery_reminders.py` 被交期台账页口径、Agent 的 `delivery_reminders` 工具和
-钉钉每日推送共用。改档位边界或日期回退顺序要同步 `README.md` 的口径章节和
-`tests/test_delivery_reminders.py`。
+`backend/delivery_reminders.py` 的 `profile=followup` 被交期台账页、Agent 的
+`delivery_reminders` 工具和钉钉每日推送共用。改档位边界或日期回退顺序要同步
+`README.md` 的口径章节、`frontend/src/pages/ledger/waves.ts` 和
+`tests/test_delivery_reminders.py`。旧四波留在 `profile=ledger`，不要接到台账页上。
 
 ### 配置与接口鉴权
 
@@ -227,14 +247,17 @@ Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方�
 - `.env` 中的 `SUPPLY_API_*`：供应链代理 Client 凭据，同样不提交
 - `.env`：服务、Agent、钉钉配置，在 `backend/app.py` 导入时由 `load_all_env` 读入；
   `setting()` 让进程环境变量优先于 `.env`
-- 页面走 `frontend/dist/` SPA 托管；`STATIC_FILES` 白名单只剩油猴 worker 脚本
+- 页面走 `frontend/dist/` SPA 托管；`STATIC_FILES` 白名单只剩换货核心 JS（油猴脚本已退役，路径仍提供）
 - `/api/contracts/*` 页面用、无鉴权（资源路径限制在 `files/outputs/` 下）；`/api/exchange/*`
   双 token（页面 `EXCHANGE_API_TOKEN` / worker `EXCHANGE_WORKER_TOKEN`）；
   `/api/agent/*`、`/api/forecast/*` 用 Bearer `AGENT_API_TOKEN` 常量时间比对，
   未配置 token 时返回 503 保持关闭
 - `AGENT_ENABLED` 默认 `false`；关闭时对话接口返回 503，看板与合同链路不受影响
 - `DINGTALK_ENABLED` 是总闸：关闭则不装配发送通道，催办/品控日报也发不出去。
-  `DINGTALK_REMINDER_ENABLED` 另管每日定时催办（不依赖大模型）
+  `DINGTALK_REMINDER_ENABLED` 另管每日定时催办（不依赖大模型）。
+  应用机器人 `groupMessages/send` 官方不支持 @。催办已绑定员工走
+  `oToMessages/batchSend` 单聊；群里要点到人仍走自定义 Webhook
+  或 Stream 缓存的入站 `sessionWebhook`（`files/data/dingtalk_session_webhooks.json`）
 - `GB_SYNC_ENABLED` 管国标目录每日同步；失败按指数退避封顶 900 秒。同步成功后若合同已选用
   的执行标准变成现行或废止，会推钉钉（同一标准同一天只发一次）。手工跑
   `scripts/sync_gb_standards.py`
@@ -254,5 +277,5 @@ Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方�
   日历加减用 UTC（`T00:00:00Z` + `getUTC*` / `setUTCDate`），不要 `toISOString()` 去本地午夜
 - 改动日期或数量口径必须同步更新 `README.md` 的口径章节
 - 新增 Agent 工具要同时补 `tests/test_agent.py`；L1/L2 工具必须给出 `preview`
-- 完成、部分完成、新增或取消 Agent 能力时，同步改 `docs/Agent进度.md`（条目、分组小计、总进度、最近变更）
+- 完成、部分完成、新增或取消 Agent 能力时，同步改 `docs/开发.md` 的完成度表（条目、分组小计、总进度、最近变更）
 - 不要提交凭证、供应商真实信息、训练好的模型工件（`files/data/models/`）或无关的 CSV 导出

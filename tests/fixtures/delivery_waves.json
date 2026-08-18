@@ -2,14 +2,12 @@
   "today": "2026-08-13",
   "waveThresholds": [
     {"days": null, "bucket": "unscheduled", "wave": "none"},
-    {"days": -1, "bucket": "overdue", "wave": "w4"},
-    {"days": 0, "bucket": "t1", "wave": "w3"},
-    {"days": 1, "bucket": "t1", "wave": "w3"},
-    {"days": 2, "bucket": "t10", "wave": "w2"},
-    {"days": 10, "bucket": "t10", "wave": "w2"},
-    {"days": 11, "bucket": "t20", "wave": "w1"},
-    {"days": 20, "bucket": "t20", "wave": "w1"},
-    {"days": 21, "bucket": "later", "wave": "far"}
+    {"days": -1, "bucket": "overdue", "wave": "overdue"},
+    {"days": 0, "bucket": "d3", "wave": "d3"},
+    {"days": 3, "bucket": "d3", "wave": "d3"},
+    {"days": 4, "bucket": "d10", "wave": "d10"},
+    {"days": 10, "bucket": "d10", "wave": "d10"},
+    {"days": 11, "bucket": "later", "wave": "far"}
   ],
   "mixedOrder": {
     "purchaseOrderNo": "MIX-1",
@@ -53,8 +51,8 @@
       "deliveryDate": "2026-08-20",
       "dateSource": "预计到货",
       "etaSpread": 2,
-      "bucket": "t10",
-      "wave": "w2"
+      "bucket": "d10",
+      "wave": "d10"
     }
   }
 }

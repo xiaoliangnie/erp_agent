@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""抖音换鞋垫：镜像定位 + 鞋码映射 + 串行写入。
+"""鞋垫换货：镜像定位 + 鞋码映射 + 串行写入。
 
-尺码来自同单鞋子规格。半码按码数舍去小数（40.5→40）再换算毫米。
+查询池默认含抖音 / 快手 / 视频号。尺码来自同单鞋子规格。
+半码按码数舍去小数（40.5→40）再换算毫米。
 默认只处理 Question / WaitConfirm。Delivering / 发货中只列出，不写 ERP。
 """
 from __future__ import annotations
@@ -10,10 +11,12 @@ import json
 import logging
 import os
 import re
+import time
 import sqlite3
 import tempfile
 import threading
 from collections import defaultdict
+from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
@@ -21,6 +24,7 @@ from typing import Any, Callable
 from .policy import load_policy
 from .service import ExchangeError
 from ..business_time import BUSINESS_TIMEZONE, business_now
+from ..staff_names import buyer_names_equivalent
 from ..order_source import OrderSourceError, _identifier, _mirror_state, source_status
 from ..database import connect
 from ..paths import DATA_DIR, ROOT, resolve_repo_path
@@ -29,7 +33,10 @@ logger = logging.getLogger(__name__)
 
 
 SOURCE_SKU = "XZ25401308-101"
-DEFAULT_SHOP = "抖音"
+SHOP_POOL = ("抖音", "快手", "视频号")
+DEFAULT_SHOP = ""
+INSOLE_WRITE_DELAY_MS = 50
+INSOLE_WRITE_CONCURRENCY = 3
 INSOLE_BY_MM = {
     "225": "XZ25401308-09901",
     "230": "XZ25401308-09902",
@@ -59,10 +66,14 @@ MM_IN_PARENS = re.compile(r"(\d{3}(?:\.\d+)?)\s*\)")
 MM_ANY = re.compile(r"(\d{3}(?:\.\d+)?)")
 EU_LABEL = re.compile(r"鞋码大小[:：]\s*(\d{2}(?:\.\d+)?)")
 EU_BEFORE_MM = re.compile(r"(\d{2}(?:\.\d+)?)\s*\(\s*\d{3}")
+# 快手 / 视频号：网眼款;42 或 布面款;39 (245)
+LOOSE_EU = re.compile(r"[;；]\s*(\d{2}(?:\.\d+)?)\s*(?:\(|$)")
 TARGET_PREFIXES = ("XZ25401308-099", "XZ25401308099")
 INSOLE_WRITTEN_PATH = DATA_DIR / "insole_written.json"
 WRITTEN_TTL_HOURS = 48
 WRITTEN_REASON = "本批已写入，镜像尚未跟上"
+RESERVED_REASON = "他人待确认或正在写入"
+RESERVED_STATUSES = frozenset({"pending", "confirmed"})
 _WRITE_LOCK = threading.Lock()
 
 
@@ -91,7 +102,27 @@ def eu_size_from_props(text: str) -> str:
     if match:
         return match.group(1)
     match = EU_BEFORE_MM.search(text or "")
+    if match:
+        return match.group(1)
+    match = LOOSE_EU.search(text or "")
     return match.group(1) if match else ""
+
+
+def shop_keys(shop) -> tuple[str, ...]:
+    """空值表示整池（抖音/快手/视频号），不是放开所有店铺。"""
+    if isinstance(shop, (list, tuple, set)):
+        keys = tuple(str(item).strip() for item in shop if str(item).strip())
+        return keys or SHOP_POOL
+    text = str(shop or "").strip()
+    if not text or text in ("全部", "all", "*"):
+        return SHOP_POOL
+    parts = tuple(item.strip() for item in re.split(r"[,，/、]", text) if item.strip())
+    return parts or SHOP_POOL
+
+
+def shop_matches(shop_name: str, shop) -> bool:
+    name = str(shop_name or "")
+    return any(key in name for key in shop_keys(shop))
 
 
 def mm_from_eu_size(size: str) -> str:
@@ -288,11 +319,87 @@ def load_written_insole_orders(setting: Callable[[str, str], str] | None = None,
     return writes
 
 
-def sync_insole_mirror(env_path: str, writes: list[dict], *, mirror=None) -> dict:
-    """写入成功后先按单拉代理，再把源 SKU 换成目标，不等 60 秒增量。"""
+def _oids_from_action(preview: dict, arguments: dict) -> list[str]:
+    oids = []
+    seen = set()
+    for item in (preview.get("orders") or []):
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get("oId") or item.get("o_id") or "").strip()
+        if oid and oid not in seen:
+            seen.add(oid)
+            oids.append(oid)
+    for raw in list(preview.get("oIds") or []) + list(arguments.get("o_ids") or []):
+        oid = str(raw or "").strip()
+        if oid and oid not in seen:
+            seen.add(oid)
+            oids.append(oid)
+    return oids
+
+
+def load_reserved_insole_orders(
+    db_path, *, exclude_action_id: str | None = None, viewer: str | None = None,
+) -> dict:
+    """pending / confirmed 动作里已经占住的内部单号，定位时不要再发给别人。
+
+    ``viewer`` 是当前查询的人：本人待确认仍给自己看，只对其他人隐藏。
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        return {}
+    try:
+        conn = sqlite3.connect(path)
+        conn.row_factory = sqlite3.Row
+        placeholders = ",".join("?" * len(RESERVED_STATUSES))
+        rows = conn.execute(
+            f"""
+            SELECT id, operator, status, preview_json, arguments_json
+            FROM pending_actions
+            WHERE tool = 'process_insole_orders' AND status IN ({placeholders})
+            """,
+            tuple(RESERVED_STATUSES),
+        ).fetchall()
+        conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("读取鞋垫占用动作失败：%s", exc)
+        return {}
+    reserved = {}
+    skip = str(exclude_action_id or "")
+    viewer_name = str(viewer or "").strip()
+    for row in rows:
+        action_id = str(row["id"] or "")
+        if skip and action_id == skip:
+            continue
+        who = str(row["operator"] or "")
+        if viewer_name and who and buyer_names_equivalent(
+            viewer_name, who, include_nick=True,
+        ):
+            continue
+        try:
+            preview = json.loads(row["preview_json"] or "{}")
+            arguments = json.loads(row["arguments_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(preview, dict):
+            preview = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        info = {
+            "action_id": action_id,
+            "operator": who,
+            "status": str(row["status"] or ""),
+        }
+        for oid in _oids_from_action(preview, arguments):
+            reserved.setdefault(oid, info)
+    return reserved
+
+
+def sync_insole_mirror(env_path: str, writes: list[dict], *, mirror=None,
+                       refresh: bool = False) -> dict:
+    """写入成功后回写镜像明细。按单拉代理默认关掉，避免钉钉确认后再等一轮接口。"""
     oids = [str(item.get("o_id") or "") for item in writes if item.get("o_id")]
     refreshed: dict = {}
-    if mirror is not None and oids:
+    if refresh and mirror is not None and oids:
         try:
             refreshed = mirror.refresh_orders(oids)
         except Exception as exc:
@@ -328,7 +435,8 @@ def _is_insole_target(sku: str) -> bool:
     return any(text.startswith(prefix) or prefix in text for prefix in TARGET_PREFIXES)
 
 
-def classify_insole_row(order: dict, *, shop: str = DEFAULT_SHOP, written: dict | None = None) -> dict:
+def classify_insole_row(order: dict, *, shop: str = DEFAULT_SHOP, written: dict | None = None,
+                        reserved: dict | None = None) -> dict:
     """给一张已聚合的订单打上 processable / parked 及原因。"""
     row = dict(order)
     status = str(row.get("status") or "")
@@ -340,9 +448,9 @@ def classify_insole_row(order: dict, *, shop: str = DEFAULT_SHOP, written: dict 
     row["target_sku"] = target
     row["size_note"] = sized.get("size_note") or row.get("size_note") or ""
     row["source_sku"] = SOURCE_SKU
-    if shop and shop not in shop_name:
+    if not shop_matches(shop_name, shop):
         row["bucket"] = "skipped"
-        row["reason"] = f"非{shop}店铺"
+        row["reason"] = f"非{'/'.join(shop_keys(shop))}店铺"
         return row
     if status in FORBIDDEN_STATUSES:
         row["bucket"] = "skipped"
@@ -355,6 +463,12 @@ def classify_insole_row(order: dict, *, shop: str = DEFAULT_SHOP, written: dict 
     if written and str(row.get("o_id") or "") in written:
         row["bucket"] = "skipped"
         row["reason"] = WRITTEN_REASON
+        return row
+    hold = (reserved or {}).get(str(row.get("o_id") or ""))
+    if hold:
+        who = str(hold.get("operator") or "").strip()
+        row["bucket"] = "skipped"
+        row["reason"] = f"{RESERVED_REASON}（{who}）" if who else RESERVED_REASON
         return row
     if status in PARKED_STATUSES:
         row["bucket"] = "parked"
@@ -428,8 +542,12 @@ def _aggregate_orders(lines: list[dict]) -> list[dict]:
     return rows
 
 
-def fetch_insole_lines(setting: Callable[[str, str], str], env_path: str) -> tuple[list[dict], dict]:
-    """从订单镜像拉出仍含源鞋垫 SKU 的整单明细。"""
+def fetch_insole_lines(setting: Callable[[str, str], str], env_path: str,
+                       *, o_ids: list[str] | None = None, shops=None) -> tuple[list[dict], dict]:
+    """从订单镜像拉出仍含源鞋垫 SKU 的整单明细。
+
+    未指定单号时只拉查询池店铺、且状态仍可能处理的单，避免扫已发货那几千行。
+    """
     availability = source_status(setting)
     if not availability["configured"]:
         raise OrderSourceError(availability.get("message") or "订单镜像尚未配置")
@@ -466,6 +584,28 @@ def fetch_insole_lines(setting: Callable[[str, str], str], env_path: str) -> tup
     status_sql = f"o.`{status_col}`" if status_col else "''"
     shop_sql = f"o.`{shop_col}`" if shop_col else "''"
     date_sql = f"o.`{date_col}`" if date_col else "''"
+    wanted = [str(item).strip() for item in (o_ids or []) if str(item).strip()]
+    inner = f"SELECT DISTINCT `{item_oid}` FROM `{item_table}` WHERE `{item_sku}`=%s"
+    params: list = [SOURCE_SKU]
+    if wanted:
+        inner += " AND CAST(`{col}` AS CHAR) IN ({ph})".format(
+            col=item_oid, ph=",".join(["%s"] * len(wanted)),
+        )
+        params.extend(wanted)
+    filters = [f"i.`{item_oid}` IN ({inner})"]
+    if not wanted:
+        live = tuple(PROCESSABLE_STATUSES | PARKED_STATUSES)
+        if status_col:
+            filters.append(
+                f"o.`{status_col}` IN ({','.join(['%s'] * len(live))})"
+            )
+            params.extend(live)
+        keys = shop_keys(shops)
+        if shop_col and keys:
+            filters.append(
+                "(" + " OR ".join([f"o.`{shop_col}` LIKE %s"] * len(keys)) + ")"
+            )
+            params.extend([f"%{key}%" for key in keys])
     sql = f"""
         SELECT o.`{oid_col}` AS o_id, {so_sql} AS so_id, {status_sql} AS status,
                {shop_sql} AS shop_name, {date_sql} AS order_date,
@@ -473,9 +613,7 @@ def fetch_insole_lines(setting: Callable[[str, str], str], env_path: str) -> tup
                {props_sql} AS properties_value, {qty_sql} AS qty
         FROM `{item_table}` i
         JOIN `{order_table}` o ON CAST(o.`{oid_col}` AS CHAR)=CAST(i.`{item_oid}` AS CHAR)
-        WHERE i.`{item_oid}` IN (
-            SELECT DISTINCT `{item_oid}` FROM `{item_table}` WHERE `{item_sku}`=%s
-        )
+        WHERE {" AND ".join(filters)}
         ORDER BY o.`{oid_col}` DESC, i.`{item_sku}`
     """
     with connect(env, autocommit=True) as conn:
@@ -485,7 +623,7 @@ def fetch_insole_lines(setting: Callable[[str, str], str], env_path: str) -> tup
                    FROM realtime_sync_state WHERE source_name='orders' LIMIT 1"""
             )
             sync = cursor.fetchone() or {}
-            cursor.execute(sql, (SOURCE_SKU,))
+            cursor.execute(sql, params)
             lines = list(cursor.fetchall() or [])
     return lines, {
         "status": str(sync.get("status") or ""),
@@ -503,6 +641,9 @@ def locate_insole_orders(
     lines: list[dict] | None = None,
     sync: dict | None = None,
     written: dict | None = None,
+    reserved: dict | None = None,
+    exclude_action_id: str | None = None,
+    viewer: str | None = None,
     root=None,
 ) -> dict:
     """定位抖音鞋垫候选。`lines` 供离线用例注入，不连库。"""
@@ -510,25 +651,38 @@ def locate_insole_orders(
     if lines is None:
         if setting is None:
             raise OrderSourceError("订单镜像查询尚未配置")
-        lines, sync = fetch_insole_lines(setting, env_path)
+        lines, sync = fetch_insole_lines(
+            setting, env_path, o_ids=o_ids, shops=shop,
+        )
         if written is None:
             written = load_written_insole_orders(setting, root=root)
-    elif written is None:
-        written = {}
+        if reserved is None:
+            db = resolve_repo_path(
+                setting("AGENT_DATABASE_PATH", "files/data/agent.sqlite3"),
+                root=Path(root) if root is not None else ROOT,
+            )
+            reserved = load_reserved_insole_orders(
+                db, exclude_action_id=exclude_action_id, viewer=viewer,
+            )
+    else:
+        if written is None:
+            written = {}
+        if reserved is None:
+            reserved = {}
     wanted = {str(item).strip() for item in (o_ids or []) if str(item).strip()}
     classified = []
     for order in _aggregate_orders(lines):
         if wanted and order["o_id"] not in wanted:
             continue
         classified.append(classify_insole_row(
-            order, shop=shop or DEFAULT_SHOP, written=written,
+            order, shop=shop, written=written, reserved=reserved,
         ))
     processable = [row for row in classified if row["bucket"] == "processable"]
     parked = [row for row in classified if row["bucket"] == "parked"]
     skipped = [row for row in classified if row["bucket"] == "skipped"]
     return {
         "sourceSku": SOURCE_SKU,
-        "shop": shop or DEFAULT_SHOP,
+        "shop": ",".join(shop_keys(shop)),
         "sync": sync or {},
         "processable": processable,
         "parked": parked,
@@ -562,8 +716,8 @@ def format_insole_list(located: dict, *, limit: int = 5) -> str:
     processable = located.get("processable") or []
     parked = located.get("parked") or []
     lines = [
-        f"抖音鞋垫待处理 {located.get('processableCount') or 0} 单"
-        f"（Question / WaitConfirm；半码按码数舍去小数后映射）。",
+        f"鞋垫待处理 {located.get('processableCount') or 0} 单"
+        f"（抖音/快手/视频号；Question / WaitConfirm；半码按码数舍去小数后映射）。",
     ]
     shown = processable[: max(1, int(limit))]
     if shown:
@@ -588,6 +742,12 @@ def format_insole_list(located: dict, *, limit: int = 5) -> str:
     ]
     if written_skipped:
         lines.append(f"已排除刚写入、镜像尚未跟上的 {len(written_skipped)} 单。")
+    reserved_skipped = [
+        row for row in (located.get("skipped") or [])
+        if str(row.get("reason") or "").startswith(RESERVED_REASON)
+    ]
+    if reserved_skipped:
+        lines.append(f"已排除他人待确认或正在写入的 {len(reserved_skipped)} 单。")
     if located.get("sync"):
         stamp = located["sync"].get("lastSuccessAt") or located["sync"].get("status") or ""
         if stamp:
@@ -595,13 +755,49 @@ def format_insole_list(located: dict, *, limit: int = 5) -> str:
     return "\n".join(lines)
 
 
-def format_insole_result(result: dict | None, *, limit: int = 5) -> str:
+def format_elapsed(ms) -> str:
+    """把毫秒收成「11 秒」「1 分 3 秒」，给钉钉结果日志用。"""
+    try:
+        total = max(0, int(round(float(ms) / 1000)))
+    except (TypeError, ValueError):
+        return ""
+    hours, rem = divmod(total, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if hours:
+        parts.append(f"{hours} 小时")
+    if minutes:
+        parts.append(f"{minutes} 分")
+    if seconds or not parts:
+        parts.append(f"{seconds} 秒")
+    return " ".join(parts)
+
+
+def format_insole_result(result: dict | None, *, limit: int = 5, elapsed_ms=None) -> str:
     """确认执行后的结果日志；只展开处理信息与写入结果。"""
     result = result or {}
     ok = int(result.get("okCount") or 0)
     skipped = int(result.get("skippedCount") or 0)
     failed = int(result.get("failedCount") or 0)
-    lines = [f"【任务完成】鞋垫换货：成功 {ok}，跳过 {skipped}，失败 {failed}。"]
+    elapsed = elapsed_ms
+    if elapsed is None:
+        elapsed = result.get("elapsedMs")
+        if elapsed is None:
+            elapsed = result.get("elapsed_ms")
+    headline = f"【任务完成】鞋垫换货：成功 {ok}，跳过 {skipped}，失败 {failed}"
+    pretty = format_elapsed(elapsed)
+    if pretty:
+        headline += f"，用时 {pretty}"
+    phases = []
+    prepare_ms = result.get("prepareMs")
+    write_ms = result.get("writeMs")
+    if prepare_ms not in (None, ""):
+        phases.append(f"开页 {format_elapsed(prepare_ms)}")
+    if write_ms not in (None, ""):
+        phases.append(f"写入 {format_elapsed(write_ms)}")
+    if phases:
+        headline += f"（{'，'.join(phases)}）"
+    lines = [headline + "。"]
     rows = list(result.get("log") or [])
     if not rows:
         for oid in result.get("oIds") or []:
@@ -639,7 +835,7 @@ def exchange_job_for(target_sku: str, o_ids: list[str]) -> dict:
 
 
 def execute_insole_orders(runtime: Any, orders: list[dict]) -> dict:
-    """按目标 SKU 分组试算，再一次串行 execute。写并发仍是 1。"""
+    """按目标 SKU 分组试算，再一次串行 execute。整批作业持有同一把锁。"""
     if runtime is None:
         raise ExchangeError(
             "ERP Digital Worker 未装配。请先 scripts/run_erp_worker.py login，"
@@ -647,33 +843,53 @@ def execute_insole_orders(runtime: Any, orders: list[dict]) -> dict:
         )
     if not orders:
         raise ExchangeError("没有可处理的鞋垫订单")
-    prepare = getattr(runtime, "prepare", None)
-    if callable(prepare):
-        prepare()
-    grouped: dict[str, list[dict]] = defaultdict(list)
-    for order in orders:
-        grouped[str(order.get("target_sku") or "")].append(order)
-    planned = []
-    for target, group in grouped.items():
-        result = runtime.run("erp.exchange_items", exchange_job_for(
-            target, [item["o_id"] for item in group],
-        ))
-        planned.extend(result.get("plans") or [])
-    ok_plans = [item for item in planned if item.get("ok")]
-    skipped_plans = [item for item in planned if not item.get("ok")]
-    executed = {"succeeded": [], "failed": [], "attempted": 0}
-    if ok_plans:
-        executed = runtime.run("erp.exchange_items", {
-            "confirm": True,
-            "plans": ok_plans,
-            "plan": {"plans": ok_plans},
-        })
-    return {
-        "okCount": len(executed.get("succeeded") or []),
-        "skippedCount": len(skipped_plans),
-        "failedCount": len(executed.get("failed") or []),
-        "attempted": executed.get("attempted") or len(ok_plans),
-        "plans": planned,
-        "succeeded": executed.get("succeeded") or [],
-        "failed": executed.get("failed") or [],
-    }
+    exclusive = getattr(runtime, "exclusive", None)
+    with exclusive() if callable(exclusive) else nullcontext():
+        prepare_started = time.monotonic()
+        prepare = getattr(runtime, "prepare", None)
+        if callable(prepare):
+            prepare()
+        prepare_ms = int((time.monotonic() - prepare_started) * 1000)
+        planned = []
+        for order in orders:
+            target = str(order.get("target_sku") or "")
+            oid = str(order.get("o_id") or "")
+            if not oid or not target:
+                planned.append({
+                    "o_id": oid, "ok": False,
+                    "reason": "缺少内部单号或目标鞋垫",
+                })
+                continue
+            planned.append({
+                "o_id": oid,
+                "ok": True,
+                "mode": "ChangeItem",
+                "src_sku_id": SOURCE_SKU,
+                "new_sku_id": target,
+            })
+        ok_plans = [item for item in planned if item.get("ok")]
+        skipped_plans = [item for item in planned if not item.get("ok")]
+        executed = {"succeeded": [], "failed": [], "attempted": 0}
+        write_started = time.monotonic()
+        if ok_plans:
+            executed = runtime.run("erp.exchange_items", {
+                "confirm": True,
+                "plans": ok_plans,
+                "plan": {"plans": ok_plans},
+                "delayMs": INSOLE_WRITE_DELAY_MS,
+                "concurrency": INSOLE_WRITE_CONCURRENCY,
+            })
+        write_ms = int((time.monotonic() - write_started) * 1000)
+        return {
+            "okCount": len(executed.get("succeeded") or []),
+            "skippedCount": len(skipped_plans),
+            "failedCount": len(executed.get("failed") or []),
+            "attempted": executed.get("attempted") or len(ok_plans),
+            "prepareMs": prepare_ms,
+            "writeMs": executed.get("elapsedMs", write_ms),
+            "plans": planned,
+            "succeeded": executed.get("succeeded") or [],
+            "failed": executed.get("failed") or [],
+            "reconciliation": executed.get("reconciliation") or {},
+            "evidence": executed.get("evidence") or {},
+        }

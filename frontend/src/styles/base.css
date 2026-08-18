@@ -28,6 +28,7 @@
   /* 到货预警档位（红→橙→黄→蓝→浅蓝→灰，越靠前越急） */
   --tier-overdue: #d03b3b;
   --tier-d1:      #e2622b;
+  --tier-d3:      #e2622b;
   --tier-d10:     #fab219;
   --tier-d20:     #2a78d6;
   --tier-far:     #9ec5f4;

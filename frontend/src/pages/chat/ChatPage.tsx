@@ -16,7 +16,7 @@ const SAMPLES = [
 ];
 
 const GREETING =
-  "填好 Token 和姓名后连接。助手只能通过固定工具查库和生成产物；生成合同、登记换货、发钉钉催办这类动作会先给出要点，等你点确认才执行。";
+  "填好 Token、姓名，以及钉钉私信里的 20 位网页身份码后连接。助手只能通过固定工具查库和生成产物；生成合同、登记换货、发钉钉催办这类动作会先给出要点，等你点确认才执行。";
 
 function readSessionKey(): string {
   const stored = sessionStorage.getItem("agentSessionKey");
@@ -27,7 +27,7 @@ function readSessionKey(): string {
 }
 
 export default function ChatPage() {
-  const { credentials, update, remember, filled } = useCredentials("agent");
+  const { credentials, update, ensureBound, filled, bound } = useCredentials("agent");
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [messages, setMessages] = useState<Message[]>([
     { id: "greeting", role: "system", text: GREETING },
@@ -48,14 +48,14 @@ export default function ChatPage() {
   }, [messages]);
 
   const connect = useCallback(async () => {
-    if (!filled) throw new Error("请填写 Token 和姓名");
-    remember(credentials);
-    setStatus(await agentApi.get<AgentStatus>("/api/agent/status", credentials));
+    if (!filled) throw new Error("请填写 Token、姓名和网页身份码");
+    const auth = await ensureBound();
+    setStatus(await agentApi.get<AgentStatus>("/api/agent/status", auth));
     setMessage("");
-  }, [credentials, filled, remember]);
+  }, [ensureBound, filled]);
 
   const bootstrapped = useRef(false);
-  const autoConnectStoredCredentials = useRef(filled);
+  const autoConnectStoredCredentials = useRef(bound && filled);
   useEffect(() => {
     if (bootstrapped.current || !autoConnectStoredCredentials.current) return;
     bootstrapped.current = true;
@@ -66,7 +66,8 @@ export default function ChatPage() {
     async (text: string) => {
       const question = text.trim();
       if (!question || sending) return;
-      const auth = credentialsRef.current;
+      const auth = await ensureBound();
+      credentialsRef.current = auth;
       const replyId = newId();
       setDraft("");
       setSending(true);
@@ -104,14 +105,16 @@ export default function ChatPage() {
         setSending(false);
       }
     },
-    [sending],
+    [ensureBound, sending],
   );
 
   const decide = useCallback(async (messageId: string, actionId: string, decision: "confirm" | "cancel") => {
+    const auth = await ensureBound();
+    credentialsRef.current = auth;
     const done = await agentApi.post<ExecutedAction>(
       `/api/agent/actions/${actionId}/${decision}`,
-      { operator: credentialsRef.current.operator.trim() },
-      credentialsRef.current,
+      { operator: auth.operator.trim() },
+      auth,
     );
     setMessages((current) =>
       current.map((item) =>
@@ -124,15 +127,17 @@ export default function ChatPage() {
           : item,
       ),
     );
-  }, []);
+  }, [ensureBound]);
 
   async function resetSession() {
     if (!window.confirm("开新话题？助手不再带着这次对话的上文；历史仍留在审计里。")) {
       return;
     }
     if (sessionId.current) {
+      const auth = await ensureBound();
+      credentialsRef.current = auth;
       await agentApi
-        .post(`/api/agent/sessions/${sessionId.current}/reset`, {}, credentialsRef.current)
+        .post(`/api/agent/sessions/${sessionId.current}/reset`, {}, auth)
         .catch(() => undefined);
     }
     setMessages([{ id: newId(), role: "system", text: "已开新话题。此前对话仍可追查，助手不再带着上文。" }]);
@@ -226,6 +231,14 @@ export default function ChatPage() {
                 value={credentials.operator}
                 onChange={(event) => update({ operator: event.target.value })}
               />
+              {bound ? null : (
+                <input
+                  autoComplete="off"
+                  placeholder="钉钉私信 20 位网页身份码"
+                  value={credentials.bindCode ?? ""}
+                  onChange={(event) => update({ bindCode: event.target.value })}
+                />
+              )}
               <button
                 type="button"
                 className="btn"
@@ -235,7 +248,9 @@ export default function ChatPage() {
               </button>
             </div>
             <div className="small" style={{ marginTop: 7 }}>
-              Token 只存在当前标签页 sessionStorage。生成合同、换货、发催办时姓名须与员工绑定表一致。
+              {bound
+                ? "网页身份已绑定，存在本机。Token 只在当前标签页。群里发「绑定网页」可重新要码。"
+                : "先到钉钉群 @机器人发「绑定网页」，把私信里的 20 位码和绑定姓名填在这里。Token 只存在当前标签页。"}
             </div>
             <div className="statusline" style={{ marginTop: 12 }}>
               <span className={`dot ${agent?.available ? "online" : "offline"}`} />

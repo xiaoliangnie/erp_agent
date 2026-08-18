@@ -2,10 +2,10 @@
  * 位置数组 payload 的唯一解码点。
  *
  * 后端 backend/procurement_data.py 把采购单和明细行编码成纯位置数组，字典维度只存下标。
- * 以前每个页面各自写一份 O_* / L_* 常量，改列顺序要同步四处且没有运行时校验；现在下标
- * 只写在这里，页面拿到的是命名字段的对象。
+ * 以前每个页面各自写一份 O_* / L_* 常量，改列顺序要同步四处且没有运行时校验；现在
+ * 列名只写在这里，页面拿到的是命名字段的对象。后端同时下发 `columns`，列名不一致直接报错。
  *
- * 改后端 payload 的列顺序时，只需要改这个文件的下标常量和 EXPECTED_* 宽度。
+ * 改后端 payload 的列顺序时，同步 `procurement_data.py` 的列名常量和本文件。
  */
 
 /** 字典维度：页面显示的名字都从这里按下标取。 */
@@ -48,31 +48,31 @@ export interface PayloadMeta {
   etaCoverage?: number;
 }
 
+export interface PayloadColumns {
+  orders: string[];
+  lines: string[];
+}
+
 export interface RawPayload {
   meta: PayloadMeta;
   dict: PayloadDict;
   orders: unknown[][];
   lines: unknown[][];
+  /** 有序列名。有则必须与前端常量一致；没有则仍按宽度校验（旧缓存）。 */
+  columns?: PayloadColumns;
 }
 
 /* ── 采购看板 ─────────────────────────────────────────────── */
 
-const O_NO = 0, O_DATE = 1, O_ST = 2, O_BUYER = 3, O_SUP = 4,
-  O_WH = 5, O_ADDR = 6, O_PAY = 7, O_EXT = 8, O_AUDIT = 9, O_CREATED = 10;
 export const DASHBOARD_ORDER_COLUMNS = [
   "采购单号", "采购日期", "已确认", "采购员", "供应商", "仓储方",
   "收货地址", "付款方式", "外部单号", "审核日期", "采购单建立时间",
 ] as const;
-const DASHBOARD_ORDER_WIDTH = DASHBOARD_ORDER_COLUMNS.length;
 
-const L_O = 0, L_SPU = 1, L_STYLE = 2, L_COLOR = 3, L_SPEC = 4, L_CAT = 5,
-  L_SEASON = 6, L_BRAND = 7, L_CHAN = 8, L_QTY = 9, L_IN = 10, L_AMT = 11,
-  L_PRICE = 12, L_STYPE = 13, L_SIZE = 14, L_ETA = 15, L_SKU = 16;
 export const DASHBOARD_LINE_COLUMNS = [
   "采购单下标", "SPU", "款式", "颜色", "规格", "品类", "季节", "品牌",
   "渠道", "数量", "入库", "金额", "单价", "尺码类型", "尺码", "预计到货", "SKU",
 ] as const;
-const DASHBOARD_LINE_WIDTH = DASHBOARD_LINE_COLUMNS.length;
 
 export interface DashboardOrder {
   index: number;
@@ -112,20 +112,14 @@ export interface DashboardLine {
 
 /* ── 交期提醒台账 ─────────────────────────────────────────── */
 
-const DO_NO = 0, DO_DATE = 1, DO_ST = 2, DO_BUYER = 3, DO_SUP = 4,
-  DO_WH = 5, DO_EXT = 6, DO_AUDIT = 7;
 export const DELIVERY_ORDER_COLUMNS = [
   "采购单号", "采购日期", "已确认", "采购员", "供应商", "仓储方", "外部单号", "审核日期",
 ] as const;
-const DELIVERY_ORDER_WIDTH = DELIVERY_ORDER_COLUMNS.length;
 
-const DL_O = 0, DL_SPU = 1, DL_SKU = 2, DL_COLOR = 3, DL_SPEC = 4, DL_CAT = 5,
-  DL_QTY = 6, DL_IN = 7, DL_DELIVERY = 8, DL_ETA = 9, DL_AMT = 10;
 export const DELIVERY_LINE_COLUMNS = [
   "采购单下标", "SPU", "SKU", "颜色", "规格", "品类",
   "数量", "入库", "交期", "预计到货", "金额",
 ] as const;
-const DELIVERY_LINE_WIDTH = DELIVERY_LINE_COLUMNS.length;
 
 export interface DeliveryOrder {
   index: number;
@@ -164,17 +158,41 @@ const num = (value: unknown): number => {
 };
 
 /**
- * 列数不对就直接报错，不猜。位置数组一旦错位，页面上每个数字都是错的，
+ * 列名或列数不对就直接报错，不猜。位置数组一旦错位，页面上每个数字都是错的，
  * 静默渲染比白屏危险得多。
  */
-function assertWidth(rows: unknown[][], expected: number, label: string): void {
+function assertColumns(
+  rows: unknown[][],
+  incoming: string[] | undefined,
+  expected: readonly string[],
+  label: string,
+): void {
+  if (incoming && incoming.length) {
+    const same =
+      incoming.length === expected.length &&
+      incoming.every((name, index) => name === expected[index]);
+    if (!same) {
+      throw new Error(
+        `${label} 列名是 [${incoming.join(", ")}]，前端预期 [${expected.join(", ")}]。` +
+          "后端 procurement_data.py 的 payload 结构变了，请同步 frontend/src/data/payload.ts。",
+      );
+    }
+  }
   const row = rows.find((candidate) => Array.isArray(candidate));
-  if (row && row.length !== expected) {
+  if (row && row.length !== expected.length) {
     throw new Error(
-      `${label} 列数是 ${row.length}，前端预期 ${expected}。` +
-        "后端 procurement_data.py 的 payload 结构变了，请同步 frontend/src/data/payload.ts 的下标常量。",
+      `${label} 列数是 ${row.length}，前端预期 ${expected.length}（${expected.join(" / ")}）。` +
+        "后端 procurement_data.py 的 payload 结构变了，请同步 frontend/src/data/payload.ts。",
     );
   }
+}
+
+function col(columns: readonly string[], name: string): number {
+  const index = columns.indexOf(name);
+  if (index < 0) {
+    throw new Error(`payload 缺少列「${name}」`);
+  }
+  return index;
 }
 
 export interface DashboardData {
@@ -185,43 +203,45 @@ export interface DashboardData {
 }
 
 export function decodeDashboard(payload: RawPayload): DashboardData {
-  assertWidth(payload.orders, DASHBOARD_ORDER_WIDTH, "采购看板 orders");
-  assertWidth(payload.lines, DASHBOARD_LINE_WIDTH, "采购看板 lines");
+  assertColumns(payload.orders, payload.columns?.orders, DASHBOARD_ORDER_COLUMNS, "采购看板 orders");
+  assertColumns(payload.lines, payload.columns?.lines, DASHBOARD_LINE_COLUMNS, "采购看板 lines");
+  const orderCol = (name: string) => col(DASHBOARD_ORDER_COLUMNS, name);
+  const lineCol = (name: string) => col(DASHBOARD_LINE_COLUMNS, name);
   return {
     meta: payload.meta,
     dict: payload.dict,
     orders: payload.orders.map((row, index) => ({
       index,
-      no: str(row[O_NO]),
-      date: str(row[O_DATE]),
-      confirmed: num(row[O_ST]) === 1,
-      buyer: num(row[O_BUYER]),
-      supplier: num(row[O_SUP]),
-      warehouse: num(row[O_WH]),
-      address: num(row[O_ADDR]),
-      payment: num(row[O_PAY]),
-      externalNo: str(row[O_EXT]),
-      auditDate: str(row[O_AUDIT]),
-      createdAt: str(row[O_CREATED]),
+      no: str(row[orderCol("采购单号")]),
+      date: str(row[orderCol("采购日期")]),
+      confirmed: num(row[orderCol("已确认")]) === 1,
+      buyer: num(row[orderCol("采购员")]),
+      supplier: num(row[orderCol("供应商")]),
+      warehouse: num(row[orderCol("仓储方")]),
+      address: num(row[orderCol("收货地址")]),
+      payment: num(row[orderCol("付款方式")]),
+      externalNo: str(row[orderCol("外部单号")]),
+      auditDate: str(row[orderCol("审核日期")]),
+      createdAt: str(row[orderCol("采购单建立时间")]),
     })),
     lines: payload.lines.map((row) => ({
-      order: num(row[L_O]),
-      spu: num(row[L_SPU]),
-      style: num(row[L_STYLE]),
-      color: num(row[L_COLOR]),
-      spec: str(row[L_SPEC]),
-      cat: num(row[L_CAT]),
-      season: num(row[L_SEASON]),
-      brand: num(row[L_BRAND]),
-      channel: num(row[L_CHAN]),
-      qty: num(row[L_QTY]),
-      inQty: num(row[L_IN]),
-      amount: num(row[L_AMT]),
-      price: num(row[L_PRICE]),
-      sizeType: num(row[L_STYPE]),
-      size: str(row[L_SIZE]),
-      eta: str(row[L_ETA]),
-      sku: str(row[L_SKU]),
+      order: num(row[lineCol("采购单下标")]),
+      spu: num(row[lineCol("SPU")]),
+      style: num(row[lineCol("款式")]),
+      color: num(row[lineCol("颜色")]),
+      spec: str(row[lineCol("规格")]),
+      cat: num(row[lineCol("品类")]),
+      season: num(row[lineCol("季节")]),
+      brand: num(row[lineCol("品牌")]),
+      channel: num(row[lineCol("渠道")]),
+      qty: num(row[lineCol("数量")]),
+      inQty: num(row[lineCol("入库")]),
+      amount: num(row[lineCol("金额")]),
+      price: num(row[lineCol("单价")]),
+      sizeType: num(row[lineCol("尺码类型")]),
+      size: str(row[lineCol("尺码")]),
+      eta: str(row[lineCol("预计到货")]),
+      sku: str(row[lineCol("SKU")]),
     })),
   };
 }
@@ -234,34 +254,36 @@ export interface DeliveryData {
 }
 
 export function decodeDelivery(payload: RawPayload): DeliveryData {
-  assertWidth(payload.orders, DELIVERY_ORDER_WIDTH, "交期台账 orders");
-  assertWidth(payload.lines, DELIVERY_LINE_WIDTH, "交期台账 lines");
+  assertColumns(payload.orders, payload.columns?.orders, DELIVERY_ORDER_COLUMNS, "交期台账 orders");
+  assertColumns(payload.lines, payload.columns?.lines, DELIVERY_LINE_COLUMNS, "交期台账 lines");
+  const orderCol = (name: string) => col(DELIVERY_ORDER_COLUMNS, name);
+  const lineCol = (name: string) => col(DELIVERY_LINE_COLUMNS, name);
   return {
     meta: payload.meta,
     dict: payload.dict,
     orders: payload.orders.map((row, index) => ({
       index,
-      no: str(row[DO_NO]),
-      date: str(row[DO_DATE]),
-      confirmed: num(row[DO_ST]) === 1,
-      buyer: num(row[DO_BUYER]),
-      supplier: num(row[DO_SUP]),
-      warehouse: num(row[DO_WH]),
-      externalNo: str(row[DO_EXT]),
-      auditDate: str(row[DO_AUDIT]),
+      no: str(row[orderCol("采购单号")]),
+      date: str(row[orderCol("采购日期")]),
+      confirmed: num(row[orderCol("已确认")]) === 1,
+      buyer: num(row[orderCol("采购员")]),
+      supplier: num(row[orderCol("供应商")]),
+      warehouse: num(row[orderCol("仓储方")]),
+      externalNo: str(row[orderCol("外部单号")]),
+      auditDate: str(row[orderCol("审核日期")]),
     })),
     lines: payload.lines.map((row) => ({
-      order: num(row[DL_O]),
-      spu: num(row[DL_SPU]),
-      sku: str(row[DL_SKU]),
-      color: num(row[DL_COLOR]),
-      spec: str(row[DL_SPEC]),
-      cat: num(row[DL_CAT]),
-      qty: num(row[DL_QTY]),
-      inQty: num(row[DL_IN]),
-      deliveryDate: str(row[DL_DELIVERY]),
-      eta: str(row[DL_ETA]),
-      amount: num(row[DL_AMT]),
+      order: num(row[lineCol("采购单下标")]),
+      spu: num(row[lineCol("SPU")]),
+      sku: str(row[lineCol("SKU")]),
+      color: num(row[lineCol("颜色")]),
+      spec: str(row[lineCol("规格")]),
+      cat: num(row[lineCol("品类")]),
+      qty: num(row[lineCol("数量")]),
+      inQty: num(row[lineCol("入库")]),
+      deliveryDate: str(row[lineCol("交期")]),
+      eta: str(row[lineCol("预计到货")]),
+      amount: num(row[lineCol("金额")]),
     })),
   };
 }

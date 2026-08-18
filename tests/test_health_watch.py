@@ -135,6 +135,26 @@ class HealthWatchEvaluateTests(unittest.TestCase):
         issues = collect_issues(payload, previous={})
         self.assertEqual([], issues)
 
+    def test_quality_last_error(self):
+        issues = collect_issues(_health(quality={"enabled": True, "running": True, "lastError": "日报失败"}), previous={})
+        self.assertEqual(["quality_error"], [item.code for item in issues])
+
+    def test_quality_dead_when_enabled_but_not_running(self):
+        issues = collect_issues(_health(quality={"enabled": True, "running": False, "lastError": ""}), previous={})
+        self.assertEqual(["quality_dead"], [item.code for item in issues])
+
+    def test_dropship_last_error(self):
+        issues = collect_issues(_health(dropship={"enabled": False, "running": False, "lastError": "抓取失败"}), previous={})
+        self.assertEqual(["dropship_error"], [item.code for item in issues])
+
+    def test_dropship_dead_when_enabled_but_not_running(self):
+        issues = collect_issues(_health(dropship={"enabled": True, "running": False, "lastError": ""}), previous={})
+        self.assertEqual(["dropship_dead"], [item.code for item in issues])
+
+    def test_dropship_not_started_is_not_dead(self):
+        issues = collect_issues(_health(dropship={"enabled": False, "running": False, "lastError": ""}), previous={})
+        self.assertEqual([], issues)
+
     def test_same_fingerprint_is_rate_limited(self):
         payload = _health(ok=False, database="unavailable", error="OperationalError")
         first = evaluate_health(payload, previous={}, now=NOW)
@@ -173,6 +193,8 @@ class HealthWatchEvaluateTests(unittest.TestCase):
         self.assertIn("服务不健康", text)
         self.assertIn("镜像同步滞后", text)
         self.assertIn("127.0.0.1:8777", text)
+        extra = render_alert([Issue("quality_dead", "品控日报调度已启用但线程未在运行")])
+        self.assertIn("品控日报调度停摆", extra)
 
     def test_state_roundtrip(self):
         tmp = tempfile.TemporaryDirectory()

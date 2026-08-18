@@ -13,7 +13,7 @@ interface BuyerBarsProps {
 interface Row {
   buyer: number;
   qty: number;
-  /** 需催量 = 前四波合计（20 天内到期 + 已逾期）。 */
+  /** 需催量 = 跟单三档合计（10 天内到期 + 已逾期）。 */
   need: number;
   byWave: Record<string, number>;
 }
@@ -66,7 +66,7 @@ export function BuyerBars({ orders, stamps, dict }: BuyerBarsProps) {
                 </div>
                 <div
                   className="bv"
-                  title={`待入库合计 ${int(row.qty)} 件，其中 20 天内到期或已逾期 ${int(row.need)} 件`}
+                  title={`待入库合计 ${int(row.qty)} 件，其中 10 天内到期或已逾期 ${int(row.need)} 件`}
                 >
                   {int(row.need)}
                   <small>需催</small>

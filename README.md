@@ -2,21 +2,21 @@
 
 采购数据服务、五个业务页面与采购助手 Agent。系统统一读取 `hanli.env` 指向的本地 MySQL
 镜像库，由供应链安全代理 API 增量维护订单和采购单数据。
-当前执行文档见 `docs/开发.md`。Agent 完成度见 `docs/Agent进度.md`。数据链路 / Agent / 钉钉见 `docs/architecture/`。
-自训练预测模型的接入步骤见 `docs/预测.md`。
+当前执行文档和 Agent 完成度见 `docs/开发.md`。系统怎么工作见 `docs/架构.md`。
+自训练预测模型的接入步骤见 `docs/预测.md`。外部接口见 `docs/接口参考.md`。
 Agent 与钉钉密钥模板见根目录 `.env.example`。
 
 ## 订单 SKU 换货
 
 访问 `http://127.0.0.1:8777/exchange`，输入源 SKU、目标 SKU 和明确的 ERP 内部
-订单号 `o_id`，即可创建 dry-run 任务。第一版的订单数据不来自采购数据库：常开的、
-已登录聚水潭订单列表页由 `frontend/js/exchange-worker.user.js` 读取真实订单明细，回传逐单
-预演清单；员工在换货页确认后，worker 才调用 ERP 页面原生 `_ACP('ChangeItem')`。
+订单号 `o_id`，即可创建 dry-run 任务。订单选择器读本地镜像库；试算和写入由后端
+Playwright Digital Worker 打开已登录的聚水潭订单页，注入 `jst-order-exchange.core.js`，
+调用页面原生 `_ACP('ChangeItem')`。员工在换货页确认后才执行。
 
 安全约束：
 
 - `.env` 必须配置彼此不同的 `EXCHANGE_API_TOKEN` 和 `EXCHANGE_WORKER_TOKEN`；前者给换货页，
-  后者只写入油猴 worker 配置。
+  后者留给已退役的油猴领取口（现在固定返回空）。
 - 换货页的 Token 只存当前标签页 `sessionStorage`；数据库凭证、ERP Cookie 都不会进入页面。
 - 任务必须明确列出全部 `o_id`，试算必须完整覆盖这些订单，缺单、取消/退款状态、找不到源 SKU
   都会作为跳过原因返回。
@@ -24,27 +24,30 @@ Agent 与钉钉密钥模板见根目录 `.env.example`。
   试算 / 订单搜索 / 只读探测领取超过 5 分钟会退回队列，最多回收 3 次后标失败。
   已经开始改 ERP 的任务超过 15 分钟标为 `stuck`（中断），钉钉告警，由人工核对后再决定是否另建任务；
   Worker 迟到的执行结果仍可凭原凭证回写，避免页面上丢掉已改过的订单。
-- 多个已登录的 ERP 订单标签页会作为独立 Worker 槽位，同时领取不同订单的任务；同一订单同时只能有
-  一个活动换货任务，防止并发重复修改。一个标签页内仍按顺序执行，避免 ERP 页面状态串单。
+- 后端 Digital Worker 写并发固定为 1；同一订单同时只能有一个活动换货任务，防止并发重复修改。
 - 采购助手可以理解“把订单 A 的 SKU B 换成 SKU C”，以及“这批待发货异常单把 B 换成 C”：
   先按订单镜像收成明确 `o_id` 再生成待确认 dry-run。Agent 确认只登记试算，真实 ERP 写入
   仍需在换货页核对试算清单后二次确认。
-- 抖音换鞋垫是单独一条固定流程：钉钉或对话里说「查询一下现在抖音需要更换的鞋垫订单」，
-  会列出内部单号、平台单号、状态、店铺、鞋码和目标 SKU；加上「进行处理」会生成待确认动作。
+- 鞋垫换货是单独一条固定流程：钉钉或对话里说「查询一下现在抖音需要更换的鞋垫订单」，
+  会列出抖音 / 快手 / 视频号里仍挂旧鞋垫的内部单号、平台单号、状态、鞋码和目标 SKU；加上「进行处理」会生成待确认动作。
   钉钉直接回复「确认」（不用带编号、不用去换货页）后，由后端 Playwright **串行**写入；
-  先回「已开始写入」，写完再发一条【任务完成】结果日志（清单和结果都只展开 5 条：单号、状态、鞋码、目标鞋垫）。
+  写入后回读订单明细，源 SKU 还应在或目标 SKU 没出现则不记成功；已经是目标 SKU 则跳过改单。
+  证据 JSON 落 `files/data/erp-evidence/`，不信页面返回「成功」。
+  先回「已开始写入」，写完再发一条【任务完成】结果日志（用时拆成开页 / 写入；清单和结果都只展开 5 条：单号、状态、鞋码、目标鞋垫）。
+  `server.py` 启动后保活 ERP 登录态（浏览器 + `erp-ai-state.json`），进程退出再关浏览器，不固定停在订单列表；代发和以后的合同页自动化共用。
+  可用 `ERP_AI_KEEPALIVE_ENABLED=false` 关掉保活（写入仍会在用到时再登录）。
   浏览器只打开一次订单页，后续按尺码试算/写入复用同一页，速度与本地批量脚本同一量级。半码按码数舍去小数再换算毫米（`40.5` → `40` → `250mm` → `09906`）；
   发货中只列出不写。写入成功后立刻按内部单号回写镜像，并把这批单记进已写入台账；增量同步还没跟上时，再查不会把同一批再列出来。
   同一会话重复「进行处理」会复用已有待确认，不另开一条。
+  多人同时处理时：待确认/写入中的内部单号不会再出现在别人的清单里；整批写入互斥，后来的确认排队等前一批写完，避免两个人改同一张单或交错抢同一页。
   钉钉写操作必须已绑定；权限表尚未落地，先按 `viewer` / 绑定拦截，后续在同一检查点加 capabilities。
 - 「异常订单」第一期只处理 SKU 替换（同款换规格 / 指定源→目标 / 已维护白名单跨款）。
   备注异常、超卖、地址错误没有规则，不会由 AI 自行定义。采购逾期走催办，不走换货。
 
-安装 worker：在 Tampermonkey 新建脚本，粘贴
-`frontend/js/exchange-worker.user.js`，通过脚本菜单配置服务地址和 `EXCHANGE_WORKER_TOKEN`，
-然后保持 `/app/order/order/list.aspx` 标签页登录且打开。换货页顶端显示 Worker 在线后即可试算。
-同一个 Worker 也负责合同商品图片的只读同步：合同页点击“从 ERP 同步图片”后，它会用浏览器
-登录态读取 `purchaseitem.aspx` 的 `pic300` / `pic160` / `pic100`，不会调用换货写接口。
+执行通道：先 `scripts/run_erp_worker.py login` 保存 `erp-ai-state.json`，再启动 `server.py`。
+`ERP_AI_ENABLED` 默认开，关掉则任务停在队列。换货页顶端显示 Digital Worker 在线后即可试算。
+合同页“从 ERP 同步图片”也由同一 Worker 用登录态读取 `purchaseitem.aspx` 的
+`pic300` / `pic160` / `pic100`，不会调用换货写接口。油猴脚本已退役，不要再装。
 任务队列第一阶段使用 `files/data/exchange_jobs.sqlite3`，后续 Agent 业务 MySQL 到位时只替换
 `backend/exchange/service.py` 的存储实现。
 换货白名单在 `files/config/exchange-rules.json`，服务按文件修改时间重读，改完不必重启。
@@ -52,7 +55,7 @@ Agent 与钉钉密钥模板见根目录 `.env.example`。
 ### 页内核心 / Codex 直接调用
 
 ERP 写操作的真正逻辑在 `frontend/js/jst-order-exchange.core.js`（纯 JS，无 GM 依赖）。
-油猴 worker 启动后会把它注入页面；Codex / Playwright 也可直接 `page.evaluate` 注入。
+后端 Playwright 用 `page.add_script_tag` 注入后 `page.evaluate` 调用。
 注入后页面上有：
 
 ```js
@@ -86,15 +89,16 @@ node scripts/jst_exchange_call.mjs plan-snippet \
 
 服务端也会托管核心文件：`http://127.0.0.1:8777/js/jst-order-exchange.core.js`。
 
-五个页面（同一个 React 单页应用的五条路由）：
+六个页面（同一个 React 单页应用的六条路由）：
 
 | 路由 | 看什么 | 日期口径 |
 |---|---|---|
 | `/dashboard` | 采购全景：金额、品类、尺码、入库进度 | `最早预计到货日期` |
-| `/ledger` | 单号 / 日期 / 供应商 / 产品 / 交期 / 入库数量 / 采购员，按四波提醒催货 | `item_delivery_date`（交期） |
+| `/ledger` | 单号 / 日期 / 供应商 / 产品 / 交期 / 入库数量 / 采购员，按跟单三档催货 | `item_delivery_date`（交期） |
 | `/contract` | 选单、选票种和单价、预览、下载采购合同 | — |
 | `/exchange` | 从镜像订单选单和源 SKU → 选择规则允许的目标 SKU → dry-run + 人工确认 | — |
 | `/chat` | 采购助手：查单、催办、生成合同、订货建议 | — |
+| `/workbench` | 待确认动作、换货任务、品控待办；确认/取消与对话是同一份状态 | — |
 
 路由用 ASCII，中文路径在地址栏和日志里会变成 percent-encoding，不好读也不好搜；页面
 标题和导航仍是中文业务叫法。旧的 `/采购看板.html` 和更早那版中文路径（`/看板` 等）都以
@@ -242,15 +246,16 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 
 | 文件 | 作用 |
 |---|---|
-| `frontend/src/` | React 单页应用：五个页面、共用 API 客户端、payload 解码与设计令牌 |
-| `frontend/js/exchange-worker.user.js` | 聚水潭页面里的油猴 worker，不属于单页应用 |
-| `frontend/js/jst-order-exchange.core.js` | 页内换货核心（plan/execute），油猴与 Codex 共用 |
+| `frontend/src/` | React 单页应用：六个页面、共用 API 客户端、payload 解码与设计令牌 |
+| `frontend/js/exchange-worker.user.js` | 已退役的油猴 worker，领取口已关闭 |
+| `frontend/js/jst-order-exchange.core.js` | 页内换货核心（plan/execute），由后端 Playwright 注入 |
 | `scripts/jst_exchange_call.mjs` | 生成注入片段 / 可选 CDP 调用 plan |
 | `backend/` | 实时数据库查询、看板 API 与采购合同服务 |
 | `backend/agent/` | Agent Core：工具注册表、工具循环、确认状态机、会话与审计 |
 | `backend/forecast/` | `Forecaster` 接口、Baseline 实现、模型工件版本与订货建议计算 |
 | `backend/dingtalk/` | 钉钉发送、身份映射、Stream 客户端与每日催办推送 |
-| `backend/delivery_reminders.py` | 四波催办口径，台账页 / Agent 工具 / 钉钉推送共用 |
+| `backend/dropship/` | 代发未安排：Digital Worker 抓取 + `YYMMDD-代发.xlsx` |
+| `backend/delivery_reminders.py` | 跟单三档催办口径，台账页 / Agent 工具 / 钉钉推送共用 |
 | `backend/gb_standards.py` | 国标目录同步：std.samr.gov.cn → `gb_standards` 表 |
 | `backend/logging_setup.py` | 统一日志：东八区时间 / 级别 / 模块，可选落 `files/data/app.log` |
 | `backend/health_watch.py` | `/api/health` 评估与告警去重；CLI 在 `scripts/health_watch.py` |
@@ -258,15 +263,16 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 | `files/` | 本地文件根：config 主数据、templates 合同母版、data 运行时、outputs 生成物 |
 | `files/data/snapshots/` | CSV 数据快照 |
 | `files/templates/采购合同模板.xlsx` | 固定栏空白母版（需方 / 收货信息 / 包装 / 检验 / 条款） |
+| `files/templates/代发订单模板.xlsx` | 代发空白母版（对齐 8.15：Sheet1 28 列，隐藏线上单号/省份/留言/标准商品名） |
 | `files/config/buyers.json` | 需方、仓库、送货与验收信息 |
 | `files/config/供应商管理.xlsx` | 本机维护的供应商主数据（不上库，不进版本库）；合同按 ERP 简称匹配 |
 | `files/config/internal_suppliers.json` | 公司内部户名单；合同不列收付款信息 |
 | `files/config/contract_mappings.json` | 合同映射表：发票类型、付款方式条款与 ERP 预选 |
 | `files/config/suppliers.json` | 没有供应商管理表时的回退；离线用例仍用它 |
 | `files/config/gb_category_map.json` | 商品分类到国标目录族（CCS/ICS/关键字）的映射 |
-| `docs/` | 架构、路线与外部接口参考；索引见 `docs/README.md` |
+| `docs/` | 现行四份：开发 / 架构 / 预测 / 接口参考；索引见 `docs/README.md` |
 | `tests/fixtures/` | 聚焦测试夹具 |
-| `files/outputs/` | 生成的合同文件，不提交版本库 |
+| `files/outputs/` | 生成的合同、品控日报、代发 Excel，不提交版本库 |
 | `hanli.env` | 本地可写实时镜像数据库配置（已忽略，不提交） |
 | `legacy/` | 已下线的旧 HTML 页面与离线数据生成器，仅供对照，可删 |
 
@@ -318,6 +324,32 @@ Agent 或命令行也可调用同一能力：
   --output files/outputs/采购合同-604264.xlsx
 ```
 
+## 代发订单
+
+「代发订单未安排」的收货信息不能从镜像或供应链 API 还原（淘系大量不在库，在库的也是打星）。
+取数复用抖音换鞋垫同一套 Digital Worker：`.env` 的 `ERP_AI_USERNAME` / `ERP_AI_PASSWORD`
+登录后，cookie 写在 `files/data/secrets/erp-ai-state.json`，Playwright 打开 epaas 再把
+订单列表嵌进外壳（淘系 `GetTopDataByBX`、拼多多 SDK 挂在 `window.top`）。
+筛选只勾异常类型「代发订单未安排」，走筛选 iframe 的 `FullSearch()`。
+
+Excel 对齐 `8.15代发.xlsx`：Sheet1 28 列（线上订单号、省份、买家留言、标准商品名隐藏）、
+Sheet2 17 列供应商子集。一行一个 SKU。收货明文来自订单页揭开；商品裸价来自列表
+`price` / `base_price`；供应商、成本价、供应商款号列表页没有，先按 SKU 补镜像
+`realtime_products`，缺的再走页面 `_CallPage('GetSku')`。快递单号写 `l_id` /
+`multiWaybillLid` / `plat_l_id`；代发未安排多数还没有运单。店铺主账号不用买家账号。
+空白模板（只刷新母版，不覆盖当日已填文件）：
+
+```bash
+.venv/bin/python scripts/generate_dropship_workbook.py
+.venv/bin/python scripts/generate_dropship_workbook.py --live
+```
+
+母版是 `files/templates/代发订单模板.xlsx`。`--live` 写出当日
+`files/outputs/dropship/YYMMDD-代发.xlsx`。日期用东八区业务日。
+对话里同一条链路是 L1 工具 `generate_dropship_workbook`：先确认，再抓 ERP，
+返回单数/行数等摘要，收货明文只进 Excel。导出页写明淘宝/天猫不支持明文导出，
+所以填表走页面揭开，不走导出订单。
+
 ## 采购助手（Agent）
 
 访问 `http://127.0.0.1:8777/chat`，填入 `AGENT_API_TOKEN` 和与 `staff_bindings` 一致的
@@ -335,7 +367,7 @@ Agent 或命令行也可调用同一能力：
 |---|---|---|
 | `search_purchase_orders` | L0 只读 | 按单号 / 供应商 / 采购员搜本年度采购单 |
 | `get_purchase_order` | L0 只读 | 单头 + 全部明细：交期、数量、已入库、待入库、单价 |
-| `delivery_reminders` | L0 只读 | 四波催办清单（口径同交期台账页） |
+| `delivery_reminders` | L0 只读 | 跟单三档催办清单（口径同交期台账页） |
 | `dashboard_summary` | L0 只读 | 金额、数量、入库率、采购员/供应商/品类 Top |
 | `search_products` | L0 只读 | 商品主数据里的 SKU（含分类） |
 | `gb_catalog_status` | L0 只读 | 国标目录库同步状态与条数 |
@@ -344,10 +376,11 @@ Agent 或命令行也可调用同一能力：
 | `forecast_demand` | L0 只读 | 逐日销量预测 p50 与 p10/p90 区间 |
 | `order_suggestion` | L0 只读 | 订货建议（确定性公式，见下） |
 | `generate_purchase_contract` | **L1 生成产物** | 生成合同 Excel + 预览，先给要点再确认 |
+| `generate_dropship_workbook` | **L1 生成产物** | 抓取代发未安排，确认后写入当日 `YYMMDD-代发.xlsx` |
 | `submit_exchange_dry_run` | **L1 生成产物** | 登记换货 dry-run 任务（真实换货仍需在换货页二次确认） |
-| `locate_insole_orders` | L0 只读 | 定位抖音旧鞋垫订单；半码按码数舍去小数后映射目标 SKU |
-| `process_insole_orders` | **L2 对外动作** | 按清单串行换鞋垫；确认前必须展示订单信息 |
-| `send_delivery_reminder` | **L2 对外动作** | 催办清单发到钉钉群并 @ 采购员 |
+| `locate_insole_orders` | L0 只读 | 定位抖音/快手/视频号旧鞋垫订单；半码按码数舍去小数后映射目标 SKU |
+| `process_insole_orders` | **L2 对外动作** | 按清单换鞋垫（同页最多 3 路并发）；确认前必须展示订单信息；同时只允许一批写入 |
+| `send_delivery_reminder` | **L2 对外动作** | 催办清单私聊已绑定采购员（不发群） |
 
 `send_delivery_reminder` 只在钉钉发送可用时注册，所以关掉钉钉时 `/api/agent/status`
 的工具清单里不会出现它。钉钉群里问国标目录或某商品对应标准，走的是同一套 L0 工具，不另开入口。
@@ -372,6 +405,7 @@ L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_action
 | POST | `/api/agent/chat` | `{message, sessionKey, operator}` → 回复 + 工具步骤 + 待确认动作 |
 | POST | `/api/agent/actions/{id}/confirm` | 确认执行一条 L1/L2 动作 |
 | POST | `/api/agent/actions/{id}/cancel` | 放弃 |
+| GET | `/api/agent/workbench?operator=` | 工作台：待办投影 + Job/Outbox 摘要 |
 | GET | `/api/agent/actions?session_id=` | 当前待确认动作 |
 | GET | `/api/agent/status` | 模型、工具清单、预测工件、钉钉状态 |
 | GET | `/api/agent/reminders?bucket=&buyer=&limit=` | 催办清单（不经模型，可直接给别的系统用） |
@@ -472,9 +506,14 @@ DINGTALK_GROUP_CONVERSATION_ID=   # 群的 openConversationId，催办 @ 人必�
 
 ### 催办推送（不依赖大模型）
 
-- `DINGTALK_REMINDER_ENABLED=true`：每天 `DINGTALK_REMINDER_TIME`（默认 08:30）把四波催办
-  清单发到群里并 @ 对应采购员。@ 到人靠 `staff_bindings` 的 userId（应用机器人）或手机号
-  （Webhook 机器人）。同一天**成功后**不再重发；失败会按 15 分钟间隔最多再试 3 次，
+- `DINGTALK_REMINDER_ENABLED=true`：每天 `DINGTALK_REMINDER_TIME`（默认 08:30）发**跟单催办**。
+  池子是全库 ERP `Confirmed`（已确认未完结，含跨年未关单），排除 `labels=返修退货` 和备注
+  「返修采购单」。档位是剩余 **≤10 天 / ≤3 天 / 已逾期**。交期台账页与此同一口径。
+  **谁的采购单只发一条给谁**。只私聊已绑定 userId 的人
+  （`robot/oToMessages/batchSend`），清单里分开写**采购数量**和**待入库数量**。
+  同一钉钉身份下的花名会并成一条。未绑定的人**不再发到采购群**。
+  群里要 @ 人（鞋垫完成通知等）仍走自定义 Webhook 或未过期的 sessionWebhook。
+  同一天**成功后**不再重发；失败会按 15 分钟间隔最多再试 3 次，
   仍失败则等次日，错误出现在 `/api/health` 的 `dingtalk.reminder.lastError`。
   手动 `POST /api/agent/reminders/push` 只认当日已成功记录，失败后仍可立刻再推。
   交期台账「发送提醒」走同一接口：确认弹窗后按当前采购员筛选和档位推送；操作人姓名须与
@@ -564,7 +603,10 @@ AGENT_MODEL=gpt-5.6-sol
 
 `/ledger`（`frontend/src/pages/ledger/`）—— 一页只干一件事：把每张采购单的
 **单号 / 采购日期 / 供应商 / 产品信息 / 交期 / 入库数量 / 采购员** 摆平，
-按交期分四波催。
+按跟单三档催（与钉钉每日催办同一口径）。
+
+池子是全库 ERP `Confirmed`（已确认未完结，含跨年未关单），排除 `labels=返修退货`
+和备注「返修采购单」。看最新年时带上更早的未关单。
 
 ## 交期取哪个字段
 
@@ -577,43 +619,39 @@ AGENT_MODEL=gpt-5.6-sol
 
 两列都有值的 2388 行里，只有 20 行相同 —— 它们本来就是两回事。
 采购看板走后者，所以 README 上面那条「T-10 / T-20 三档现在都是 0」的坑成立；
-这页走前者，四波就都填上了。
+这页走前者，跟单三档按约定交期归档。
 
 取值顺序：该行 `item_delivery_date` → 空则退到 `最早预计到货日期` → 都空算未排期。
 表里凡是退过一档的，交期下面标一行小字 `预计到货`，不掺着糊弄。
 401 单里 **214 单用交期，50 单回退，137 单两个都没有**。
 
-## 四波提醒
+## 跟单三档
 
 一张单的交期 = 所有**待入库**行里最早的那个（已入库完的行没有期限可催）；
-波次取最急的一档。第 n 波的触发日直接由交期倒推，表里那四个圆点就是这个：
+档位取最急的一档。第 n 档的触发日直接由交期倒推，表里那三个圆点就是这个：
 
-| 波次 | 触发日 | 剩余天数 | 该干什么 |
+| 档位 | 触发日 | 剩余天数 | 该干什么 |
 |---|---|---|---|
-| 第 1 次 · T-20 | 交期 − 20 天 | 11 ~ 20 | 确认排产进度 |
-| 第 2 次 · T-10 | 交期 − 10 天 | 2 ~ 10 | 确认发货计划 |
-| 第 3 次 · T-1 | 交期 − 1 天 | 0 ~ 1 | 核对物流单号 |
-| 第 4 次 · 逾期催办 | 交期 + 1 天 | < 0 | 逐日追 |
-| 暂不提醒 | — | > 20 | 还没进提醒窗 |
+| 第 1 档 · 剩 ≤10 天 | 交期 − 10 天 | 4 ~ 10 | 确认排产/发货计划 |
+| 第 2 档 · 剩 ≤3 天 | 交期 − 3 天 | 0 ~ 3 | 确认发货 |
+| 第 3 档 · 已逾期 | 交期 + 1 天 | < 0 | 逐日追 |
+| 暂不提醒 | — | > 10 | 还没进提醒窗 |
 | 未排期 | — | 无交期 | 先补日期才催得动 |
 
-圆点实心 = 那一波已到点，带圈 = 当前这一波。悬停看具体日期。
-
-以 2026-08-10 为今天时：逾期 177 单 / T-1 8 单 / T-10 27 单 / T-20 13 单 /
-暂不提醒 39 单 / 未排期 137 单，需催合计 **225 单 · 193,069 件**。
+圆点实心 = 那一档已到点，带圈 = 当前这一档。悬停看具体日期。
 
 **「今天」可改**。默认取 payload `meta.today`（业务日，东八区）；
-顶栏第一个日期框改一下，四波和整张表立刻跟着重排。
+顶栏第一个日期框改一下，三档和整张表立刻跟着重排。
 
 ## 别的
 
 - 档位卡点一下就是筛选，再点取消；卡片自己不受档位筛选约束，否则选中一档别的全归零
-- 「按采购员的催办量」每人一条按波次堆叠，右端是需催量（前四波合计）
+- 「按采购员的催办量」每人一条按档位堆叠，右端是需催量（跟单三档合计）
 - 「导出催办清单」按当前切片导出，多给两列：**交期来源**（交期 / 预计到货）和
   **下次提醒日**，直接拿去发
-- 「发送提醒」把当前采购员/档位的需催清单发到钉钉群（与定时催办同一口径）。需填写
+- 「发送提醒」把当前采购员/档位的需催清单**私聊**已绑定采购员（与定时催办同一口径，不发群）。需填写
   `AGENT_API_TOKEN` 和绑定过的姓名；当日已成功推过同一批会提示「当日已推」
-- 点任意一行开抽屉：该单四波排期的具体日期 + 商品明细（颜色、规格、逐行交期与入库）
+- 点任意一行开抽屉：该单三档排期的具体日期 + 商品明细（颜色、规格、逐行交期与入库）
 - 供应商名称取实时主表 `seller`
 
 ---

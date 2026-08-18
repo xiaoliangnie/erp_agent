@@ -9,6 +9,7 @@ const LedgerPage = lazy(() => import("./pages/ledger/LedgerPage"));
 const ContractPage = lazy(() => import("./pages/contract/ContractPage"));
 const ExchangePage = lazy(() => import("./pages/exchange/ExchangePage"));
 const ChatPage = lazy(() => import("./pages/chat/ChatPage"));
+const WorkbenchPage = lazy(() => import("./pages/workbench/WorkbenchPage"));
 
 export function App() {
   return (
@@ -20,6 +21,7 @@ export function App() {
         <Route path={ROUTES.contract} element={<ContractPage />} />
         <Route path={ROUTES.exchange} element={<ExchangePage />} />
         <Route path={ROUTES.chat} element={<ChatPage />} />
+        <Route path={ROUTES.workbench} element={<WorkbenchPage />} />
         <Route path="*" element={<Navigate to={ROUTES.dashboard} replace />} />
       </Routes>
     </Suspense>

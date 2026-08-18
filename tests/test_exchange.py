@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from backend.exchange import ExchangeError, ExchangeService
+from backend.exchange import ExchangeError, ExchangeService, assess_exchange_impact
 
 
 class ExchangeServiceTests(unittest.TestCase):
@@ -373,6 +373,52 @@ class ExchangePolicyReloadTests(unittest.TestCase):
             finally:
                 policy_mod.RULE_PATH = original
                 policy_mod._load_policy.cache_clear()
+
+
+class ExchangeImpactTests(unittest.TestCase):
+    def payload(self):
+        return {
+            "rules": {"strategy": "direct", "replacements": [{"from": "OLD-01", "to": "NEW-01"}]},
+            "targets": {"o_ids": ["10001", "10002"]},
+        }
+
+    def test_duplicate_open_job_blocks(self):
+        result = assess_exchange_impact(
+            self.payload(),
+            products=[{"sku": "NEW-01", "styleCode": "STYLE-01"}],
+            orders=[{"oId": "10001", "shopName": "抖音店"}],
+            open_jobs=[{
+                "id": "job-dup",
+                "status": "pending",
+                "rules": {"replacements": [{"from": "OLD-01", "to": "NEW-01"}]},
+                "targets": {"o_ids": ["10001"]},
+            }],
+        )
+        self.assertEqual("block", result["decision"])
+        self.assertTrue(any(item["code"] == "duplicate_job" for item in result["blockers"]))
+
+    def test_missing_target_sku_blocks(self):
+        result = assess_exchange_impact(
+            self.payload(),
+            products=[{"sku": "OLD-01"}],
+            orders=[{"oId": "10001", "shopName": "抖音店"}],
+            open_jobs=[],
+        )
+        self.assertEqual("block", result["decision"])
+        self.assertTrue(any(item["code"] == "target_sku_missing" for item in result["blockers"]))
+
+    def test_cross_shop_warns(self):
+        result = assess_exchange_impact(
+            self.payload(),
+            products=[{"sku": "NEW-01", "styleCode": "STYLE-01"}],
+            orders=[
+                {"oId": "10001", "shopName": "抖音店"},
+                {"oId": "10002", "shopName": "快手店"},
+            ],
+            open_jobs=[],
+        )
+        self.assertEqual("allow_with_warning", result["decision"])
+        self.assertTrue(any(item["code"] == "cross_shop" for item in result["warnings"]))
 
 
 if __name__ == "__main__":

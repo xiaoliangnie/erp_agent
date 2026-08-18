@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
-"""交期四波催办口径。不连数据库，行数据直接构造。"""
+"""交期催办口径（四波对照 + 跟单三档）。不连数据库，行数据直接构造。"""
 import json
 import unittest
 from pathlib import Path
 
-from backend.delivery_reminders import build_reminders, classify, filter_orders, reminder_markdown
+from backend.delivery_reminders import (
+    FOLLOWUP_URGENT, build_reminders, classify, classify_followup, filter_orders,
+    is_repair_row, reminder_markdown,
+)
 
 WAVE_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "delivery_waves.json"
 
@@ -43,6 +46,7 @@ class BuildRemindersTests(unittest.TestCase):
         self.assertEqual(1, len(result["orders"]))
         order = result["orders"][0]
         self.assertEqual(4, order["pendingQty"])
+        self.assertEqual(15, order["purchaseQty"])
         self.assertEqual("2026-08-20", order["deliveryDate"])
         self.assertEqual("t10", order["bucket"])
 
@@ -128,6 +132,63 @@ class BuildRemindersTests(unittest.TestCase):
         self.assertIn("**李四**", text)
         self.assertIn("逾期 10 天", text)
         self.assertIn("剩 1 天", text)
+        self.assertIn("需催 **2** 单", text)
+        self.assertIn("采购 **20** 件", text)
+        self.assertIn("待入库 **20** 件", text)
+
+    def test_markdown_uses_selected_orders_only(self):
+        rows = [
+            line("K", qty=3, delivery="2026-08-01", buyer="张三"),
+            line("L", qty=9, delivery="2026-08-01", buyer="李四"),
+        ]
+        result = build_reminders(rows, "2026-08-11")
+        orders, _ = filter_orders(result, buyer="张三")
+        text = reminder_markdown(result, orders)
+        self.assertIn("需催 **1** 单", text)
+        self.assertIn("采购 **3** 件", text)
+        self.assertIn("待入库 **3** 件", text)
+        self.assertIn("K", text)
+        self.assertNotIn("李四", text)
+        self.assertNotIn("L", text)
+
+
+class FollowupTests(unittest.TestCase):
+    def test_followup_buckets(self):
+        self.assertEqual("unscheduled", classify_followup(None))
+        self.assertEqual("overdue", classify_followup(-1))
+        self.assertEqual("d3", classify_followup(0))
+        self.assertEqual("d3", classify_followup(3))
+        self.assertEqual("d10", classify_followup(4))
+        self.assertEqual("d10", classify_followup(10))
+        self.assertEqual("later", classify_followup(11))
+
+    def test_repair_rows_are_excluded(self):
+        self.assertTrue(is_repair_row({"标签": "返修退货"}))
+        self.assertTrue(is_repair_row({"备注": "返修采购单，退货单号【1】"}))
+        self.assertFalse(is_repair_row({"标签": "", "备注": "正常补货"}))
+        rows = [
+            {**line("R1", delivery="2026-08-01"), "标签": "返修退货"},
+            line("N1", delivery="2026-08-01"),
+        ]
+        result = build_reminders(rows, "2026-08-11", profile="followup")
+        self.assertEqual(["N1"], [item["purchaseOrderNo"] for item in result["orders"]])
+
+    def test_followup_profile_uses_three_waves(self):
+        rows = [
+            line("over", delivery="2026-08-01"),
+            line("d3", delivery="2026-08-13"),
+            line("d10", delivery="2026-08-20"),
+            line("later", delivery="2026-09-01"),
+        ]
+        result = build_reminders(rows, "2026-08-11", profile="followup")
+        by_no = {item["purchaseOrderNo"]: item["bucket"] for item in result["orders"]}
+        self.assertEqual("overdue", by_no["over"])
+        self.assertEqual("d3", by_no["d3"])
+        self.assertEqual("d10", by_no["d10"])
+        self.assertEqual("later", by_no["later"])
+        orders, matched = filter_orders(result, buckets=FOLLOWUP_URGENT)
+        self.assertEqual(3, matched)
+        self.assertEqual({"over", "d3", "d10"}, {item["purchaseOrderNo"] for item in orders})
 
 
 class SharedWaveFixtureTests(unittest.TestCase):
@@ -136,11 +197,11 @@ class SharedWaveFixtureTests(unittest.TestCase):
 
     def test_thresholds_match_classify(self):
         for row in self.fixture["waveThresholds"]:
-            self.assertEqual(row["bucket"], classify(row["days"]), row)
+            self.assertEqual(row["bucket"], classify_followup(row["days"]), row)
 
     def test_mixed_order_uses_per_line_fallback(self):
         mixed = self.fixture["mixedOrder"]
-        result = build_reminders(mixed["rows"], self.fixture["today"])
+        result = build_reminders(mixed["rows"], self.fixture["today"], profile="followup")
         self.assertEqual(1, len(result["orders"]))
         order = result["orders"][0]
         expected = mixed["expected"]

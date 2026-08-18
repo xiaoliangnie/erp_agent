@@ -270,7 +270,7 @@ class DigitalRuntime:
         return result
 
     def close_browser(self) -> None:
-        """关掉浏览器，保留 Playwright 线程和本机 cookie，供时段外释放资源。"""
+        """关掉浏览器，保留 Playwright 线程和本机 cookie，供进程退出时释放。"""
         with self._job_lock:
             self._pw.call(self._close)
 

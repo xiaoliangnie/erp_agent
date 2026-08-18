@@ -6,8 +6,11 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from backend.agent.actions import ActionError
 from backend.agent.audit import AuditLog
 from backend.agent.store import AgentStore
+from backend.agent.work_items import WorkItems
+from backend.staff_names import VIEWER_WRITE_DENIED, WEB_OPERATOR_UNBOUND
 from backend.business_time import BUSINESS_TIMEZONE, business_today
 from backend.dingtalk.sender import encode_multipart
 from backend.quality import (
@@ -58,6 +61,16 @@ class ParseTests(unittest.TestCase):
         self.assertEqual("cancel", parse_quality_command("撤销品控 abcdef")["action"])
         self.assertEqual("今天", parse_quality_command("品控查询")["query"])
         self.assertIsNone(parse_quality_command("催一下逾期单"))
+
+    def test_agent_intent_maps_close_and_cancel(self):
+        from backend.agent.intents import classify_intent
+        closed = classify_intent("品控关闭 abcdef 已赔")
+        self.assertEqual("resolve_quality_issue", closed.tool)
+        self.assertEqual("abcdef", closed.arguments["issue_id"])
+        self.assertEqual("已赔", closed.arguments["resolution"])
+        cancelled = classify_intent("撤销品控 abcdef")
+        self.assertEqual("cancel_quality_issue", cancelled.tool)
+        self.assertEqual({"issue_id": "abcdef"}, cancelled.arguments)
 
     def test_fields_hit_and_do_not_guess(self):
         fields = parse_quality_fields(
@@ -118,6 +131,66 @@ class LedgerTests(unittest.TestCase):
         self.assertIn("604264", text)
         listed = self.ledger.handle_text("品控查询 今天")
         self.assertIn("鞋垫开胶", listed)
+
+
+class FakeDirectory:
+    def __init__(self, names, role="buyer"):
+        self.names = set(names)
+        self.role = role
+
+    def known_operator(self, operator):
+        return str(operator or "") in self.names
+
+    def find_binding(self, *, operator="", actor_id=""):
+        del actor_id
+        if str(operator or "") not in self.names:
+            return {}
+        return {"role": self.role, "buyerName": operator}
+
+
+class WorkbenchQualityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = AgentStore(Path(self.tmp.name) / "agent.sqlite3")
+        self.ledger = QualityLedger(self.store, suppliers={"佰特"})
+        self.items = WorkItems(self.store)
+        self.directory = FakeDirectory({"张三"})
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_reporter_can_resolve_from_workbench(self):
+        issue = self.ledger.record(description="开胶", reporter="张三")
+        item = self.items.decide_quality(
+            self.ledger, issue_id=issue["id"], decision="resolve",
+            operator="张三", resolution="已赔", directory=self.directory,
+        )
+        self.assertEqual("resolved", item["status"])
+        self.assertEqual("resolved", self.ledger.get(issue["id"])["status"])
+
+    def test_other_operator_cannot_decide(self):
+        issue = self.ledger.record(description="开胶", reporter="张三")
+        other = FakeDirectory({"李四"})
+        with self.assertRaisesRegex(ActionError, "自己登记"):
+            self.items.decide_quality(
+                self.ledger, issue_id=issue["id"], decision="cancel",
+                operator="李四", directory=other,
+            )
+        self.assertEqual("open", self.ledger.get(issue["id"])["status"])
+
+    def test_viewer_and_unbound_are_denied(self):
+        issue = self.ledger.record(description="开胶", reporter="张三")
+        viewer = FakeDirectory({"张三"}, role="viewer")
+        with self.assertRaisesRegex(ActionError, VIEWER_WRITE_DENIED):
+            self.items.decide_quality(
+                self.ledger, issue_id=issue["id"], decision="resolve",
+                operator="张三", directory=viewer,
+            )
+        with self.assertRaisesRegex(ActionError, WEB_OPERATOR_UNBOUND):
+            self.items.decide_quality(
+                self.ledger, issue_id=issue["id"], decision="resolve",
+                operator="路人", directory=self.directory,
+            )
 
 
 class WorkbookTests(unittest.TestCase):

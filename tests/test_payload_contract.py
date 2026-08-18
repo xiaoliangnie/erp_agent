@@ -75,6 +75,8 @@ class PayloadContractTests(unittest.TestCase):
         self.assertEqual(DASHBOARD_LINE_WIDTH, len(payload["lines"][0]))
         self.assertEqual("PO-1", payload["orders"][0][0])
         self.assertEqual("SKU-1", payload["lines"][0][-1])
+        self.assertEqual(list(DASHBOARD_ORDER_COLUMNS), payload["columns"]["orders"])
+        self.assertEqual(list(DASHBOARD_LINE_COLUMNS), payload["columns"]["lines"])
 
     def test_delivery_encoder_width(self):
         payload = build_delivery_payload([SAMPLE_ROW])
@@ -82,6 +84,8 @@ class PayloadContractTests(unittest.TestCase):
         self.assertEqual(DELIVERY_LINE_WIDTH, len(payload["lines"][0]))
         self.assertEqual("2026-08-18", payload["lines"][0][8])
         self.assertEqual("2026-08-20", payload["lines"][0][9])
+        self.assertEqual(list(DELIVERY_ORDER_COLUMNS), payload["columns"]["orders"])
+        self.assertEqual(list(DELIVERY_LINE_COLUMNS), payload["columns"]["lines"])
 
 
 if __name__ == "__main__":

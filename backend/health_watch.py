@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""评估 `/api/health`：库不可用、镜像滞后、Stream 重连增长、催办 lastError。
+"""评估 `/api/health`：库不可用、镜像滞后、Stream 重连增长、催办/品控/代发 lastError。
 
 巡检脚本 `scripts/health_watch.py` 调这里；不要 import `backend.app`（会把整站装配起来）。
 评估函数纯数据进纯数据出，离线测试不发 HTTP、不发钉钉。
@@ -112,6 +112,20 @@ def collect_issues(payload: dict | None, *, fetch_error: str = "",
         issues.append(Issue("reminder_error", reminder_error[:300]))
     if reminder.get("enabled") and not reminder.get("running"):
         issues.append(Issue("reminder_dead", "催办调度已启用但线程未在运行"))
+
+    quality = payload.get("quality") or {}
+    quality_error = str(quality.get("lastError") or "").strip()
+    if quality_error:
+        issues.append(Issue("quality_error", quality_error[:300]))
+    if quality.get("enabled") and not quality.get("running"):
+        issues.append(Issue("quality_dead", "品控日报调度已启用但线程未在运行"))
+
+    dropship = payload.get("dropship") or {}
+    dropship_error = str(dropship.get("lastError") or "").strip()
+    if dropship_error:
+        issues.append(Issue("dropship_error", dropship_error[:300]))
+    if dropship.get("enabled") and not dropship.get("running"):
+        issues.append(Issue("dropship_dead", "代发调度已启用但线程未在运行"))
     return issues
 
 
@@ -174,6 +188,10 @@ def render_alert(issues: list[Issue], *, url: str = "") -> str:
         "stream_restart": "钉钉 Stream 重连",
         "reminder_error": "交期催办失败",
         "reminder_dead": "交期催办调度停摆",
+        "quality_error": "品控日报失败",
+        "quality_dead": "品控日报调度停摆",
+        "dropship_error": "代发导出失败",
+        "dropship_dead": "代发调度停摆",
     }
     for item in issues:
         title = labels.get(item.code, item.code)

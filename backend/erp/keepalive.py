@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""ERP 登录态保活：工作时段维持浏览器和 cookie，不固定停在某一页。
+"""ERP 登录态保活：服务在跑就维持浏览器和 cookie，进程退出再关。
 
 鞋垫写入、代发抓取、以后合同页自动化都复用同一套登录态。
 保活只做 ``login_if_needed`` + 落 ``storage_state``，不去订单列表。
@@ -13,6 +13,7 @@ from datetime import datetime
 
 from ..business_time import business_now
 from .session import playwright_available
+
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +30,7 @@ def parse_hhmm(value, default=DEFAULT_START) -> tuple[int, int]:
 
 
 def in_keepalive_window(now: datetime, *, start=DEFAULT_START, end=DEFAULT_END) -> bool:
-    """北京时间闭区间；跨日窗口（例如 22:00–06:00）也支持。"""
+    """兼容旧测试；登录态已改为随进程，不再按此时段关浏览器。"""
     current = (now.hour, now.minute)
     if start <= end:
         return start <= current <= end
@@ -37,7 +38,7 @@ def in_keepalive_window(now: datetime, *, start=DEFAULT_START, end=DEFAULT_END) 
 
 
 class ErpKeepAlive:
-    """工作时段内周期性确认仍在 ERP 内；时段外关掉浏览器，cookie 留在本机。"""
+    """``server.py`` 启动后立刻暖机，运行期间周期性续 cookie，停止时关浏览器。"""
 
     def __init__(
         self,
@@ -49,27 +50,24 @@ class ErpKeepAlive:
         interval_seconds: int = 180,
         poll_seconds: int = 30,
     ):
+        del start_time, end_time
         self.runtime = runtime
         self.enabled = bool(enabled)
-        self.start_at = parse_hhmm(start_time, DEFAULT_START)
-        self.end_at = parse_hhmm(end_time, DEFAULT_END)
         self.interval_seconds = max(30, int(interval_seconds))
         self.poll_seconds = max(5, int(poll_seconds))
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._warmed = False
-        self._closed_after_hours = False
         self.last_ok = ""
         self.last_error = ""
         self.last_skip = ""
 
     def status(self) -> dict:
-        now = business_now()
         return {
             "enabled": self.enabled,
             "running": bool(self._thread and self._thread.is_alive()),
-            "window": f"{self.start_at[0]:02d}:{self.start_at[1]:02d}-{self.end_at[0]:02d}:{self.end_at[1]:02d}",
-            "inWindow": in_keepalive_window(now, start=self.start_at, end=self.end_at),
+            "window": "process",
+            "inWindow": bool(self._thread and self._thread.is_alive()),
             "warmed": self._warmed,
             "intervalSeconds": self.interval_seconds,
             "lastOk": self.last_ok,
@@ -94,8 +92,10 @@ class ErpKeepAlive:
     def stop(self) -> None:
         self._stop.set()
         if self._thread:
-            self._thread.join(timeout=5)
+            self._thread.join(timeout=8)
         self._thread = None
+        if self._warmed:
+            self._close_browser()
 
     def _can_run(self) -> bool:
         if not playwright_available():
@@ -116,19 +116,18 @@ class ErpKeepAlive:
         return "没有 ERP 账号密码，也没有已保存的登录态"
 
     def _loop(self) -> None:
-        while not self._stop.wait(self.poll_seconds):
+        while True:
             try:
                 self.tick()
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 logger.exception("ERP 登录态保活失败")
+            if self._stop.wait(self.poll_seconds):
+                break
 
     def tick(self, *, now: datetime | None = None) -> dict:
         """执行一轮判断；测试可传入 ``now``。"""
         current = now or business_now()
-        if not in_keepalive_window(current, start=self.start_at, end=self.end_at):
-            return self._leave_window()
-        self._closed_after_hours = False
         if self._warmed and self.last_ok:
             elapsed = (current - _parse_stamp(self.last_ok)).total_seconds()
             if elapsed < self.interval_seconds:
@@ -154,29 +153,29 @@ class ErpKeepAlive:
             if callable(release):
                 release()
 
-    def _leave_window(self) -> dict:
-        if not self._warmed or self._closed_after_hours:
-            self.last_skip = "非保活时段"
-            return {"skipped": True, "reason": self.last_skip}
+    def _close_browser(self) -> None:
+        closer = getattr(self.runtime, "close_browser", None) or getattr(self.runtime, "close", None)
+        if not callable(closer):
+            self._warmed = False
+            return
         lock = getattr(self.runtime, "try_exclusive", None)
-        if callable(lock) and not lock():
-            self.last_skip = "写入中，稍后关浏览器"
-            return {"skipped": True, "reason": self.last_skip}
+        held = callable(lock) and lock()
+        if callable(lock) and not held:
+            logger.info("ERP 登录态停止时写入占用中，留给 Digital Worker 关浏览器")
+            return
         try:
-            closer = getattr(self.runtime, "close_browser", None) or getattr(self.runtime, "close")
             closer()
             self._warmed = False
-            self._closed_after_hours = True
-            self.last_skip = "已过保活时段，浏览器已关"
-            logger.info("ERP 登录态保活结束，浏览器已关闭（cookie 仍在本机）")
-            return {"closed": True, "reason": self.last_skip}
+            self.last_skip = "服务停止，浏览器已关"
+            logger.info("ERP 登录态已随服务停止，浏览器已关闭（cookie 仍在本机）")
         except Exception as exc:
             self.last_error = f"{type(exc).__name__}: {exc}"
-            return {"failed": True, "reason": self.last_error}
+            logger.warning("关闭 ERP 浏览器失败：%s", self.last_error)
         finally:
-            release = getattr(self.runtime, "release_exclusive", None)
-            if callable(release):
-                release()
+            if held:
+                release = getattr(self.runtime, "release_exclusive", None)
+                if callable(release):
+                    release()
 
 
 def _parse_stamp(value: str) -> datetime:

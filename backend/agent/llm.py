@@ -36,6 +36,10 @@ class LLMError(RuntimeError):
     """模型调用失败；错误信息可以回给员工，但不含密钥。"""
 
 
+class ToolChoiceRejected(LLMError):
+    """思考模式等接口不接受当前 tool_choice。"""
+
+
 class LLMClient:
     def __init__(self, *, api_base: str, api_key: str, model: str,
                  temperature: float = 0.1, timeout: int = 60,
@@ -101,18 +105,16 @@ class LLMClient:
         }
         if tools:
             payload["tools"] = tools
-            payload["tool_choice"] = tool_choice
-        request = urllib.request.Request(
-            self.endpoint,
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}",
-                "Accept": "application/json",
-            },
-            method="POST",
-        )
-        body = self._post(request, "模型接口")
+            if tool_choice:
+                payload["tool_choice"] = tool_choice
+        try:
+            body = self._post_payload(payload)
+        except ToolChoiceRejected:
+            if payload.get("tool_choice") in (None, "auto"):
+                raise
+            logger.warning("模型拒绝 tool_choice=%s，改用 auto 重试", payload.get("tool_choice"))
+            payload["tool_choice"] = "auto"
+            body = self._post_payload(payload)
         choices = body.get("choices") or []
         if not choices:
             raise LLMError("模型接口没有返回任何回复")
@@ -196,6 +198,19 @@ class LLMClient:
             )
         return parsed
 
+    def _post_payload(self, payload: dict) -> dict:
+        request = urllib.request.Request(
+            self.endpoint,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        return self._post(request, "模型接口")
+
     def _post(self, request, label: str) -> dict:
         last_error = None
         for attempt in range(2):
@@ -206,6 +221,8 @@ class LLMClient:
                 detail = exc.read().decode("utf-8", "replace")[:400]
                 logger.warning("%s HTTP %s: %s", label, exc.code, detail)
                 last_error = LLMError(f"{label}返回 {exc.code}")
+                if exc.code == 400 and "tool_choice" in detail.lower():
+                    raise ToolChoiceRejected(f"{label}拒绝 tool_choice") from exc
                 if exc.code in (429, 500, 502, 503, 504) and attempt == 0:
                     time.sleep(0.8)
                     continue

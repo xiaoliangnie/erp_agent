@@ -9,7 +9,7 @@ interface WaveDotsProps {
   current: OrderWave;
 }
 
-/** 四波时间轴：今天走到哪一波，前面的都算「已到点」。 */
+/** 跟单三档时间轴：今天走到哪一档，前面的都算「已到点」。 */
 export function WaveDots({ etaDay, today, current }: WaveDotsProps) {
   const plan = planWaves(etaDay);
   return (
@@ -17,7 +17,7 @@ export function WaveDots({ etaDay, today, current }: WaveDotsProps) {
       {TIMELINE.map((wave, index) => {
         if (!plan) {
           return (
-            <i key={wave.k} title="未排期，四波都发不出去">
+            <i key={wave.k} title="未排期，三档都发不出去">
               {index + 1}
             </i>
           );
