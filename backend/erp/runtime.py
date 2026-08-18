@@ -11,6 +11,7 @@ import concurrent.futures
 import queue
 import secrets
 import threading
+import time
 from pathlib import Path
 
 from . import evidence, exchange_page
@@ -189,13 +190,22 @@ class DigitalRuntime:
         plans = [item for item in evidence.plans_from_payload(payload) if item.get("ok")]
         expected = [evidence.expected_from_plan(item) for item in plans]
         oids = [item["oId"] for item in expected if item["oId"]]
+        read_width = payload.get("readConcurrency", payload.get("read_concurrency"))
+        if read_width is None:
+            read_width = concurrency
+        read_width = max(1, min(8, int(read_width or 1)))
         before = {}
         unread = []
+        before_started = time.monotonic()
+        loaded = exchange_page.load_orders(
+            self.session.page, oids, concurrency=read_width,
+        )
         for oid in oids:
-            snap = evidence.snapshot_from_order(exchange_page.load_order(self.session.page, oid))
+            snap = evidence.snapshot_from_order(loaded.get(oid))
             before[oid] = snap
             if snap.get("loadError"):
                 unread.append(oid)
+        before_ms = int((time.monotonic() - before_started) * 1000)
         if unread:
             raise ErpError(f"写入前无法回读订单：{', '.join(unread)}")
 
@@ -237,10 +247,13 @@ class DigitalRuntime:
             result.setdefault("succeeded", []).append({"o_id": oid, "alreadyDone": True})
 
         after = {}
+        after_started = time.monotonic()
+        loaded = exchange_page.load_orders(
+            self.session.page, oids, concurrency=read_width,
+        )
         for oid in oids:
-            after[oid] = evidence.snapshot_from_order(
-                exchange_page.load_order(self.session.page, oid)
-            )
+            after[oid] = evidence.snapshot_from_order(loaded.get(oid))
+        after_ms = int((time.monotonic() - after_started) * 1000)
         if folder is not None and callable(screenshot):
             screenshot(folder / "after.png")
         if tracing and folder is not None and callable(stop_trace):
@@ -263,6 +276,8 @@ class DigitalRuntime:
             },
         )
         result["evidence"] = bundle
+        result["readMs"] = before_ms + after_ms
+        result["readConcurrency"] = read_width
         if write_error is not None or recon.get("status") == "unknown":
             raise ErpUnknownResult(
                 str(write_error or "写入后回读失败，结果未知，未重试")

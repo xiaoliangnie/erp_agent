@@ -8,7 +8,7 @@
  *
  * 暴露：
  *   globalThis.JstOrderExchange = {
- *     version, ready, loadOrder, planOrder, plan, execute, changeItem
+ *     version, ready, loadOrder, loadOrders, planOrder, plan, execute, changeItem
  *   }
  *
  * 用法（浏览器控制台 / 油猴 / Codex page.evaluate）：
@@ -30,7 +30,7 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.7.0';
+  const VERSION = '0.7.1';
   const DEFAULT_WRITE_DELAY_MS = 250;
   const DEFAULT_WRITE_CONCURRENCY = 1;
   const MAX_WRITE_CONCURRENCY = 8;
@@ -123,6 +123,23 @@
       o_id: String(oid),
       items: Array.isArray(items) ? items : [],
     });
+  }
+
+  async function loadOrders(input) {
+    const spec = input && !Array.isArray(input) ? input : { oids: input };
+    const keys = [];
+    (spec.oids || []).forEach(function (oid) {
+      const key = String(oid || '').trim();
+      if (key && keys.indexOf(key) < 0) keys.push(key);
+    });
+    const rows = await mapPool(keys, spec.concurrency, async function (oid) {
+      try {
+        return await loadOrder(oid);
+      } catch (error) {
+        return { o_id: oid, items: [], load_error: String(error) };
+      }
+    });
+    return { orders: rows, count: rows.length };
   }
 
   /** 只读扫描当前 ERP 订单数据集，并逐单读取明细反查 SKU。 */
@@ -468,6 +485,7 @@
     version: VERSION,
     ready: ready,
     loadOrder: loadOrder,
+    loadOrders: loadOrders,
     planOrder: planOrder,
     plan: plan,
     execute: execute,

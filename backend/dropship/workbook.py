@@ -6,14 +6,15 @@ Sheet2 是给供应商的收货 + 商品子集。
 """
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-from ..business_time import business_today
+from ..business_time import BUSINESS_TIMEZONE, business_now, business_today
 from ..paths import TEMPLATES_DIR, local_dir
 
 SHEET1_COLUMNS = [
@@ -68,6 +69,97 @@ def dropship_filename(today: date | None = None) -> str:
 
 def dropship_output_path(*, root=None, today: date | None = None) -> Path:
     return local_dir("outputs", root=root) / "dropship" / dropship_filename(today)
+
+
+def dropship_meta_path(workbook_path) -> Path:
+    target = Path(workbook_path)
+    return target.with_name(target.stem + ".meta.json")
+
+
+def format_dropship_cutoff(moment=None) -> str:
+    stamp = moment or business_now()
+    if getattr(stamp, "tzinfo", None) is None:
+        stamp = stamp.replace(tzinfo=BUSINESS_TIMEZONE)
+    else:
+        stamp = stamp.astimezone(BUSINESS_TIMEZONE)
+    return stamp.strftime("%Y-%m-%d %H:%M")
+
+
+def _clean_oids(values) -> list[str]:
+    found = []
+    for raw in values or []:
+        oid = str(raw or "").strip()
+        if oid and oid not in found:
+            found.append(oid)
+    return found
+
+
+def write_dropship_meta(workbook_path, *, cutoff=None, rate_limited=None,
+                       stats=None, rest_complete=None) -> dict:
+    """抓表完成时记下截止时间和揭收货限流单号，发送通知用。不含收货明文。"""
+    current = read_dropship_meta(workbook_path)
+    stamp = cutoff or current.get("dataCutoff") or format_dropship_cutoff()
+    limited = _clean_oids(
+        rate_limited if rate_limited is not None else current.get("rateLimited")
+    )
+    if rest_complete is None:
+        complete = bool(current.get("restComplete"))
+    else:
+        complete = bool(rest_complete)
+    payload = {
+        "dataCutoff": stamp,
+        "rateLimited": limited,
+        "restComplete": complete,
+    }
+    source = stats if stats is not None else current.get("stats")
+    if isinstance(source, dict) and source:
+        payload["stats"] = {
+            key: source.get(key)
+            for key in ("orders", "lines", "收货人", "手机", "地址")
+            if source.get(key) is not None
+        }
+    meta = dropship_meta_path(workbook_path)
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def write_dropship_cutoff(workbook_path, *, cutoff=None, rate_limited=None,
+                          stats=None, rest_complete=None) -> str:
+    return write_dropship_meta(
+        workbook_path, cutoff=cutoff, rate_limited=rate_limited,
+        stats=stats, rest_complete=rest_complete,
+    ).get("dataCutoff") or ""
+
+
+def read_dropship_meta(workbook_path) -> dict:
+    target = Path(workbook_path)
+    meta = dropship_meta_path(target)
+    payload = {}
+    if meta.exists():
+        try:
+            loaded = json.loads(meta.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                payload = loaded
+        except (OSError, json.JSONDecodeError, TypeError):
+            payload = {}
+    cutoff = str(payload.get("dataCutoff") or "").strip()
+    if not cutoff and target.exists():
+        cutoff = format_dropship_cutoff(
+            datetime.fromtimestamp(target.stat().st_mtime, BUSINESS_TIMEZONE)
+        )
+    if not cutoff:
+        cutoff = format_dropship_cutoff()
+    return {
+        "dataCutoff": cutoff,
+        "rateLimited": _clean_oids(payload.get("rateLimited")),
+        "restComplete": bool(payload.get("restComplete")),
+        "stats": payload.get("stats") if isinstance(payload.get("stats"), dict) else {},
+    }
+
+
+def read_dropship_cutoff(workbook_path) -> str:
+    return str(read_dropship_meta(workbook_path).get("dataCutoff") or "")
 
 
 def dropship_template_path(*, root=None) -> Path:

@@ -8,7 +8,7 @@ from typing import Any
 from ..erp.errors import ErpError
 from .page import _list_frame, ensure_epaas_order_page, filter_unscheduled_dropship
 from .products import apply_sku_facts, default_env_path, fetch_sku_facts, missing_sku_ids
-from .workbook import dropship_output_path, write_dropship_workbook
+from .workbook import dropship_output_path, write_dropship_cutoff, write_dropship_workbook
 
 EXTRACT_JS = r"""() => {
   const text = (value) => String(value == null ? '' : value).trim();
@@ -394,6 +394,21 @@ def rows_from_orders(orders: list[dict], unmasked: dict[str, dict]) -> list[dict
     return lines
 
 
+def receiver_rest_complete(rows: list[dict], rate_limited) -> bool:
+    """限流单之外，其余订单的收货人/手机/地址是否都揭开了。"""
+    limited = {str(item).strip() for item in (rate_limited or []) if str(item).strip()}
+    by_oid: dict[str, dict[str, bool]] = {}
+    for row in rows:
+        oid = str(row.get("内部订单号") or "").strip()
+        if not oid or oid in limited:
+            continue
+        flags = by_oid.setdefault(oid, {"name": True, "mobile": True, "address": True})
+        flags["name"] = flags["name"] and _usable(row.get("收货人"), "name")
+        flags["mobile"] = flags["mobile"] and _usable(row.get("手机"), "mobile")
+        flags["address"] = flags["address"] and _usable(row.get("地址(包含省市区)"), "text")
+    return bool(by_oid) and all(all(flags.values()) for flags in by_oid.values())
+
+
 def fill_stats(rows: list[dict]) -> dict:
     def count(key, kind="text"):
         if kind == "number":
@@ -433,6 +448,8 @@ def public_export_result(payload: dict) -> dict:
         "成本价": stats.get("成本价"),
         "快递单号": stats.get("快递单号"),
         "rateLimited": list(payload.get("rateLimited") or []),
+        "restComplete": bool(payload.get("restComplete")),
+        "dataCutoff": payload.get("dataCutoff") or "",
     }
 
 
@@ -481,10 +498,17 @@ def export_today_dropship(runtime: Any, *, path=None, root=None, env_path=None) 
     except PermissionError:
         target = target.with_name(target.stem + "-订单" + target.suffix)
         write_dropship_workbook(rows, target)
+    stats = fill_stats(rows)
+    limited = list(payload.get("rateLimited") or [])
+    rest_ok = receiver_rest_complete(rows, limited)
+    cutoff = write_dropship_cutoff(
+        target, rate_limited=limited, stats=stats, rest_complete=rest_ok,
+    )
     return {
         "ok": True,
         "path": str(target),
         "filename": target.name if hasattr(target, "name") else str(target),
+        "dataCutoff": cutoff,
         "shopSites": payload.get("shopSites") or {},
         "itemKeys": payload.get("itemKeys") or [],
         "orderKeys": payload.get("orderKeys") or [],
@@ -495,9 +519,10 @@ def export_today_dropship(runtime: Any, *, path=None, root=None, env_path=None) 
         "reloaded": reloaded,
         "reloadLimited": reload_limited,
         "rateLimited": payload.get("rateLimited") or [],
+        "restComplete": rest_ok,
         "failed": payload.get("failed") or [],
         "dataCount": payload.get("dataCount"),
-        "stats": fill_stats(rows),
+        "stats": stats,
     }
 
 

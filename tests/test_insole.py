@@ -434,6 +434,7 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(1, len(confirms))
         self.assertEqual(50, confirms[0].get("delayMs"))
         self.assertEqual(3, confirms[0].get("concurrency"))
+        self.assertEqual(5, confirms[0].get("readConcurrency"))
         self.assertEqual(3, result["okCount"])
         self.assertEqual(0, result["failedCount"])
 
@@ -454,11 +455,13 @@ class ExecuteTests(unittest.TestCase):
             "elapsedMs": 63000,
             "prepareMs": 48000,
             "writeMs": 14000,
+            "readMs": 50000,
             "log": [{"oId": "1", "targetSku": "XZ25401308-09907", "result": "ok"}],
         })
         self.assertIn("用时 1 分 3 秒", text)
         self.assertIn("开页 48 秒", text)
         self.assertIn("写入 14 秒", text)
+        self.assertIn("回读 50 秒", text)
 
 
 class IntentTests(unittest.TestCase):

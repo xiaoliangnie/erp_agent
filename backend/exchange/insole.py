@@ -37,6 +37,7 @@ SHOP_POOL = ("抖音", "快手", "视频号")
 DEFAULT_SHOP = ""
 INSOLE_WRITE_DELAY_MS = 50
 INSOLE_WRITE_CONCURRENCY = 3
+INSOLE_READ_CONCURRENCY = 5
 INSOLE_BY_MM = {
     "225": "XZ25401308-09901",
     "230": "XZ25401308-09902",
@@ -791,10 +792,13 @@ def format_insole_result(result: dict | None, *, limit: int = 5, elapsed_ms=None
     phases = []
     prepare_ms = result.get("prepareMs")
     write_ms = result.get("writeMs")
+    read_ms = result.get("readMs")
     if prepare_ms not in (None, ""):
         phases.append(f"开页 {format_elapsed(prepare_ms)}")
     if write_ms not in (None, ""):
         phases.append(f"写入 {format_elapsed(write_ms)}")
+    if read_ms not in (None, ""):
+        phases.append(f"回读 {format_elapsed(read_ms)}")
     if phases:
         headline += f"（{'，'.join(phases)}）"
     lines = [headline + "。"]
@@ -878,6 +882,7 @@ def execute_insole_orders(runtime: Any, orders: list[dict]) -> dict:
                 "plan": {"plans": ok_plans},
                 "delayMs": INSOLE_WRITE_DELAY_MS,
                 "concurrency": INSOLE_WRITE_CONCURRENCY,
+                "readConcurrency": INSOLE_READ_CONCURRENCY,
             })
         write_ms = int((time.monotonic() - write_started) * 1000)
         return {
@@ -887,6 +892,7 @@ def execute_insole_orders(runtime: Any, orders: list[dict]) -> dict:
             "attempted": executed.get("attempted") or len(ok_plans),
             "prepareMs": prepare_ms,
             "writeMs": executed.get("elapsedMs", write_ms),
+            "readMs": executed.get("readMs"),
             "plans": planned,
             "succeeded": executed.get("succeeded") or [],
             "failed": executed.get("failed") or [],

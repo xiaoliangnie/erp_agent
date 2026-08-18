@@ -375,7 +375,9 @@ class SchedulerTests(unittest.TestCase):
         self.assertTrue(failed["failed"])
         early = scheduler.tick(now=datetime(2026, 8, 18, 10, 0))
         self.assertEqual("未到准备时间", early["reason"])
-        waiting = scheduler.tick(now=datetime(2026, 8, 18, 13, 40))
+        too_early = scheduler.tick(now=datetime(2026, 8, 18, 13, 40))
+        self.assertEqual("未到准备时间", too_early["reason"])
+        waiting = scheduler.tick(now=datetime(2026, 8, 18, 13, 50))
         self.assertEqual("表已备好，等待发送", waiting["reason"])
         tmp.cleanup()
 
@@ -416,6 +418,62 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(1, len(called))
         tmp.cleanup()
 
+    def test_notice_uses_written_cutoff(self):
+        from backend.dropship.scheduler import dropship_notice_text
+        from backend.dropship.workbook import (
+            dropship_output_path, read_dropship_cutoff, write_dropship_cutoff,
+            write_dropship_workbook,
+        )
+
+        tmp = tempfile.TemporaryDirectory()
+        root = Path(tmp.name)
+        path = dropship_output_path(root=root, today=date(2026, 8, 18))
+        write_dropship_workbook([{"内部订单号": "1", "数量": 1}], path)
+        write_dropship_cutoff(path, cutoff="2026-08-18 13:55")
+        self.assertEqual("2026-08-18 13:55", read_dropship_cutoff(path))
+        text = dropship_notice_text(
+            today="2026-08-18", rows=1, filename=path.name, cutoff="2026-08-18 13:55",
+        )
+        self.assertEqual(
+            "今日代发未安排 1 行，数据截至 2026-08-18 13:55。文件：260818-代发.xlsx",
+            text,
+        )
+        tmp.cleanup()
+
+    def test_notice_mentions_rate_limited_orders(self):
+        from backend.dropship.export import receiver_rest_complete
+        from backend.dropship.scheduler import dropship_notice_text
+
+        rows = [
+            {
+                "内部订单号": "11559389", "收货人": "张*", "手机": "138****0000",
+                "地址(包含省市区)": "杭州市**",
+            },
+            {
+                "内部订单号": "11555749", "收货人": "*", "手机": "****",
+                "地址(包含省市区)": "**",
+            },
+            {
+                "内部订单号": "11554001", "收货人": "李四", "手机": "13800138000",
+                "地址(包含省市区)": "杭州市西湖区文三路1号",
+            },
+        ]
+        limited = ["11559389", "11555749"]
+        self.assertTrue(receiver_rest_complete(rows, limited))
+        self.assertFalse(receiver_rest_complete(rows, []))
+        text = dropship_notice_text(
+            today="2026-08-18", rows=3, filename="260818-代发.xlsx",
+            cutoff="2026-08-18 14:22", rate_limited=limited, rest_complete=True,
+        )
+        self.assertIn("有 2 单揭收货被限流（11559389、11555749）", text)
+        self.assertIn("其余收货人/手机/地址都齐了", text)
+        incomplete = dropship_notice_text(
+            today="2026-08-18", rows=3, filename="260818-代发.xlsx",
+            cutoff="2026-08-18 14:22", rate_limited=limited, rest_complete=False,
+        )
+        self.assertIn("有 2 单揭收货被限流（11559389、11555749）", incomplete)
+        self.assertNotIn("都齐了", incomplete)
+
     def test_run_once_exports_with_fake_runtime(self):
         from backend.dropship.scheduler import DailyDropshipScheduler
 
@@ -448,7 +506,9 @@ class SchedulerTests(unittest.TestCase):
         from backend.agent.store import AgentStore
         from backend.agent.audit import AuditLog
         from backend.dropship.scheduler import DailyDropshipScheduler
-        from backend.dropship.workbook import dropship_output_path, write_dropship_workbook
+        from backend.dropship.workbook import (
+            dropship_output_path, write_dropship_cutoff, write_dropship_workbook,
+        )
 
         tmp = tempfile.TemporaryDirectory()
         root = Path(tmp.name)
@@ -460,6 +520,10 @@ class SchedulerTests(unittest.TestCase):
             "收货人": "测",
             "数量": 1,
         }], path)
+        write_dropship_cutoff(
+            path, cutoff="2026-08-18 14:22",
+            rate_limited=["11559389", "11555749"], rest_complete=True,
+        )
         sender = RecordingSender()
         audit = AuditLog(AgentStore(root / "agent.sqlite3"))
         scheduler = DailyDropshipScheduler(
@@ -480,6 +544,9 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual("cid-drop", sender.files[0]["cid"])
         self.assertIn("代发未安排", sender.markdowns[0][0])
         self.assertIn("1 行", sender.markdowns[0][1])
+        self.assertIn("数据截至", sender.markdowns[0][1])
+        self.assertIn("有 2 单揭收货被限流（11559389、11555749）", sender.markdowns[0][1])
+        self.assertIn("其余收货人/手机/地址都齐了", sender.markdowns[0][1])
         self.assertNotIn("测", sender.markdowns[0][1])
         self.assertEqual([], exported)
         again = scheduler.run_once(today=today)

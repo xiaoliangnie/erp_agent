@@ -8,7 +8,7 @@ from .errors import ErpError, ErpUnknownResult
 from ..paths import ROOT
 
 CORE_PATH = ROOT / "frontend" / "js" / "jst-order-exchange.core.js"
-CORE_VERSION = "0.7.0"
+CORE_VERSION = "0.7.1"
 
 
 def read_core(path: Path | None = None) -> str:
@@ -72,20 +72,58 @@ def load_order(page, oid: str) -> dict:
     key = str(oid or "").strip()
     if not key:
         return {"o_id": "", "items": [], "load_error": "缺少内部单号"}
+    return load_orders(page, [key]).get(key) or {
+        "o_id": key, "items": [], "load_error": "ERP 未返回该订单",
+    }
+
+
+def load_orders(page, oids, *, concurrency: int = 3) -> dict:
+    """一批回读，只进一次页面。失败单带 load_error，不抛。"""
+    keys = []
+    for raw in oids or []:
+        oid = str(raw or "").strip()
+        if oid and oid not in keys:
+            keys.append(oid)
+    if not keys:
+        return {}
+    width = max(1, min(8, int(concurrency or 3)))
     try:
         result = page.evaluate(
-            """async (oid) => {
+            """async (input) => {
                 if (!window.JstOrderExchange) throw new Error('换货核心未注入');
-                return await window.JstOrderExchange.loadOrder(oid);
+                if (typeof window.JstOrderExchange.loadOrders === 'function') {
+                    return await window.JstOrderExchange.loadOrders(input);
+                }
+                const orders = [];
+                for (const oid of input.oids || []) {
+                    try {
+                        orders.push(await window.JstOrderExchange.loadOrder(oid));
+                    } catch (error) {
+                        orders.push({ o_id: oid, items: [], load_error: String(error) });
+                    }
+                }
+                return { orders: orders, count: orders.length };
             }""",
-            key,
+            {"oids": keys, "concurrency": width},
         )
     except Exception as exc:
-        return {"o_id": key, "items": [], "load_error": str(exc)}
-    if not isinstance(result, dict):
-        return {"o_id": key, "items": [], "load_error": "回读结果不是对象"}
-    result.setdefault("o_id", key)
-    return result
+        return {
+            oid: {"o_id": oid, "items": [], "load_error": str(exc)}
+            for oid in keys
+        }
+    loaded = {}
+    for item in (result or {}).get("orders") or []:
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get("o_id") or item.get("oId") or "").strip()
+        if not oid:
+            continue
+        item.setdefault("o_id", oid)
+        loaded[oid] = item
+    for oid in keys:
+        if oid not in loaded:
+            loaded[oid] = {"o_id": oid, "items": [], "load_error": "ERP 未返回该订单"}
+    return loaded
 
 
 def search_sku(page, sku: str, *, limit: int = 500) -> dict:

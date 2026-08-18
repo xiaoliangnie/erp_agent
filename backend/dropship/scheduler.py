@@ -45,6 +45,31 @@ def dropship_group_key(today: str) -> str:
     return f"dropship-file-group-{today}"
 
 
+def dropship_limited_note(rate_limited=None, *, rest_complete=False) -> str:
+    oids = [str(item).strip() for item in (rate_limited or []) if str(item).strip()]
+    if not oids:
+        return ""
+    shown = "、".join(oids[:20])
+    if len(oids) > 20:
+        shown += f" 等{len(oids)}单"
+    note = f"有 {len(oids)} 单揭收货被限流（{shown}）"
+    if rest_complete:
+        note += "，其余收货人/手机/地址都齐了"
+    return note
+
+
+def dropship_notice_text(*, today: str, rows: int, filename: str, cutoff: str,
+                         rate_limited=None, rest_complete=False) -> str:
+    if rows:
+        text = f"今日代发未安排 {rows} 行，数据截至 {cutoff}。文件：{filename}"
+    else:
+        text = f"今日无代发未安排（{today}），数据截至 {cutoff}。文件：{filename}"
+    extra = dropship_limited_note(rate_limited, rest_complete=rest_complete)
+    if extra:
+        return f"{text}\n{extra}"
+    return text
+
+
 def _split_names(value) -> tuple[str, ...]:
     text = str(value or "").strip()
     if not text:
@@ -57,7 +82,7 @@ class DailyDropshipScheduler:
                  poll_seconds: int = 30, enabled: bool = False, sender=None,
                  audit=None, conversation_id: str = "", directory=None,
                  oto_buyers: str = "安安", oto_user_ids: str = "",
-                 prepare_lead_minutes: int = 30,
+                 prepare_lead_minutes: int = 10,
                  max_attempts_per_day: int = 3, retry_interval_seconds: int = 15 * 60):
         self.runtime = runtime
         self.root = Path(root)
@@ -269,14 +294,22 @@ class DailyDropshipScheduler:
         rows = dropship_row_count(path)
         if not path.exists() or path.stat().st_size <= 0:
             return {"failed": True, "reason": "当日代发表不存在", "today": today}
+        from .workbook import read_dropship_meta
+
+        meta = read_dropship_meta(path)
+        cutoff = meta.get("dataCutoff") or ""
+        limited = meta.get("rateLimited") or []
         title = f"代发未安排 · {today}"
-        if rows:
-            text = f"今日代发未安排 {rows} 行，文件：{path.name}"
-        else:
-            text = f"今日无代发未安排（{today}）。文件：{path.name}"
+        rest_complete = bool(meta.get("restComplete"))
+        text = dropship_notice_text(
+            today=today, rows=rows, filename=path.name, cutoff=cutoff,
+            rate_limited=limited, rest_complete=rest_complete,
+        )
         detail = {
             "today": today, "operator": operator, "path": str(path),
             "filename": path.name, "rows": rows, "reused": reused,
+            "dataCutoff": cutoff, "rateLimited": limited,
+            "restComplete": rest_complete,
         }
         conversation_id = self.conversation_id or getattr(self.sender, "group_conversation_id", "") or "group"
         oto_ids, unbound = self._oto_targets()

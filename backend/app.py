@@ -159,7 +159,7 @@ DROPSHIP_SCHEDULER = DailyDropshipScheduler(
     root=ROOT,
     env_path=REALTIME_ENV_PATH,
     send_time=setting("DROPSHIP_SCHEDULE_TIME", "14:00"),
-    prepare_lead_minutes=int(setting("DROPSHIP_PREPARE_LEAD_MINUTES", "30") or 30),
+    prepare_lead_minutes=int(setting("DROPSHIP_PREPARE_LEAD_MINUTES", "10") or 10),
     enabled=flag(setting("DROPSHIP_SCHEDULE_ENABLED", "false")),
     conversation_id=setting("DROPSHIP_GROUP_CONVERSATION_ID", "")
     or setting("DINGTALK_GROUP_CONVERSATION_ID", ""),

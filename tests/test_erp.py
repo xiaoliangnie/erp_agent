@@ -129,6 +129,16 @@ class FakePage:
                 "total": 1, "exchangeable": 1, "skipped": 0,
                 "plans": [{"o_id": "10001", "ok": True, "mode": "ChangeItem"}],
             }
+        if "loadOrders" in str(expr):
+            oids = list((arg or {}).get("oids") or [])
+            rows = []
+            for oid in oids:
+                key = str(oid or "")
+                if key in self.orders:
+                    rows.append({"o_id": key, **self.orders[key]})
+                else:
+                    rows.append({"o_id": key, "items": [], "load_error": "ERP 未返回该订单"})
+            return {"orders": rows, "count": len(rows)}
         if "loadOrder" in str(expr):
             oid = str(arg or "")
             if oid in self.orders:
@@ -161,6 +171,18 @@ class ExchangePageTests(unittest.TestCase):
         source = exchange_page.read_core()
         self.assertIn(f"const VERSION = '{exchange_page.CORE_VERSION}'", source)
         self.assertIn("concurrency", source)
+        self.assertIn("loadOrders", source)
+
+    def test_load_orders_uses_one_evaluate(self):
+        page = FakePage(orders={
+            "10001": {"items": [{"sku_id": "A"}]},
+            "10002": {"items": [{"sku_id": "B"}]},
+        })
+        loaded = exchange_page.load_orders(page, ["10001", "10002", "10003"], concurrency=5)
+        self.assertEqual("A", loaded["10001"]["items"][0]["sku_id"])
+        self.assertEqual("B", loaded["10002"]["items"][0]["sku_id"])
+        self.assertTrue(loaded["10003"].get("load_error"))
+        self.assertEqual(1, sum(1 for call in page.calls if "loadOrders" in str(call)))
 
     def test_plan_and_execute_on_ready_page(self):
         page = FakePage()
@@ -829,9 +851,17 @@ class RuntimeReadbackTests(unittest.TestCase):
         loads = {"n": 0}
 
         def evaluate(expr, arg=None, **kwargs):
-            if "loadOrder" in str(expr):
+            if "loadOrders" in str(expr) or "loadOrder" in str(expr):
                 loads["n"] += 1
                 if loads["n"] > 1:
+                    if "loadOrders" in str(expr):
+                        oids = list((arg or {}).get("oids") or ["10001"])
+                        return {
+                            "orders": [
+                                {"o_id": str(oid), "items": [], "load_error": "timeout"}
+                                for oid in oids
+                            ],
+                        }
                     return {"o_id": "10001", "items": [], "load_error": "timeout"}
             return original(expr, arg, **kwargs)
 
