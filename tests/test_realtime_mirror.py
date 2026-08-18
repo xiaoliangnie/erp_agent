@@ -193,5 +193,113 @@ class RealtimeMirrorParsingTests(unittest.TestCase):
         upserted.assert_called_once()
 
 
+class FakeSkuCursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self._rows = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def execute(self, sql, args=None):
+        self.conn.calls.append((str(sql), tuple(args or ())))
+        if "SELECT" in str(sql).upper():
+            wanted = {str(item) for item in (args or ())}
+            self._rows = [row for row in self.conn.rows if str(row["o_id"]) in wanted]
+        else:
+            self._rows = []
+
+    def executemany(self, sql, rows):
+        self.conn.calls.append((str(sql), list(rows)))
+        self.conn.inserted.extend(list(rows))
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+class FakeSkuConn:
+    def __init__(self, rows):
+        self.rows = list(rows)
+        self.calls = []
+        self.inserted = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def cursor(self):
+        return FakeSkuCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class ReplaceOrderItemSkuTests(unittest.TestCase):
+    def test_batch_uses_one_connection_and_in_clause(self):
+        from backend.realtime_mirror import replace_order_item_skus
+
+        conn = FakeSkuConn([
+            {
+                "source_key": "k1", "o_id": "1", "sku_id": "OLD",
+                "i_id": "S", "name": "垫", "properties_value": "",
+                "qty": "1", "image_url": "", "source_payload": "{}",
+            },
+            {
+                "source_key": "k2", "o_id": "2", "sku_id": "OLD",
+                "i_id": "S", "name": "垫", "properties_value": "",
+                "qty": "1", "image_url": "", "source_payload": "{}",
+            },
+            {
+                "source_key": "k3", "o_id": "3", "sku_id": "OTHER",
+                "i_id": "S", "name": "鞋", "properties_value": "",
+                "qty": "1", "image_url": "", "source_payload": "{}",
+            },
+        ])
+        connects = []
+
+        def connect(_env):
+            connects.append(1)
+            return conn
+
+        with patch("backend.realtime_mirror.connect", side_effect=connect):
+            applied = replace_order_item_skus("unused.env", [
+                {"o_id": "1", "source_sku": "OLD", "target_sku": "NEW-1"},
+                {"o_id": "2", "source_sku": "OLD", "target_sku": "NEW-2"},
+                {"o_id": "3", "source_sku": "OLD", "target_sku": "NEW-3"},
+            ])
+        self.assertEqual(1, len(connects))
+        self.assertEqual(1, conn.commits)
+        self.assertEqual(["1", "2"], applied)
+        select_sql = conn.calls[0][0]
+        self.assertIn("IN (", select_sql)
+        delete_sql = next(sql for sql, _args in conn.calls if sql.startswith("DELETE"))
+        self.assertIn("IN (", delete_sql)
+        self.assertEqual(2, len(conn.inserted))
+        self.assertEqual("NEW-1", conn.inserted[0][2])
+        self.assertEqual("NEW-2", conn.inserted[1][2])
+
+    def test_single_replace_reuses_batch(self):
+        from backend.realtime_mirror import replace_order_item_sku
+
+        conn = FakeSkuConn([{
+            "source_key": "k1", "o_id": "9", "sku_id": "OLD",
+            "i_id": "S", "name": "垫", "properties_value": "",
+            "qty": "1", "image_url": "", "source_payload": "{}",
+        }])
+        with patch("backend.realtime_mirror.connect", return_value=conn):
+            self.assertTrue(replace_order_item_sku("unused.env", "9", "OLD", "NEW"))
+        self.assertEqual(1, conn.commits)
+
+
 if __name__ == "__main__":
     unittest.main()

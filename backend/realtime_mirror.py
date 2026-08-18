@@ -779,40 +779,64 @@ def upsert_order_records(env_path: str, records: list[dict], synced_at: str) -> 
     return {"orders": len(orders), "items": len(items), "images": sum(bool(item[7]) for item in items)}
 
 
-def replace_order_item_sku(env_path: str, o_id: str, source_sku: str, target_sku: str) -> bool:
-    """把一单镜像明细里的源 SKU 换成目标。增量同步滞后时先本地跟上。"""
-    o_id = str(o_id or "").strip()
-    source_sku = str(source_sku or "").strip()
-    target_sku = str(target_sku or "").strip()
-    if not o_id or not source_sku or not target_sku or source_sku == target_sku:
-        return False
+def _sku_replacements(replacements) -> list[dict]:
+    jobs = {}
+    for item in replacements or []:
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get("o_id") or item.get("oId") or "").strip()
+        source = str(item.get("source_sku") or item.get("sourceSku") or "").strip()
+        target = str(item.get("target_sku") or item.get("targetSku") or "").strip()
+        if not oid or not source or not target or source == target:
+            continue
+        jobs[oid] = {"o_id": oid, "source_sku": source, "target_sku": target}
+    return list(jobs.values())
+
+
+def replace_order_item_skus(env_path: str, replacements: list[dict]) -> list[str]:
+    """一批把镜像明细源 SKU 换成目标。只连一次库。返回实际改到的内部单号。"""
+    jobs = _sku_replacements(replacements)
+    if not jobs:
+        return []
+    oids = [job["o_id"] for job in jobs]
     synced_at = _format_api_time(business_now())
+    applied = []
     with connect(env_path) as conn:
         try:
             with conn.cursor() as cursor:
+                marks = ",".join(["%s"] * len(oids))
                 cursor.execute(
                     f"SELECT source_key, o_id, sku_id, i_id, name, properties_value, qty, "
                     f"image_url, source_payload FROM `{ORDER_ITEM_TABLE}` "
-                    f"WHERE CAST(o_id AS CHAR)=%s",
-                    (o_id,),
+                    f"WHERE CAST(o_id AS CHAR) IN ({marks})",
+                    oids,
                 )
-                rows = list(cursor.fetchall() or [])
-                sources = [row for row in rows if str(row.get("sku_id") or "") == source_sku]
-                if not sources:
-                    return False
-                has_target = any(str(row.get("sku_id") or "") == target_sku for row in rows)
-                for row in sources:
-                    cursor.execute(
-                        f"DELETE FROM `{ORDER_ITEM_TABLE}` WHERE source_key=%s",
-                        (row["source_key"],),
+                grouped: dict[str, list[dict]] = {}
+                for row in list(cursor.fetchall() or []):
+                    grouped.setdefault(str(row.get("o_id") or ""), []).append(row)
+                delete_keys = []
+                inserts = []
+                for job in jobs:
+                    oid = job["o_id"]
+                    rows = grouped.get(oid) or []
+                    sources = [
+                        row for row in rows
+                        if str(row.get("sku_id") or "") == job["source_sku"]
+                    ]
+                    if not sources:
+                        continue
+                    has_target = any(
+                        str(row.get("sku_id") or "") == job["target_sku"] for row in rows
                     )
-                if not has_target:
-                    src = sources[0]
-                    cursor.execute(
-                        _upsert_sql(ORDER_ITEM_TABLE, ORDER_ITEM_COLUMNS),
-                        (
-                            _source_key(o_id, "", target_sku, 1),
-                            o_id, target_sku,
+                    for row in sources:
+                        key = str(row.get("source_key") or "")
+                        if key:
+                            delete_keys.append(key)
+                    if not has_target:
+                        src = sources[0]
+                        inserts.append((
+                            _source_key(oid, "", job["target_sku"], 1),
+                            oid, job["target_sku"],
                             str(src.get("i_id") or ""),
                             str(src.get("name") or ""),
                             str(src.get("properties_value") or ""),
@@ -820,13 +844,30 @@ def replace_order_item_sku(env_path: str, o_id: str, source_sku: str, target_sku
                             str(src.get("image_url") or ""),
                             src.get("source_payload") or "{}",
                             synced_at,
-                        ),
+                        ))
+                    applied.append(oid)
+                if delete_keys:
+                    marks = ",".join(["%s"] * len(delete_keys))
+                    cursor.execute(
+                        f"DELETE FROM `{ORDER_ITEM_TABLE}` WHERE source_key IN ({marks})",
+                        delete_keys,
+                    )
+                if inserts:
+                    cursor.executemany(
+                        _upsert_sql(ORDER_ITEM_TABLE, ORDER_ITEM_COLUMNS), inserts,
                     )
             conn.commit()
         except Exception:
             conn.rollback()
             raise
-    return True
+    return applied
+
+
+def replace_order_item_sku(env_path: str, o_id: str, source_sku: str, target_sku: str) -> bool:
+    """把一单镜像明细里的源 SKU 换成目标。增量同步滞后时先本地跟上。"""
+    return bool(replace_order_item_skus(env_path, [{
+        "o_id": o_id, "source_sku": source_sku, "target_sku": target_sku,
+    }]))
 
 
 def upsert_product_records(env_path: str, records: list[dict], synced_at: str) -> dict:

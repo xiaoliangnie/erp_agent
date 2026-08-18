@@ -20,7 +20,7 @@ from backend.exchange.insole import (
     execute_insole_orders, format_elapsed, format_insole_list, format_insole_result,
     load_executed_insole_writes, load_insole_writes, load_reserved_insole_orders,
     locate_insole_orders, mm_from_props, remember_insole_writes, resolve_insole_size,
-    target_sku_for_mm,
+    sync_insole_mirror, target_sku_for_mm,
 )
 
 
@@ -437,6 +437,27 @@ class ExecuteTests(unittest.TestCase):
         self.assertEqual(5, confirms[0].get("readConcurrency"))
         self.assertEqual(3, result["okCount"])
         self.assertEqual(0, result["failedCount"])
+
+    def test_sync_mirror_writes_all_orders_in_one_batch(self):
+        calls = []
+
+        def fake_batch(env_path, replacements):
+            calls.append((env_path, list(replacements)))
+            return [str(item["o_id"]) for item in replacements]
+
+        tmp = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        tmp.write("MYSQL_HOST=127.0.0.1\n")
+        tmp.close()
+        with patch("backend.realtime_mirror.replace_order_item_skus", side_effect=fake_batch):
+            result = sync_insole_mirror(tmp.name, [
+                {"o_id": "1", "target_sku": "XZ25401308-09907"},
+                {"o_id": "2", "target_sku": "XZ25401308-09908"},
+            ])
+        Path(tmp.name).unlink(missing_ok=True)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(2, len(calls[0][1]))
+        self.assertEqual(["1", "2"], result["applied"])
+        self.assertEqual(SOURCE_SKU, calls[0][1][0]["source_sku"])
 
     def test_result_log_abbreviates(self):
         text = format_insole_result({

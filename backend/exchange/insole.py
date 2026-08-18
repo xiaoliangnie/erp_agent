@@ -409,12 +409,18 @@ def sync_insole_mirror(env_path: str, writes: list[dict], *, mirror=None,
     applied = []
     if env_path and writes and Path(env_path).is_file():
         try:
-            from ..realtime_mirror import replace_order_item_sku
-            for item in writes:
-                oid = str(item.get("o_id") or "")
-                target = str(item.get("target_sku") or "")
-                if oid and target and replace_order_item_sku(env_path, oid, SOURCE_SKU, target):
-                    applied.append(oid)
+            from ..realtime_mirror import replace_order_item_skus
+            applied = replace_order_item_skus(
+                env_path,
+                [
+                    {
+                        "o_id": item.get("o_id"),
+                        "source_sku": SOURCE_SKU,
+                        "target_sku": item.get("target_sku"),
+                    }
+                    for item in writes
+                ],
+            )
         except Exception as exc:
             logger.warning("鞋垫写入后回写镜像明细失败：%s", exc)
     return {"refresh": refreshed, "applied": applied}
