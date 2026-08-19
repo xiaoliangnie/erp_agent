@@ -476,13 +476,24 @@ class ExecuteTests(unittest.TestCase):
             "elapsedMs": 63000,
             "prepareMs": 48000,
             "writeMs": 14000,
-            "readMs": 50000,
+            "beforeMs": 2000,
+            "afterMs": 18000,
+            "readMs": 20000,
             "log": [{"oId": "1", "targetSku": "XZ25401308-09907", "result": "ok"}],
         })
         self.assertIn("用时 1 分 3 秒", text)
         self.assertIn("开页 48 秒", text)
         self.assertIn("写入 14 秒", text)
-        self.assertIn("回读 50 秒", text)
+        self.assertIn("写前快照 2 秒", text)
+        self.assertIn("写后回读 18 秒", text)
+        self.assertNotIn("回读 20 秒", text)
+        legacy = format_insole_result({
+            "okCount": 1, "skippedCount": 0, "failedCount": 0,
+            "elapsedMs": 20000,
+            "readMs": 15000,
+            "log": [{"oId": "1", "targetSku": "XZ25401308-09907", "result": "ok"}],
+        })
+        self.assertIn("回读 15 秒", legacy)
 
 
 class IntentTests(unittest.TestCase):

@@ -8,7 +8,7 @@ from .errors import ErpError, ErpUnknownResult
 from ..paths import ROOT
 
 CORE_PATH = ROOT / "frontend" / "js" / "jst-order-exchange.core.js"
-CORE_VERSION = "0.7.1"
+CORE_VERSION = "0.7.2"
 
 
 def read_core(path: Path | None = None) -> str:
@@ -77,8 +77,12 @@ def load_order(page, oid: str) -> dict:
     }
 
 
-def load_orders(page, oids, *, concurrency: int = 3) -> dict:
-    """一批回读，只进一次页面。失败单带 load_error，不抛。"""
+def load_orders(page, oids, *, concurrency: int = 3, fresh: bool = False) -> dict:
+    """一批回读，只进一次页面。失败单带 load_error，不抛。
+
+    ``fresh=False``：列表行已有明细就不再 ``ReloadOrdersV2``。
+    ``fresh=True``：写入后必须刷新，不信列表缓存。
+    """
     keys = []
     for raw in oids or []:
         oid = str(raw or "").strip()
@@ -97,14 +101,16 @@ def load_orders(page, oids, *, concurrency: int = 3) -> dict:
                 const orders = [];
                 for (const oid of input.oids || []) {
                     try {
-                        orders.push(await window.JstOrderExchange.loadOrder(oid));
+                        orders.push(await window.JstOrderExchange.loadOrder(oid, {
+                            fresh: !!input.fresh,
+                        }));
                     } catch (error) {
                         orders.push({ o_id: oid, items: [], load_error: String(error) });
                     }
                 }
                 return { orders: orders, count: orders.length };
             }""",
-            {"oids": keys, "concurrency": width},
+            {"oids": keys, "concurrency": width, "fresh": bool(fresh)},
         )
     except Exception as exc:
         return {

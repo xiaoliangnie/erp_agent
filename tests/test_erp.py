@@ -106,7 +106,7 @@ class FakePage:
         self.scripts.append(content)
 
     def evaluate(self, expr, arg=None, **kwargs):
-        self.calls.append(expr)
+        self.calls.append((expr, arg))
         if self.explode and "executeJob" in str(expr):
             raise RuntimeError(self.explode)
         if "hasAcp" in str(expr) or "JstOrderExchange.ready" in str(expr):
@@ -172,6 +172,8 @@ class ExchangePageTests(unittest.TestCase):
         self.assertIn(f"const VERSION = '{exchange_page.CORE_VERSION}'", source)
         self.assertIn("concurrency", source)
         self.assertIn("loadOrders", source)
+        self.assertIn("fresh", source)
+        self.assertIn("reloadViaAcp", source)
 
     def test_load_orders_uses_one_evaluate(self):
         page = FakePage(orders={
@@ -183,6 +185,9 @@ class ExchangePageTests(unittest.TestCase):
         self.assertEqual("B", loaded["10002"]["items"][0]["sku_id"])
         self.assertTrue(loaded["10003"].get("load_error"))
         self.assertEqual(1, sum(1 for call in page.calls if "loadOrders" in str(call)))
+        fresh = exchange_page.load_orders(page, ["10001"], concurrency=5, fresh=True)
+        self.assertEqual("A", fresh["10001"]["items"][0]["sku_id"])
+        self.assertTrue(any((call[1] or {}).get("fresh") for call in page.calls if "loadOrders" in str(call[0])))
 
     def test_plan_and_execute_on_ready_page(self):
         page = FakePage()
@@ -818,6 +823,45 @@ class RuntimeReadbackTests(unittest.TestCase):
         runtime.close()
         self.assertTrue(result["succeeded"][0].get("alreadyDone"))
         self.assertFalse(any("executeJob" in str(call) for call in page.calls))
+        self.assertEqual(0, result.get("readWritten"))
+        self.assertEqual(1, sum(1 for call in page.calls if "loadOrders" in str(call)))
+
+    def test_after_read_only_reloads_written_orders(self):
+        page = FakePage(orders={
+            "10001": {"items": [{"sku_id": "OLD", "qty": 1}]},
+            "10002": {"items": [{"sku_id": "NEW", "qty": 1}]},
+        })
+        loads = []
+        original = page.evaluate
+
+        def evaluate(expr, arg=None, **kwargs):
+            if "loadOrders" in str(expr):
+                loads.append(dict(arg or {}))
+            return original(expr, arg, **kwargs)
+
+        page.evaluate = evaluate
+        runtime = self._runtime(page)
+        result = runtime.run("erp.exchange_items", {
+            "confirm": True,
+            "plans": [
+                {
+                    "o_id": "10001", "ok": True, "mode": "ChangeItem",
+                    "src_sku_id": "OLD", "new_sku_id": "NEW",
+                },
+                {
+                    "o_id": "10002", "ok": True, "mode": "ChangeItem",
+                    "src_sku_id": "OLD", "new_sku_id": "NEW",
+                },
+            ],
+        })
+        runtime.close()
+        self.assertEqual(2, len(loads))
+        self.assertFalse(loads[0].get("fresh"))
+        self.assertEqual(["10001", "10002"], list(loads[0].get("oids") or []))
+        self.assertTrue(loads[1].get("fresh"))
+        self.assertEqual(["10001"], list(loads[1].get("oids") or []))
+        self.assertEqual(1, result.get("readWritten"))
+        self.assertTrue(any(item.get("alreadyDone") for item in result["succeeded"]))
 
     def test_mismatch_is_not_success(self):
         page = FakePage(orders={"10001": {"items": [{"sku_id": "OLD", "qty": 1}]}})

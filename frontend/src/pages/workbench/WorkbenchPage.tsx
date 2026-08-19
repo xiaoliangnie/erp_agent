@@ -55,7 +55,7 @@ export default function WorkbenchPage() {
   credentialsRef.current = credentials;
 
   const load = useCallback(async () => {
-    if (!filled) throw new Error("请填写 Token、姓名和网页身份码");
+    if (!filled) throw new Error("请填写姓名，以及钉钉私信里的 20 位网页身份码");
     const auth = await ensureBound();
     setLoading(true);
     try {
@@ -112,13 +112,13 @@ export default function WorkbenchPage() {
         <section className="panel">
           <div className="panel-head">
             <strong>连接</strong>
-            <small>与采购助手共用 Token、姓名和网页身份</small>
+            <small>与采购助手共用姓名和网页身份，共享 Token 可留空</small>
           </div>
           <div className="credentials-grid" style={{ marginTop: 12 }}>
             <input
               type="password"
               autoComplete="off"
-              placeholder="AGENT_API_TOKEN"
+              placeholder="AGENT_API_TOKEN（可选）"
               value={credentials.token}
               onChange={(event) => update({ token: event.target.value })}
             />

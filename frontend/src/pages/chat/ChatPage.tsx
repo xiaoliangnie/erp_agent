@@ -16,7 +16,7 @@ const SAMPLES = [
 ];
 
 const GREETING =
-  "填好 Token、姓名，以及钉钉私信里的 20 位网页身份码后连接。助手只能通过固定工具查库和生成产物；生成合同、登记换货、发钉钉催办这类动作会先给出要点，等你点确认才执行。";
+  "填好与钉钉一致的姓名，以及私信里的 20 位网页身份码后连接。已绑定过的不用再填 Token。助手只能通过固定工具查库和生成产物；生成合同、登记换货、发钉钉催办这类动作会先给出要点，等你点确认才执行。";
 
 function readSessionKey(): string {
   const stored = sessionStorage.getItem("agentSessionKey");
@@ -48,7 +48,7 @@ export default function ChatPage() {
   }, [messages]);
 
   const connect = useCallback(async () => {
-    if (!filled) throw new Error("请填写 Token、姓名和网页身份码");
+    if (!filled) throw new Error("请填写姓名，以及钉钉私信里的 20 位网页身份码");
     const auth = await ensureBound();
     setStatus(await agentApi.get<AgentStatus>("/api/agent/status", auth));
     setMessage("");
@@ -221,7 +221,7 @@ export default function ChatPage() {
               <input
                 type="password"
                 autoComplete="off"
-                placeholder="AGENT_API_TOKEN"
+                placeholder="AGENT_API_TOKEN（可选）"
                 value={credentials.token}
                 onChange={(event) => update({ token: event.target.value })}
               />
@@ -249,8 +249,8 @@ export default function ChatPage() {
             </div>
             <div className="small" style={{ marginTop: 7 }}>
               {bound
-                ? "网页身份已绑定，存在本机。Token 只在当前标签页。群里发「绑定网页」可重新要码。"
-                : "先到钉钉群 @机器人发「绑定网页」，把私信里的 20 位码和绑定姓名填在这里。Token 只存在当前标签页。"}
+                ? "网页身份已绑定，存在本机。共享 Token 可留空。群里发「绑定网页」可重新要码。"
+                : "先到钉钉群 @机器人发「绑定网页」，把私信里的 20 位码和绑定姓名填在这里。不要把身份码填进 Token。"}
             </div>
             <div className="statusline" style={{ marginTop: 12 }}>
               <span className={`dot ${agent?.available ? "online" : "offline"}`} />

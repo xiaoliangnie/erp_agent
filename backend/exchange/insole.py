@@ -798,12 +798,19 @@ def format_insole_result(result: dict | None, *, limit: int = 5, elapsed_ms=None
     phases = []
     prepare_ms = result.get("prepareMs")
     write_ms = result.get("writeMs")
+    before_ms = result.get("beforeMs")
+    after_ms = result.get("afterMs")
     read_ms = result.get("readMs")
     if prepare_ms not in (None, ""):
         phases.append(f"开页 {format_elapsed(prepare_ms)}")
     if write_ms not in (None, ""):
         phases.append(f"写入 {format_elapsed(write_ms)}")
-    if read_ms not in (None, ""):
+    if before_ms not in (None, "") or after_ms not in (None, ""):
+        if before_ms not in (None, ""):
+            phases.append(f"写前快照 {format_elapsed(before_ms)}")
+        if after_ms not in (None, ""):
+            phases.append(f"写后回读 {format_elapsed(after_ms)}")
+    elif read_ms not in (None, ""):
         phases.append(f"回读 {format_elapsed(read_ms)}")
     if phases:
         headline += f"（{'，'.join(phases)}）"
@@ -899,6 +906,8 @@ def execute_insole_orders(runtime: Any, orders: list[dict]) -> dict:
             "prepareMs": prepare_ms,
             "writeMs": executed.get("elapsedMs", write_ms),
             "readMs": executed.get("readMs"),
+            "beforeMs": executed.get("beforeMs"),
+            "afterMs": executed.get("afterMs"),
             "plans": planned,
             "succeeded": executed.get("succeeded") or [],
             "failed": executed.get("failed") or [],

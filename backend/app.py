@@ -159,7 +159,7 @@ DROPSHIP_SCHEDULER = DailyDropshipScheduler(
     root=ROOT,
     env_path=REALTIME_ENV_PATH,
     send_time=setting("DROPSHIP_SCHEDULE_TIME", "14:00"),
-    prepare_lead_minutes=int(setting("DROPSHIP_PREPARE_LEAD_MINUTES", "10") or 10),
+    prepare_lead_minutes=int(setting("DROPSHIP_PREPARE_LEAD_MINUTES", "0") or 0),
     enabled=flag(setting("DROPSHIP_SCHEDULE_ENABLED", "false")),
     conversation_id=setting("DROPSHIP_GROUP_CONVERSATION_ID", "")
     or setting("DINGTALK_GROUP_CONVERSATION_ID", ""),
@@ -612,18 +612,29 @@ class Handler(BaseHTTPRequestHandler):
             parse_constant=_reject_json_constant,
         )
 
-    def require_agent_token(self):
+    def require_agent_token(self, *, allow_web_session=False):
         expected = setting("AGENT_API_TOKEN", "").strip()
-        if not expected:
-            self.json_response({"ok": False, "error": "Agent 接口尚未配置 AGENT_API_TOKEN"}, 503)
-            return False
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer "):
             supplied = supplied[7:]
-        if not _tokens_equal(supplied, expected):
-            self.json_response({"ok": False, "error": "Agent 接口认证失败"}, 401)
+        supplied = supplied.strip()
+        if expected and _tokens_equal(supplied, expected):
+            return True
+        if allow_web_session:
+            web_token = self.agent_web_token()
+            if web_token and WEB_AUTH.get_session(web_token):
+                return True
+        if not expected:
+            self.json_response({"ok": False, "error": "Agent 接口尚未配置 AGENT_API_TOKEN"}, 503)
             return False
-        return True
+        if allow_web_session:
+            self.json_response({
+                "ok": False,
+                "error": "请先用钉钉「绑定网页」的 20 位码绑定，或填写正确的 AGENT_API_TOKEN。不要把身份码填进 Token 框。",
+            }, 401)
+            return False
+        self.json_response({"ok": False, "error": "Agent 接口认证失败"}, 401)
+        return False
 
     def require_exchange_token(self, *, worker=False):
         name = "EXCHANGE_WORKER_TOKEN" if worker else "EXCHANGE_API_TOKEN"
@@ -833,7 +844,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.json_response({"ok": False, "error": "Agent 接口暂时不可用"}, 500)
 
     def agent_get(self, path, parsed):
-        if not self.require_agent_token():
+        forecast = path.startswith("/api/forecast/")
+        if not self.require_agent_token(allow_web_session=not forecast):
             return
         try:
             query = parse_qs(parsed.query)
@@ -941,17 +953,19 @@ class Handler(BaseHTTPRequestHandler):
             self.agent_error(exc)
 
     def agent_post(self, path):
-        if not self.require_agent_token():
-            return
         try:
-            body = self.read_json_body(max_size=2 * 1024 * 1024)
             if path == "/api/agent/web-bind":
+                body = self.read_json_body(max_size=2 * 1024 * 1024)
                 result = WEB_AUTH.consume_code(
                     operator=self.agent_operator(body),
                     code=str(body.get("code") or body.get("bindCode") or ""),
                     directory=STAFF_DIRECTORY,
                 )
                 return self.json_response({"ok": True, **result})
+            forecast = path.startswith("/api/forecast/")
+            if not self.require_agent_token(allow_web_session=not forecast):
+                return
+            body = self.read_json_body(max_size=2 * 1024 * 1024)
             if path == "/api/forecast/predict":
                 return self.json_response(FORECAST.predict(
                     body.get("keys") or body.get("skus") or [],
@@ -1426,9 +1440,8 @@ def main():
     DROPSHIP_SCHEDULER.start()
     if DROPSHIP_SCHEDULER.enabled:
         logger.info(
-            "每日代发已启用：%s 备表、%s 发群并私聊（不覆盖已填表）",
+            "每日代发已启用：%s 开始抓取，抓到后发群并私聊（不覆盖已填表）",
             DROPSHIP_SCHEDULER.status()["prepareTime"],
-            DROPSHIP_SCHEDULER.status()["sendTime"],
         )
     MAINTENANCE.start()
     JOB_WORKER.start()

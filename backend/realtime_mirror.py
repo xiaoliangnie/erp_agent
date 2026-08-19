@@ -49,6 +49,8 @@ ORDER_TABLE = "realtime_orders"
 ORDER_ITEM_TABLE = "realtime_order_items"
 PRODUCT_TABLE = "realtime_products"
 SUPPLIER_TABLE = "realtime_suppliers"
+PURCHASEIN_TABLE = "realtime_purchase_inbounds"
+PURCHASEIN_ITEM_TABLE = "realtime_purchase_inbound_items"
 SYNC_STATE_TABLE = "realtime_sync_state"
 
 PURCHASE_ROUTE = "/api/proxy/v1/jushuitan/purchase/orders/query"
@@ -56,6 +58,8 @@ PURCHASE_ROUTE = "/api/proxy/v1/jushuitan/purchase/orders/query"
 ORDER_ROUTE = "/api/proxy/v1/jushuitan/orders/search"
 PRODUCT_ROUTE = "/api/proxy/v1/jushuitan/items/query"
 SUPPLIER_ROUTE = "/api/proxy/v1/jushuitan/suppliers/query"
+PURCHASEIN_ROUTE = "/api/proxy/v1/jushuitan/purchase/inbound/query"
+SYNC_SOURCES = ("purchase", "orders", "products", "suppliers", "purchasein")
 
 SCHEMA_SQL = [
     f"""
@@ -212,6 +216,51 @@ SCHEMA_SQL = [
         api_synced_at DATETIME NOT NULL,
         KEY idx_supplier_modified (modified),
         KEY idx_supplier_name (name)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS `{PURCHASEIN_TABLE}` (
+        io_id VARCHAR(64) NOT NULL PRIMARY KEY,
+        po_id VARCHAR(64) NOT NULL DEFAULT '',
+        so_id VARCHAR(128) NOT NULL DEFAULT '',
+        status VARCHAR(64) NOT NULL DEFAULT '',
+        supplier_id VARCHAR(128) NOT NULL DEFAULT '',
+        supplier_name VARCHAR(255) NOT NULL DEFAULT '',
+        warehouse VARCHAR(255) NOT NULL DEFAULT '',
+        wh_id VARCHAR(128) NOT NULL DEFAULT '',
+        wms_co_id VARCHAR(128) NOT NULL DEFAULT '',
+        io_date DATETIME NULL,
+        created DATETIME NULL,
+        modified DATETIME NULL,
+        io_type VARCHAR(64) NOT NULL DEFAULT '',
+        labels VARCHAR(512) NOT NULL DEFAULT '',
+        remark TEXT NULL,
+        creator_name VARCHAR(128) NOT NULL DEFAULT '',
+        source_payload JSON NULL,
+        api_synced_at DATETIME NOT NULL,
+        KEY idx_purchasein_po (po_id),
+        KEY idx_purchasein_io_date (io_date),
+        KEY idx_purchasein_modified (modified)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS `{PURCHASEIN_ITEM_TABLE}` (
+        source_key CHAR(64) NOT NULL PRIMARY KEY,
+        io_id VARCHAR(64) NOT NULL,
+        ioi_id VARCHAR(64) NOT NULL DEFAULT '',
+        po_id VARCHAR(64) NOT NULL DEFAULT '',
+        sku_id VARCHAR(128) NOT NULL DEFAULT '',
+        i_id VARCHAR(128) NOT NULL DEFAULT '',
+        name VARCHAR(255) NOT NULL DEFAULT '',
+        properties_value VARCHAR(255) NOT NULL DEFAULT '',
+        qty DECIMAL(18, 4) NOT NULL DEFAULT 0,
+        unit VARCHAR(32) NOT NULL DEFAULT '',
+        remark TEXT NULL,
+        source_payload JSON NULL,
+        api_synced_at DATETIME NOT NULL,
+        KEY idx_purchasein_item_io (io_id),
+        KEY idx_purchasein_item_po (po_id),
+        KEY idx_purchasein_item_sku (sku_id)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     """,
     f"""
@@ -415,6 +464,53 @@ def normalize_purchase(record: dict, synced_at: str) -> tuple[tuple, list[tuple]
             _image_url(item), _text(_first(item, "remark", "memo")), _json(item), synced_at,
         ))
     return order, items, has_items
+
+
+def normalize_purchase_in(record: dict, synced_at: str) -> tuple[tuple, list[tuple], bool]:
+    """采购入库单：准交率用 io_date + po_id + sku，不抽成本价。"""
+    io_id = _text(_first(record, "io_id", "ioId"))
+    if not io_id:
+        raise MirrorError("入库接口返回记录缺少 io_id")
+    po_id = _text(_first(record, "po_id", "poId"))
+    labels = _first(record, "labels", "label")
+    if isinstance(labels, (list, dict)):
+        labels = _text(labels)
+    else:
+        labels = _text(labels)
+    header = (
+        io_id, po_id,
+        _text(_first(record, "so_id", "soId")),
+        _text(_first(record, "status", "f_status", "status_v")),
+        _text(_first(record, "supplier_id", "seller_id")),
+        _text(_first(record, "supplier_name", "seller", "seller_name")),
+        _text(_first(record, "warehouse", "wms_co_name")),
+        _text(_first(record, "wh_id", "whId")),
+        _text(_first(record, "wms_co_id", "wmsCoId")),
+        _datetime(_first(record, "io_date", "ioDate")),
+        _datetime(_first(record, "created", "create_date")),
+        _datetime(_first(record, "modified", "modified_at", "updated_at")),
+        _text(_first(record, "type", "io_type")),
+        labels[:512],
+        _text(_first(record, "remark", "extend_remark", "memo")),
+        _text(_first(record, "creator_name", "creator")),
+        _json(record), synced_at,
+    )
+    raw_items, has_items = _items_field(record)
+    items = []
+    for index, item in enumerate(raw_items):
+        ioi_id = _text(_first(item, "ioi_id", "ioiId", "item_id", default=index + 1))
+        sku_id = _text(_first(item, "sku_id", "skuId", "sku"))
+        items.append((
+            _source_key(io_id, ioi_id, sku_id, index), io_id, ioi_id, po_id, sku_id,
+            _text(_first(item, "i_id", "iId", "style_code")),
+            _text(_first(item, "name", "product_name")),
+            _text(_first(item, "properties_value", "properties", "specification")),
+            _number(_first(item, "qty", "quantity", "io_qty")),
+            _text(_first(item, "unit")),
+            _text(_first(item, "remark", "memo")),
+            _json(item), synced_at,
+        ))
+    return header, items, has_items
 
 
 def normalize_order(record: dict, synced_at: str) -> tuple[tuple, list[tuple], bool]:
@@ -726,6 +822,15 @@ SUPPLIER_COLUMNS = [
     "establish_date", "registered_capital", "business_scope", "remark", "modified",
     "source_payload", "api_synced_at",
 ]
+PURCHASEIN_COLUMNS = [
+    "io_id", "po_id", "so_id", "status", "supplier_id", "supplier_name",
+    "warehouse", "wh_id", "wms_co_id", "io_date", "created", "modified",
+    "io_type", "labels", "remark", "creator_name", "source_payload", "api_synced_at",
+]
+PURCHASEIN_ITEM_COLUMNS = [
+    "source_key", "io_id", "ioi_id", "po_id", "sku_id", "i_id", "name",
+    "properties_value", "qty", "unit", "remark", "source_payload", "api_synced_at",
+]
 
 
 def _upsert_sql(table: str, columns: list[str]) -> str:
@@ -898,6 +1003,42 @@ def upsert_supplier_records(env_path: str, records: list[dict], synced_at: str) 
     return {"records": len(suppliers)}
 
 
+def upsert_purchase_in_records(env_path: str, records: list[dict], synced_at: str) -> dict:
+    orders = []
+    items = []
+    replaced = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if not _text(_first(record, "io_id", "ioId")):
+            continue
+        header, lines, has_items = normalize_purchase_in(record, synced_at)
+        orders.append(header)
+        items.extend(lines)
+        if has_items:
+            replaced.append(header[0])
+    with connect(env_path) as conn:
+        try:
+            with conn.cursor() as cursor:
+                if orders:
+                    cursor.executemany(_upsert_sql(PURCHASEIN_TABLE, PURCHASEIN_COLUMNS), orders)
+                if replaced:
+                    marks = ",".join(["%s"] * len(replaced))
+                    cursor.execute(
+                        f"DELETE FROM `{PURCHASEIN_ITEM_TABLE}` WHERE io_id IN ({marks})",
+                        replaced,
+                    )
+                if items:
+                    cursor.executemany(
+                        _upsert_sql(PURCHASEIN_ITEM_TABLE, PURCHASEIN_ITEM_COLUMNS), items,
+                    )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    return {"orders": len(orders), "items": len(items)}
+
+
 def sync_state(
     env_path: str, source_name: str | None = None, *, ensure: bool = True,
 ) -> dict | list[dict]:
@@ -961,6 +1102,7 @@ class RealtimeMirror:
         *,
         page_size: int = 50,
         initial_days: int = 30,
+        purchasein_initial_days: int | None = None,
         overlap_minutes: int = 5,
         chunk_days: int = 7,
         request_interval: float = 1.05,
@@ -970,7 +1112,12 @@ class RealtimeMirror:
         self.client = client
         # orders.search 官方建议不超过 50；采购接口同用该值以保证统一限流。
         self.page_size = max(1, min(int(page_size), 50))
+        # purchasein.query 官方 max_page_size=100，首轮回溯用满页。
+        self.purchasein_page_size = 100
         self.initial_days = max(1, int(initial_days))
+        self.purchasein_initial_days = max(
+            1, int(purchasein_initial_days if purchasein_initial_days is not None else 2000),
+        )
         self.overlap = timedelta(minutes=max(0, int(overlap_minutes)))
         self.chunk = timedelta(days=max(1, int(chunk_days)))
         self.request_interval = max(0, float(request_interval))
@@ -1002,7 +1149,7 @@ class RealtimeMirror:
             self._ensure_schema()
             result = {}
             errors = []
-            for source in ("purchase", "orders", "products", "suppliers"):
+            for source in SYNC_SOURCES:
                 for attempt in range(2):
                     try:
                         result[source] = self.sync_source(source, since=since, until=until)
@@ -1023,14 +1170,15 @@ class RealtimeMirror:
     def sync_source(
         self, source: str, *, since: datetime | None = None, until: datetime | None = None,
     ) -> dict:
-        if source not in ("purchase", "orders", "products", "suppliers"):
-            raise ValueError("source 只能是 purchase、orders、products 或 suppliers")
+        if source not in SYNC_SOURCES:
+            raise ValueError("source 只能是 " + "、".join(SYNC_SOURCES))
         self._ensure_schema()
         now = business_now()
         end = until or now
         state = sync_state(self.env_path, source, ensure=False)
         watermark = _parse_time(state.get("watermark_modified")) if state else None
-        begin = since or ((watermark - self.overlap) if watermark else (end - timedelta(days=self.initial_days)))
+        lookback = self.purchasein_initial_days if source == "purchasein" else self.initial_days
+        begin = since or ((watermark - self.overlap) if watermark else (end - timedelta(days=lookback)))
         if begin >= end:
             begin = end - max(self.overlap, timedelta(minutes=1))
         started = _format_api_time(now)
@@ -1083,9 +1231,10 @@ class RealtimeMirror:
                 window_end = min(window_start + self.chunk, end)
                 page = 1
                 while True:
+                    width = self.purchasein_page_size if source == "purchasein" else self.page_size
                     body = {
                         "page_index": page,
-                        "page_size": self.page_size,
+                        "page_size": width,
                         "modified_begin": _format_api_time(window_start),
                         "modified_end": _format_api_time(window_end),
                     }
@@ -1094,9 +1243,10 @@ class RealtimeMirror:
                         "orders": ORDER_ROUTE,
                         "products": PRODUCT_ROUTE,
                         "suppliers": SUPPLIER_ROUTE,
+                        "purchasein": PURCHASEIN_ROUTE,
                     }[source]
                     value = self.client.post(route, body)
-                    records, more, request_id = extract_page(value, page, self.page_size)
+                    records, more, request_id = extract_page(value, page, width)
                     synced_at = _format_api_time(business_now())
                     if source == "purchase":
                         counts = upsert_purchase_records(self.env_path, records, synced_at)
@@ -1106,6 +1256,9 @@ class RealtimeMirror:
                         counts["records"] = counts["orders"]
                     elif source == "products":
                         counts = upsert_product_records(self.env_path, records, synced_at)
+                    elif source == "purchasein":
+                        counts = upsert_purchase_in_records(self.env_path, records, synced_at)
+                        counts["records"] = counts["orders"]
                     else:
                         counts = upsert_supplier_records(self.env_path, records, synced_at)
                     for key in ("records", "orders", "items", "images"):
@@ -1400,6 +1553,7 @@ def build_mirror_from_settings(
         env_path, client,
         page_size=int(setting("REALTIME_SYNC_PAGE_SIZE", "50") or 50),
         initial_days=int(setting("REALTIME_SYNC_INITIAL_DAYS", "30") or 30),
+        purchasein_initial_days=int(setting("REALTIME_PURCHASEIN_INITIAL_DAYS", "2000") or 2000),
         overlap_minutes=int(setting("REALTIME_SYNC_OVERLAP_MINUTES", "5") or 5),
         chunk_days=int(setting("REALTIME_SYNC_CHUNK_DAYS", "7") or 7),
         request_interval=float(setting("REALTIME_SYNC_REQUEST_INTERVAL", "1.05") or 1.05),

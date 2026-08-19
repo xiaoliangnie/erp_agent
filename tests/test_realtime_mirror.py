@@ -9,6 +9,7 @@ from backend.database import is_transient_mysql_error
 from backend.realtime_mirror import (
     ORDER_ROUTE,
     PRODUCT_ROUTE,
+    PURCHASEIN_ROUTE,
     SUPPLIER_ROUTE,
     ProxyAPIError,
     RealtimeMirror,
@@ -18,6 +19,7 @@ from backend.realtime_mirror import (
     normalize_order,
     normalize_product,
     normalize_purchase,
+    normalize_purchase_in,
     normalize_supplier,
 )
 
@@ -32,6 +34,7 @@ class RealtimeMirrorParsingTests(unittest.TestCase):
         self.assertEqual("/api/proxy/v1/jushuitan/orders/search", ORDER_ROUTE)
         self.assertEqual("/api/proxy/v1/jushuitan/items/query", PRODUCT_ROUTE)
         self.assertEqual("/api/proxy/v1/jushuitan/suppliers/query", SUPPLIER_ROUTE)
+        self.assertEqual("/api/proxy/v1/jushuitan/purchase/inbound/query", PURCHASEIN_ROUTE)
 
     def test_extracts_nested_proxy_page_and_request_id(self):
         value = {
@@ -95,6 +98,60 @@ class RealtimeMirrorParsingTests(unittest.TestCase):
         self.assertTrue(has_items)
         self.assertEqual("SKU-01", items[0][3])
         self.assertEqual("https://img.example/large.jpg", items[0][19])
+
+    def test_normalizes_purchase_inbound_without_cost_columns(self):
+        header, items, has_items = normalize_purchase_in({
+            "io_id": "IO-01",
+            "po_id": "604264",
+            "io_date": "2026-08-01 10:00:00",
+            "status": "Confirmed",
+            "supplier_name": "供应商甲",
+            "items": [{
+                "ioi_id": "9",
+                "sku_id": "SKU-01",
+                "i_id": "STYLE-01",
+                "name": "测试商品",
+                "qty": 2,
+                "cost_price": 99,
+            }],
+        }, "2026-08-19 10:00:00")
+        self.assertEqual("IO-01", header[0])
+        self.assertEqual("604264", header[1])
+        self.assertEqual("2026-08-01 10:00:00", header[9])
+        self.assertTrue(has_items)
+        self.assertEqual("SKU-01", items[0][4])
+        self.assertEqual("2", items[0][8])
+        self.assertNotIn(99, items[0])
+
+    def test_purchasein_sync_uses_inbound_route(self):
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, route, body):
+                self.calls.append((route, body))
+                return {
+                    "request_id": "req-in",
+                    "data": {"code": 0, "datas": [{
+                        "io_id": "IO-02", "po_id": "1", "io_date": "2026-08-01 00:00:00",
+                        "items": [{"sku_id": "A", "qty": 1}],
+                    }]},
+                }
+
+        client = FakeClient()
+        mirror = RealtimeMirror("unused.env", client, request_interval=0, purchasein_initial_days=1)
+        with patch("backend.realtime_mirror.sync_state", return_value={}), \
+                patch("backend.realtime_mirror._state_update"), \
+                patch("backend.realtime_mirror.RealtimeMirror._ensure_schema"), \
+                patch(
+                    "backend.realtime_mirror.upsert_purchase_in_records",
+                    return_value={"orders": 1, "items": 1},
+                ) as upserted:
+            result = mirror.sync_source("purchasein")
+        self.assertTrue(result["ok"])
+        self.assertEqual(PURCHASEIN_ROUTE, client.calls[0][0])
+        self.assertEqual(100, client.calls[0][1]["page_size"])
+        upserted.assert_called()
 
     def test_order_without_items_does_not_request_item_replacement(self):
         order, items, has_items = normalize_order({

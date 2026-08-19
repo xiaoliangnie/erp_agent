@@ -58,17 +58,17 @@ def is_confirmed_admin_name(name: str) -> bool:
     return False
 
 
-# 先不合并，只记录。重新跑 seed 也不会把它们建成 User。
+# 2026-08-19 已拍板：这些署名明确不要入 users。列表只用来挡住自动种子。
 DEFERRED_ALIAS_REVIEWS = (
-    {"aliases": ("黄娟25",), "related": "黄娟", "reason": "digit_suffix", "note": "先不管"},
-    {"aliases": ("戴启伟17",), "related": "戴启伟", "reason": "digit_suffix", "note": "先不管"},
-    {"aliases": ("熊凯丽1&10",), "related": "熊凯丽", "reason": "digit_suffix", "note": "先不管"},
-    {"aliases": ("魏大可（01）",), "related": "", "reason": "code_in_parentheses", "note": "先不管"},
-    {"aliases": ("吴慧（03）",), "related": "", "reason": "code_in_parentheses", "note": "先不管"},
-    {"aliases": ("小溪-商品实习生",), "related": "", "reason": "role_or_temp", "note": "先不管"},
-    {"aliases": ("临时-张龙祥", "临时工-夏梓轩", "临时工-涂猛", "临时工-赵祥兵"), "related": "", "reason": "temp_worker", "note": "先不管"},
-    {"aliases": ("杭州仓-利特",), "related": "李佳冬/利特", "reason": "warehouse_prefix", "note": "先不管，未并入利特"},
-    {"aliases": ("无际云帆-协助机", "邹灵念11"), "related": "", "reason": "not_person_like", "note": "先不管"},
+    {"aliases": ("黄娟25",), "related": "黄娟", "reason": "digit_suffix", "note": "不要"},
+    {"aliases": ("戴启伟17",), "related": "戴启伟", "reason": "digit_suffix", "note": "不要"},
+    {"aliases": ("熊凯丽1&10",), "related": "熊凯丽", "reason": "digit_suffix", "note": "不要"},
+    {"aliases": ("魏大可（01）",), "related": "", "reason": "code_in_parentheses", "note": "不要"},
+    {"aliases": ("吴慧（03）",), "related": "", "reason": "code_in_parentheses", "note": "不要"},
+    {"aliases": ("小溪-商品实习生",), "related": "", "reason": "role_or_temp", "note": "不要"},
+    {"aliases": ("临时-张龙祥", "临时工-夏梓轩", "临时工-涂猛", "临时工-赵祥兵"), "related": "", "reason": "temp_worker", "note": "不要"},
+    {"aliases": ("杭州仓-利特",), "related": "李佳冬/利特", "reason": "warehouse_prefix", "note": "不要，未并入利特"},
+    {"aliases": ("无际云帆-协助机", "邹灵念11"), "related": "", "reason": "not_person_like", "note": "不要"},
 )
 
 

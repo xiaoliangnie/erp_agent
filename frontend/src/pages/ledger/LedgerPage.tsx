@@ -171,7 +171,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
   async function sendReminders() {
     if (needCount === 0 || pushing) return;
     if (!filled) {
-      setPushNote("请先填写 Token、姓名和钉钉私信里的网页身份码，再发送提醒。");
+      setPushNote("请先填写姓名和钉钉私信里的网页身份码，再发送提醒。");
       return;
     }
     const who = buyerName ? `（仅 ${buyerName}）` : "";
@@ -366,7 +366,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
                 <input
                   type="password"
                   autoComplete="off"
-                  placeholder="AGENT_API_TOKEN"
+                  placeholder="AGENT_API_TOKEN（可选）"
                   value={credentials.token}
                   onChange={(event) => update({ token: event.target.value })}
                 />

@@ -12,6 +12,6 @@
 | [`预测.md`](预测.md) | 需求、F0 / F0.1 公式语义、ERP 对照、怎么换 Forecaster |
 | [`接口参考.md`](接口参考.md) | 聚水潭 `#_jt_data`、供应链代理 API |
 
-种子扫描报告仍写到 `reports/user_identity_analysis.md`（`scripts/seed_users.py` 生成，不是设计文档）。
+点状报告在 `reports/`：身份扫描 `user_identity_analysis.md`，预测第一次出数 [`reports/预测数据与基线分析.md`](reports/预测数据与基线分析.md)。都不是设计文档。
 
 归档原文里**现在还要用的结论**已经写进上面四份。[`archive/`](archive/) 只留 V5 / 0817 任务书 / 调研全文备查，不要再当执行依据，也不要往里加新执行项。

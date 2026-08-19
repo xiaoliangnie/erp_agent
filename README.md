@@ -33,7 +33,7 @@ Playwright Digital Worker 打开已登录的聚水潭订单页，注入 `jst-ord
   钉钉直接回复「确认」（不用带编号、不用去换货页）后，由后端 Playwright **串行**写入；
   写入后回读订单明细，源 SKU 还应在或目标 SKU 没出现则不记成功；已经是目标 SKU 则跳过改单。
   证据 JSON 落 `files/data/erp-evidence/`，不信页面返回「成功」。
-  先回「已开始写入」，写完再发一条【任务完成】结果日志（用时拆成开页 / 写入 / 回读；写前写后回读一批进页面，最多 5 路。清单和结果都只展开 5 条：单号、状态、鞋码、目标鞋垫）。
+  先回「已开始写入」，写完再发一条【任务完成】结果日志（用时拆成开页 / 写入 / 写前快照 / 写后回读。写前用列表缓存，不 Reload；写后只刷新改过的单，Reload 走 `_ACP` 异步最多 5 路。清单和结果都只展开 5 条：单号、状态、鞋码、目标鞋垫）。
   `server.py` 启动后保活 ERP 登录态（浏览器 + `erp-ai-state.json`），进程退出再关浏览器，不固定停在订单列表；代发和以后的合同页自动化共用。
   可用 `ERP_AI_KEEPALIVE_ENABLED=false` 关掉保活（写入仍会在用到时再登录）。
   浏览器只打开一次订单页，后续按尺码试算/写入复用同一页，速度与本地批量脚本同一量级。半码按码数舍去小数再换算毫米（`40.5` → `40` → `250mm` → `09906`）；
@@ -182,7 +182,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 - `realtime_orders`：内部订单号、线上单号、日期、状态和店铺。
 - `realtime_order_items`：订单 SKU、款式、名称、规格和数量。
 
-`realtime_sync_state` 单独记录采购单、订单、商品和供应商的成功水位、最近 `request_id` 和错误。增量任务
+`realtime_sync_state` 单独记录采购单、订单、入库单、商品和供应商的成功水位、最近 `request_id` 和错误。增量任务
 默认每 60 秒运行一次，回看 5 分钟覆盖边界更新，API 调用不超过代理的 60 次/分钟限制。
 服务启动后默认错峰 30 秒再执行首轮同步，避免与首次看板年度数据加载同时压远程镜像库。
 修改 `.env` 中 `REALTIME_SYNC_*` 可调整周期、初次回溯天数、分页和窗口。订单接口每页最多
@@ -195,6 +195,7 @@ npm install && npm run build        # 前端产物落 frontend/dist/
 ```bash
 .venv/bin/python scripts/sync_realtime_mirror.py --source all
 .venv/bin/python scripts/sync_realtime_mirror.py --source purchase --since 2026-07-01T00:00:00+08:00
+.venv/bin/python scripts/sync_realtime_mirror.py --source purchasein
 ```
 
 国标目录不走供应链代理，而是读 `https://std.samr.gov.cn/` 高级检索的公开 JSON
@@ -333,8 +334,9 @@ Agent 或命令行也可调用同一能力：
 筛选只勾异常类型「代发订单未安排」，走筛选 iframe 的 `FullSearch()`。
 
 Excel 对齐 `8.15代发.xlsx`：Sheet1 28 列（线上订单号、省份、买家留言、标准商品名隐藏）、
-Sheet2 17 列供应商子集。一行一个 SKU。收货明文来自订单页揭开；商品裸价来自列表
-`price` / `base_price`；供应商、成本价、供应商款号列表页没有，先按 SKU 补镜像
+Sheet2 17 列供应商子集。一行一个 SKU。收货明文来自订单页揭开。商品裸价对齐系统「商品裸价金额」：优先写
+明细 `amount` / `sale_amount`，没有则用裸价单价（`base_price`，否则 `price`）× 数量；
+不从商品主数据兜底单价。供应商、成本价、供应商款号列表页没有，先按 SKU 补镜像
 `realtime_products`，缺的再走页面 `_CallPage('GetSku')`。快递单号写 `l_id` /
 `multiWaybillLid` / `plat_l_id`；代发未安排多数还没有运单。店铺主账号不用买家账号。
 空白模板（只刷新母版，不覆盖当日已填文件）：
@@ -346,7 +348,7 @@ Sheet2 17 列供应商子集。一行一个 SKU。收货明文来自订单页揭
 
 母版是 `files/templates/代发订单模板.xlsx`。`--live` 写出当日
 `files/outputs/dropship/YYMMDD-代发.xlsx`。日期用东八区业务日。
-定时：13:50 抓 ERP 备表，14:00 发群并私聊安安；通知写「数据截至」抓表完成时刻。
+定时：14:00 开始抓 ERP，抓到后立刻发群并私聊安安；通知写「数据截至」抓表完成时刻。
 揭收货被限流时点内部单号，其余收货人/手机/地址齐了再写「都齐了」。已填表不覆盖。
 对话里同一条链路是 L1 工具 `generate_dropship_workbook`：先确认，再抓 ERP，
 返回单数/行数等摘要，收货明文只进 Excel。导出页写明淘宝/天猫不支持明文导出，
@@ -456,8 +458,10 @@ L0 直接执行；**L1/L2 一律不直接执行**：先落一条 `pending_action
 先用导出的 CSV 训练打通链路：
 
 ```bash
-# CSV 至少要有 SKU、日期、数量三列；F1 导出目录是 D:\Predict_DATA（不进镜像）
-.venv/bin/python scripts/train_forecast_model.py --csv D:/Predict_DATA/csv/销售出库明细.csv --holdout-days 14
+# 先出质量 / 回测 / k_H，不写线上 FORECAST_MODEL_DIR
+.venv/bin/python scripts/run_forecast_prep.py
+# 要接线上再训（默认仍是仓库里的 Baseline 占位）
+.venv/bin/python scripts/train_forecast_model.py --csv D:/Predict_DATA/csv/销售出库日汇总.csv --holdout-days 14
 ```
 
 **接入自己训练好的模型**：继承 `Forecaster` 实现 `fit` / `predict`，训练时加
@@ -655,6 +659,20 @@ AGENT_MODEL=gpt-5.6-sol
   `AGENT_API_TOKEN` 和绑定过的姓名；当日已成功推过同一批会提示「当日已推」
 - 点任意一行开抽屉：该单三档排期的具体日期 + 商品明细（颜色、规格、逐行交期与入库）
 - 供应商名称取实时主表 `seller`
+
+---
+
+# 准交率（自营百货）
+
+跟单三档看的是**还没入完**的单。准交率看的是**已经发生过入库**（含已完成）的履约，两套数字不要混。
+2026-08-19 冻结，**还没有上页面**；缺入库单表时算不出来，禁止用关单日或「今天」代替第一票入库时间。
+
+- **范围**：采购员按现有花名规则命中刃海、静静的采购单。镜像里常见署名为 `洪静茹(静静）`、`李迎(刃海)`；只写 `刃海` 的也算刃海。不要用店铺分组或「百货采购在途」反推。
+- **协议到货日**：明细 `item_delivery_date`；空则退到 `最早预计到货日期`；都空记未排期，**不进率、不猜日期**。
+- **准交**：该行**第一张采购入库单**的 `io_date` **早于**协议到货日（`<`，当天到不算准）。
+- **百货按首批**：只看第一票。后面几票晚到不影响。未入完且今天已过协议日 → 不准；未到期 → 观察中，不进分母。
+- **数据**：入库事件来自代理 `purchasein.query`，镜像表 `realtime_purchase_inbounds` / `realtime_purchase_inbound_items`（`io_id / io_date / po_id / sku / qty`）。首次回溯约 `REALTIME_PURCHASEIN_INITIAL_DAYS`（默认 2000 天）。还没有准交率页面。
+- **不做**：供应商分级产品、用准交率自动改下单。以后只读指标给 `supplier_scorecard`。
 
 ---
 

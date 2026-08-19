@@ -186,7 +186,7 @@ class DigitalRuntime:
 
     def _execute_with_evidence(self, command: str, payload: dict, *,
                                delay_ms: int, concurrency: int) -> dict:
-        """写入前快照 → 已换过的跳过 → 执行 → 回读 → 对不上不记成功。"""
+        """写前用列表缓存快照 → 已换过的跳过 → 执行 → 只刷新写过的单 → 对不上不记成功。"""
         plans = [item for item in evidence.plans_from_payload(payload) if item.get("ok")]
         expected = [evidence.expected_from_plan(item) for item in plans]
         oids = [item["oId"] for item in expected if item["oId"]]
@@ -198,7 +198,7 @@ class DigitalRuntime:
         unread = []
         before_started = time.monotonic()
         loaded = exchange_page.load_orders(
-            self.session.page, oids, concurrency=read_width,
+            self.session.page, oids, concurrency=read_width, fresh=False,
         )
         for oid in oids:
             snap = evidence.snapshot_from_order(loaded.get(oid))
@@ -246,13 +246,23 @@ class DigitalRuntime:
             oid = evidence.oid_of(plan)
             result.setdefault("succeeded", []).append({"o_id": oid, "alreadyDone": True})
 
+        written_oids = []
+        for item in to_write:
+            oid = evidence.oid_of(item)
+            if oid and oid not in written_oids:
+                written_oids.append(oid)
         after = {}
         after_started = time.monotonic()
-        loaded = exchange_page.load_orders(
-            self.session.page, oids, concurrency=read_width,
-        )
-        for oid in oids:
-            after[oid] = evidence.snapshot_from_order(loaded.get(oid))
+        if written_oids:
+            loaded = exchange_page.load_orders(
+                self.session.page, written_oids, concurrency=read_width, fresh=True,
+            )
+            for oid in written_oids:
+                after[oid] = evidence.snapshot_from_order(loaded.get(oid))
+        for plan in already:
+            oid = evidence.oid_of(plan)
+            if oid:
+                after.setdefault(oid, before.get(oid) or {})
         after_ms = int((time.monotonic() - after_started) * 1000)
         if folder is not None and callable(screenshot):
             screenshot(folder / "after.png")
@@ -276,8 +286,11 @@ class DigitalRuntime:
             },
         )
         result["evidence"] = bundle
+        result["beforeMs"] = before_ms
+        result["afterMs"] = after_ms
         result["readMs"] = before_ms + after_ms
         result["readConcurrency"] = read_width
+        result["readWritten"] = len(written_oids)
         if write_error is not None or recon.get("status") == "unknown":
             raise ErpUnknownResult(
                 str(write_error or "写入后回读失败，结果未知，未重试")

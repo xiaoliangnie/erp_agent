@@ -43,8 +43,8 @@ export function useCredentials(prefix: string) {
   const hasToken = credentials.token.trim() !== "";
   const hasName = credentials.operator.trim() !== "";
   const hasWeb = prefix !== "agent" || Boolean(credentials.webToken?.trim());
-  const canBind = prefix === "agent" && hasToken && hasName && Boolean(credentials.bindCode?.trim());
-  const filled = hasToken && hasName && (hasWeb || canBind);
+  const canBind = prefix === "agent" && hasName && Boolean(credentials.bindCode?.trim());
+  const filled = prefix === "agent" ? hasName && (hasWeb || canBind) : hasToken && hasName;
   const bound = prefix !== "agent" || Boolean(credentials.webToken?.trim());
 
   const ensureBound = useCallback(async () => {

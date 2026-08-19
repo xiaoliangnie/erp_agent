@@ -28,11 +28,11 @@ def parsed_time(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="同步订单、采购单、商品和供应商到 MySQL 实时镜像")
+    parser = argparse.ArgumentParser(description="同步订单、采购单、入库单、商品和供应商到 MySQL 实时镜像")
     parser.add_argument("--env", default=str(ROOT / "hanli.env"), help="目标 MySQL env 文件")
     parser.add_argument("--config", default=str(ROOT / ".env"), help="API 配置文件")
     parser.add_argument(
-        "--source", choices=["all", "purchase", "orders", "products", "suppliers"],
+        "--source", choices=["all", "purchase", "orders", "products", "suppliers", "purchasein"],
         default="all",
     )
     parser.add_argument("--since", help="覆盖同步开始时间（ISO 8601）")
@@ -62,6 +62,7 @@ def main():
         args.env, client,
         page_size=int(setting(values, "REALTIME_SYNC_PAGE_SIZE", "50") or 50),
         initial_days=int(setting(values, "REALTIME_SYNC_INITIAL_DAYS", "30") or 30),
+        purchasein_initial_days=int(setting(values, "REALTIME_PURCHASEIN_INITIAL_DAYS", "2000") or 2000),
         overlap_minutes=int(setting(values, "REALTIME_SYNC_OVERLAP_MINUTES", "5") or 5),
         chunk_days=int(setting(values, "REALTIME_SYNC_CHUNK_DAYS", "7") or 7),
         request_interval=float(setting(values, "REALTIME_SYNC_REQUEST_INTERVAL", "1.05") or 1.05),

@@ -1215,6 +1215,8 @@ def _process_insole(arguments, ctx):
         "prepareMs": result.get("prepareMs"),
         "writeMs": result.get("writeMs"),
         "readMs": result.get("readMs"),
+        "beforeMs": result.get("beforeMs"),
+        "afterMs": result.get("afterMs"),
         "oIds": [row["o_id"] for row in located["processable"]],
         "failed": result.get("failed") or [],
         "log": log,

@@ -30,10 +30,11 @@
 (function (root) {
   'use strict';
 
-  const VERSION = '0.7.1';
+  const VERSION = '0.7.2';
   const DEFAULT_WRITE_DELAY_MS = 250;
   const DEFAULT_WRITE_CONCURRENCY = 1;
   const MAX_WRITE_CONCURRENCY = 8;
+  const ACP_RELOAD_TIMEOUT_MS = 8000;
   const DEFAULT_FORBIDDEN = '取消|退款|关闭|Cancelled|Delete|Merged';
 
   function erp() {
@@ -56,6 +57,21 @@
         reject(error);
       }
     });
+  }
+
+  function acpTimeout(method, timeoutMs) {
+    const args = Array.prototype.slice.call(arguments, 2);
+    const limit = Math.max(500, Number(timeoutMs) || ACP_RELOAD_TIMEOUT_MS);
+    return Promise.race([
+      acp.apply(null, [method].concat(args)),
+      new Promise(function (_, reject) {
+        setTimeout(function () { reject(new Error('ACP timeout ' + method)); }, limit);
+      }),
+    ]);
+  }
+
+  function skuOf(item) {
+    return String((item && (item.sku_id || item.skuId || item.sku)) || '').trim();
   }
 
   function sleep(ms) {
@@ -101,28 +117,59 @@
     return source && (source.data || source);
   }
 
-  async function loadOrder(oid) {
+  function usableItems(order) {
+    const items = order && order.items;
+    if (!Array.isArray(items) || !items.length) return [];
+    return items.filter(function (item) { return skuOf(item); });
+  }
+
+  // _CallPage 是同步的，并发会被 JS 线程串行化。优先 _ACP 异步刷新。
+  let reloadViaAcp = true;
+
+  async function reloadOrder(oid) {
     const w = erp();
-    let order = currentOrder(oid);
-    let items = order && order.items;
-    if (typeof w._CallPage === 'function') {
+    const key = String(oid || '').trim();
+    if (!key) return null;
+    if (reloadViaAcp && typeof w._ACP === 'function') {
       try {
-        const reloaded = normalizeReload(w._CallPage('ReloadOrdersV2', String(oid), true));
-        if (reloaded && String(reloaded.o_id || oid) === String(oid)) {
-          order = Object.assign({}, order || {}, reloaded);
-          items = reloaded.items || items;
-        }
-      } catch (error) {
-        if (!order) throw new Error('读取订单 ' + oid + ' 失败：' + String(error));
+        const reloaded = normalizeReload(await acpTimeout(
+          'ReloadOrdersV2', ACP_RELOAD_TIMEOUT_MS, key, true,
+        ));
+        if (reloaded && String(reloaded.o_id || key) === key) return reloaded;
+      } catch (_) {
+        reloadViaAcp = false;
       }
     }
-    if (!order) {
-      return { o_id: String(oid), items: [], load_error: 'ERP 未返回该订单' };
+    if (typeof w._CallPage === 'function') {
+      try {
+        const reloaded = normalizeReload(w._CallPage('ReloadOrdersV2', key, true));
+        if (reloaded && String(reloaded.o_id || key) === key) return reloaded;
+      } catch (_) {}
     }
-    return Object.assign({}, order, {
-      o_id: String(oid),
-      items: Array.isArray(items) ? items : [],
-    });
+    return null;
+  }
+
+  async function loadOrder(oid, options) {
+    const spec = options && typeof options === 'object' ? options : {};
+    const fresh = spec.fresh === true;
+    const key = String(oid || '').trim();
+    const cached = currentOrder(key);
+    const cachedItems = usableItems(cached);
+    if (!fresh && cached && cachedItems.length) {
+      return Object.assign({}, cached, { o_id: key, items: cachedItems, fromCache: true });
+    }
+    const reloaded = await reloadOrder(key);
+    if (reloaded) {
+      const merged = Object.assign({}, cached || {}, reloaded);
+      return Object.assign({}, merged, { o_id: key, items: usableItems(merged) });
+    }
+    if (fresh) {
+      return { o_id: key, items: [], load_error: '写入后回读失败' };
+    }
+    if (cached && cachedItems.length) {
+      return Object.assign({}, cached, { o_id: key, items: cachedItems, fromCache: true });
+    }
+    return { o_id: key, items: [], load_error: 'ERP 未返回该订单' };
   }
 
   async function loadOrders(input) {
@@ -132,14 +179,15 @@
       const key = String(oid || '').trim();
       if (key && keys.indexOf(key) < 0) keys.push(key);
     });
+    const fresh = spec.fresh === true;
     const rows = await mapPool(keys, spec.concurrency, async function (oid) {
       try {
-        return await loadOrder(oid);
+        return await loadOrder(oid, { fresh: fresh });
       } catch (error) {
         return { o_id: oid, items: [], load_error: String(error) };
       }
     });
-    return { orders: rows, count: rows.length };
+    return { orders: rows, count: rows.length, fresh: fresh };
   }
 
   /** 只读扫描当前 ERP 订单数据集，并逐单读取明细反查 SKU。 */
@@ -168,7 +216,7 @@
     for (let index = 0; index < candidates.length; index += 1) {
       const candidate = candidates[index];
       try {
-        const order = await loadOrder(candidate.o_id);
+        const order = await loadOrder(candidate.o_id, { fresh: true });
         const lines = (order.items || []).filter(function (item) { return skuOf(item) === sku; });
         if (lines.length) {
           matches.push({
@@ -193,10 +241,6 @@
       orders: matches,
       failures: failures.slice(0, 50),
     };
-  }
-
-  function skuOf(item) {
-    return String((item && (item.sku_id || item.skuId)) || '').trim();
   }
 
   function styleOf(item) {
@@ -347,7 +391,7 @@
     for (let i = 0; i < oids.length; i += 1) {
       const oid = oids[i];
       try {
-        plans.push(planOrder(await loadOrder(oid), rules));
+        plans.push(planOrder(await loadOrder(oid, { fresh: true }), rules));
       } catch (error) {
         plans.push({ o_id: String(oid), ok: false, reason: String(error) });
       }

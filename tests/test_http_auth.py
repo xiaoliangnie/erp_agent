@@ -91,6 +91,12 @@ class HttpAuthTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertIn("items", payload)
         self.assertIn("outbox", payload)
+        session_only = self.issue_web_session()
+        status, payload = self.request(
+            "/api/agent/workbench",
+            headers={"X-Agent-Web-Token": session_only["webToken"]},
+        )
+        self.assertEqual(200, status)
 
     def test_agent_status_requires_bearer(self):
         status, payload = self.request("/api/agent/status")
@@ -105,6 +111,26 @@ class HttpAuthTests(unittest.TestCase):
         self.assertIn("dropship", payload)
         self.assertIn("jobs", payload)
         self.assertIn("outbox", payload)
+
+    def test_agent_status_accepts_web_session_without_shared_token(self):
+        session = self.issue_web_session()
+        status, payload = self.request(
+            "/api/agent/status",
+            headers={"X-Agent-Web-Token": session["webToken"]},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload.get("ok"))
+
+    def test_web_bind_does_not_need_shared_token(self):
+        sender_id = "u-web-bind"
+        app_mod.STAFF_DIRECTORY.upsert("测绑定", dingtalk_user_id=sender_id, role="operator")
+        issued = app_mod.WEB_AUTH.issue_code(sender_id=sender_id, buyer_name="测绑定")
+        status, payload = self.request(
+            "/api/agent/web-bind", method="POST",
+            body={"operator": "测绑定", "code": issued["code"]},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload.get("webToken"))
 
     def test_quality_decide_requires_bearer(self):
         self.assertEqual(401, self.request("/api/agent/quality/abcdef/resolve", method="POST", body={})[0])
