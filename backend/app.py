@@ -60,7 +60,11 @@ from .dingtalk import (
     notify_pending_after_restart,
 )
 from .forecast import ForecastError, ForecastService, ForecastUnavailable
-from .business_time import business_today
+from .business_time import business_now, business_timestamp, business_today
+from .ops_status import (
+    build_schedules, next_daily, next_insole, next_interval, schedule_row,
+    source_card,
+)
 from .staff_names import WEB_OPERATOR_UNBOUND, buyer_names_equivalent
 from .agent.users import is_confirmed_admin_name
 from .agent.web_auth import WebAuth, WebAuthError
@@ -68,7 +72,24 @@ from .product_images import ProductImageError, ProductImageService
 from .order_source import OrderSourceError, fetch_exchange_order_items, fetch_exchange_orders
 from .erp import DigitalRuntime, DigitalWorkerLoop, ErpKeepAlive, public_worker_status
 from .dropship.scheduler import DailyDropshipScheduler
+from .exchange.insole import warm_insole_lines_cache
+from .exchange.insole_scheduler import DouyinInsoleScheduler
 from .realtime_mirror import build_mirror_from_settings
+from .spu_plan import (
+    BOARDS,
+    DataMissing as SpuDataMissing,
+    build_style_alerts,
+    load_style_snapshot,
+    normalize_board,
+    save_style_snapshot,
+)
+from .spu_plan.plan_source import MAX_UPLOAD_BYTES, PlanSourceError, PlanSourceUpdater
+from .spu_plan.scheduler import DailySpuSnapshotScheduler
+from .purchase_draft import create_purchase_draft, load_purchase_draft, public_draft
+from .purchase_draft.service import PurchaseDraftError, apply_draft_edits, draft_xlsx_path
+from .purchase_draft.submit import submit_purchase_draft
+from .purchase_draft.workbook import write_blank_purchase_template
+from .erp.errors import ErpError, ErpUnknownResult
 from .gb_standards import (
     build_gb_sync_from_settings,
     expand_recommend_candidates,
@@ -166,6 +187,21 @@ DROPSHIP_SCHEDULER = DailyDropshipScheduler(
     oto_buyers=setting("DROPSHIP_OTO_BUYERS", "安安"),
     oto_user_ids=setting("DROPSHIP_OTO_USER_IDS", ""),
 )
+INSOLE_SCHEDULER = DouyinInsoleScheduler(
+    setting=setting,
+    env_path=REALTIME_ENV_PATH,
+    runtime=DIGITAL_WORKER.runtime,
+    root=ROOT,
+    enabled=flag(setting("INSOLE_SCHEDULE_ENABLED", "true"), default=True),
+    start_time=setting("INSOLE_SCHEDULE_START", "09:30"),
+    end_time=setting("INSOLE_SCHEDULE_END", "18:30"),
+    interval_minutes=int(setting("INSOLE_SCHEDULE_INTERVAL_MINUTES", "60") or 60),
+    shop=setting("INSOLE_SCHEDULE_SHOP", "抖音") or "抖音",
+    conversation_id=setting("INSOLE_SCHEDULE_GROUP_CONVERSATION_ID", "")
+    or setting("DINGTALK_GROUP_CONVERSATION_ID", ""),
+    oto_buyers=setting("INSOLE_SCHEDULE_OTO_BUYERS", "安安"),
+    oto_user_ids=setting("INSOLE_SCHEDULE_OTO_USER_IDS", ""),
+)
 REALTIME_MIRROR, REALTIME_MIRROR_SCHEDULER = build_mirror_from_settings(
     setting, root=ROOT, env_path=REALTIME_ENV_PATH,
 )
@@ -173,10 +209,28 @@ GB_STANDARDS_SYNCER, GB_STANDARDS_SCHEDULER = build_gb_sync_from_settings(
     setting, env_path=REALTIME_ENV_PATH,
 )
 CACHE_TTL_SECONDS = 30
+CACHE_STALE_SECONDS = 600
+CACHE_KEEP_SECONDS = 25
 CACHE_YEAR_LIMIT = 3
 _cache = {}
 _source_state = {"source": None, "warning": None, "year": None}
 _cache_lock = threading.Lock()
+_rebuilding = set()
+# 鞋服 SPU 看板：读结果表即刻返回；重算约一分钟，锁保证同时只有一次。
+SPU_REFRESH_LOCK = threading.Lock()
+SPU_REFRESH_STATE = {"startedAt": "", "finishedAt": "", "lastError": ""}
+SPU_SCHEDULER = DailySpuSnapshotScheduler(
+    env_path=REALTIME_ENV_PATH,
+    enabled=flag(setting("SPU_SNAPSHOT_ENABLED", "true"), default=True),
+    run_time=setting("SPU_SNAPSHOT_TIME", "09:00"),
+    lock=SPU_REFRESH_LOCK,
+    plan_source=str(resolve_repo_path(
+        setting("SPU_PLAN_SOURCE_XLSX", "files/config/重点产品订货表.xlsx"),
+    )),
+)
+PLAN_UPDATER = PlanSourceUpdater(
+    env_path=REALTIME_ENV_PATH, source_path=SPU_SCHEDULER.plan_source,
+)
 _year_locks = {}
 _followup_cache = {}
 _followup_lock = threading.Lock()
@@ -185,6 +239,82 @@ _followup_lock = threading.Lock()
 def _year_lock(year: str):
     with _cache_lock:
         return _year_locks.setdefault(year, threading.Lock())
+
+
+class PageCacheKeeper:
+    """看板/台账热缓存：到点自己重算，不等人打开页面。"""
+
+    def __init__(self, *, interval_seconds: int = CACHE_KEEP_SECONDS, initial_delay: int = 20):
+        self.interval = max(15, int(interval_seconds))
+        self.initial_delay = max(0, int(initial_delay))
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._hot = set()
+        self.last_ok = ""
+        self.last_error = ""
+
+    def remember(self, year: str) -> None:
+        text = str(year or "").strip()
+        if text:
+            self._hot.add(text)
+
+    def status(self) -> dict:
+        return {
+            "enabled": True,
+            "running": bool(self._thread and self._thread.is_alive()),
+            "intervalSeconds": self.interval,
+            "lastOk": self.last_ok,
+            "lastError": self.last_error,
+            "hotYears": sorted(self._hot),
+        }
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="page-cache-keep", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=5)
+        self._thread = None
+
+    def _loop(self) -> None:
+        if self.initial_delay and self._stop.wait(self.initial_delay):
+            return
+        while not self._stop.is_set():
+            self.refresh()
+            if self._stop.wait(self.interval):
+                return
+
+    def refresh(self) -> None:
+        try:
+            years = fetch_realtime_years(REALTIME_ENV_PATH)
+            current = resolve_source_year(None, years)
+            wanted = set(self._hot) | {current}
+            now = time.monotonic()
+            for year in sorted(wanted):
+                self.remember(year)
+                with _cache_lock:
+                    cached = _cache.get(year)
+                    still_hot = bool(cached and cached.get("expires", 0) > now + 5)
+                if not still_hot:
+                    _fill_source_cache(year, years)
+            with _cache_lock:
+                follow = _followup_cache.get("all")
+                follow_hot = bool(follow and follow.get("expires", 0) > now + 5)
+            if not follow_hot:
+                _fill_followup_cache()
+            self.last_ok = business_now().strftime("%Y-%m-%d %H:%M:%S")
+            self.last_error = ""
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("看板热缓存刷新失败")
+
+
+PAGE_CACHE_KEEPER = PageCacheKeeper()
 
 
 def snapshot_years(rows):
@@ -206,9 +336,10 @@ def resolve_source_year(requested_year, years, current_year=None):
 
 
 def trim_source_cache(cache, now, *, keep_key=None, limit=CACHE_YEAR_LIMIT):
-    """先丢掉过期条目，再按过期时间从旧到新逐出，最多留 limit 个年份。"""
+    """先丢掉过期且不能再拿来垫底的条目，再按过期时间从旧到新逐出。"""
     for key in [item for item, value in cache.items()
-                if value.get("expires", 0) <= now and item != keep_key]:
+                if value.get("staleUntil", value.get("expires", 0)) <= now
+                and item != keep_key]:
         cache.pop(key, None)
     while len(cache) > limit:
         candidates = [key for key in cache if key != keep_key]
@@ -227,49 +358,252 @@ def source_rows(requested_year=None):
 
 
 def source_cache(requested_year=None):
-    """短时缓存原始明细行和两个页面的数据，避免同一批明细重复压库。"""
+    """短时缓存原始明细行和看板数据。过期后先返回上一份，后台再刷新。"""
     years = fetch_realtime_years(REALTIME_ENV_PATH)
     year = resolve_source_year(requested_year, years)
+    PAGE_CACHE_KEEPER.remember(year)
     now = time.monotonic()
     with _cache_lock:
         cached = _cache.get(year)
         if cached and cached["expires"] > now:
             return cached
+        stale = bool(cached and cached.get("staleUntil", 0) > now)
+    if stale:
+        _schedule_source_rebuild(year, years)
+        return cached
     with _year_lock(year):
         now = time.monotonic()
         with _cache_lock:
             cached = _cache.get(year)
             if cached and cached["expires"] > now:
                 return cached
-        rows = fetch_realtime_purchase_rows(year, REALTIME_ENV_PATH)
-        source = "供应链 API 本地实时镜像"
-        sync_state = fetch_realtime_sync_state(REALTIME_ENV_PATH)
-        warning = _mirror_warning(sync_state)
-        window_warning = purchase_window_warning(year)
-        if window_warning:
-            warning = f"{warning}；{window_warning}" if warning else window_warning
-        dashboard = build_dashboard_payload(rows, source)
-        dashboard["meta"].update(
-            warning=warning, availableYears=years, selectedYear=year,
-            databaseNow=sync_state["databaseNow"], syncedAt=sync_state["syncedAt"],
-            syncLagMinutes=sync_state["syncLagMinutes"], fresh=sync_state["fresh"],
-            sourceStatus=sync_state.get("sourceStatus", ""),
-            timezone="Asia/Shanghai",
-        )
-        today = business_today().isoformat()
-        dashboard["meta"]["today"] = today
-        with _cache_lock:
-            _cache[year] = {
-                # 年度明细从远程镜像读取可能耗时较长，TTL 应从构建完成时开始计算。
-                "expires": time.monotonic() + CACHE_TTL_SECONDS,
-                "rows": rows,
-                "meta": {"source": source, "year": year, "availableYears": years,
-                         "warning": warning, "today": today, "rows": len(rows)},
-                "dashboard": dashboard,
-            }
-            trim_source_cache(_cache, now, keep_key=year)
-            _source_state.update(source=source, warning=warning, year=year)
-            return _cache[year]
+            if cached and cached.get("staleUntil", 0) > now:
+                _schedule_source_rebuild(year, years)
+                return cached
+        return _fill_source_cache(year, years)
+
+
+def _schedule_source_rebuild(year: str, years) -> None:
+    with _cache_lock:
+        if year in _rebuilding:
+            return
+        _rebuilding.add(year)
+
+    def worker():
+        try:
+            with _year_lock(year):
+                _fill_source_cache(year, years)
+        except Exception:
+            logger.exception("后台刷新看板缓存失败：%s", year)
+        finally:
+            with _cache_lock:
+                _rebuilding.discard(year)
+
+    threading.Thread(target=worker, name=f"source-cache-{year}", daemon=True).start()
+
+
+def _fill_source_cache(year: str, years):
+    rows = fetch_realtime_purchase_rows(year, REALTIME_ENV_PATH)
+    source = "供应链 API 本地实时镜像"
+    sync_state = fetch_realtime_sync_state(REALTIME_ENV_PATH)
+    warning = _mirror_warning(sync_state)
+    window_warning = purchase_window_warning(year)
+    if window_warning:
+        warning = f"{warning}；{window_warning}" if warning else window_warning
+    dashboard = build_dashboard_payload(rows, source)
+    dashboard["meta"].update(
+        warning=warning, availableYears=years, selectedYear=year,
+        databaseNow=sync_state["databaseNow"], syncedAt=sync_state["syncedAt"],
+        syncLagMinutes=sync_state["syncLagMinutes"], fresh=sync_state["fresh"],
+        sourceStatus=sync_state.get("sourceStatus", ""),
+        timezone="Asia/Shanghai",
+    )
+    today = business_today().isoformat()
+    dashboard["meta"]["today"] = today
+    built = time.monotonic()
+    with _cache_lock:
+        _cache[year] = {
+            # 年度明细从远程镜像读取可能耗时较长，TTL 应从构建完成时开始计算。
+            "expires": built + CACHE_TTL_SECONDS,
+            "staleUntil": built + CACHE_TTL_SECONDS + CACHE_STALE_SECONDS,
+            "rows": rows,
+            "meta": {"source": source, "year": year, "availableYears": years,
+                     "warning": warning, "today": today, "rows": len(rows)},
+            "dashboard": dashboard,
+        }
+        trim_source_cache(_cache, built, keep_key=year)
+        _source_state.update(source=source, warning=warning, year=year)
+        return _cache[year]
+
+
+def cached_source_card():
+    """健康页用的数据源卡：只读已有看板缓存，不重算全年明细。"""
+    sync = {}
+    try:
+        sync = fetch_realtime_sync_state(REALTIME_ENV_PATH)
+    except Exception:
+        sync = {}
+    meta = {}
+    with _cache_lock:
+        year = str(_source_state.get("year") or "")
+        cached = _cache.get(year) if year else None
+        if cached is None and _cache:
+            cached = next(iter(_cache.values()))
+        if cached:
+            meta = dict((cached.get("dashboard") or {}).get("meta") or cached.get("meta") or {})
+    return source_card(meta, sync, _source_state)
+
+
+def health_schedules():
+    """把各调度的 lastRun / 下次执行收成一张表。"""
+    now = business_now()
+    today = now.date().isoformat()
+    mirror = _safe_status(REALTIME_MIRROR_SCHEDULER.status)
+    sync = {}
+    try:
+        sync = fetch_realtime_sync_state(REALTIME_ENV_PATH)
+    except Exception:
+        sync = {}
+    reminder = _safe_status(REMINDER_SCHEDULER.status)
+    quality = _safe_status(QUALITY_SCHEDULER.status)
+    dropship = _safe_status(DROPSHIP_SCHEDULER.status)
+    insole = _safe_status(INSOLE_SCHEDULER.status)
+    gb = _safe_status(GB_STANDARDS_SCHEDULER.status)
+    spu = _safe_status(SPU_SCHEDULER.status)
+    keep = _safe_status(ERP_KEEPALIVE.status)
+    jobs = _safe_status(JOB_WORKER.status)
+    stream = _safe_status(DINGTALK_STREAM.status)
+
+    rem_next, rem_done = next_daily(
+        now, reminder.get("sendTime") or "08:30", last_run=reminder.get("lastRun") or "",
+    )
+    qty_next, qty_done = next_daily(
+        now, quality.get("sendTime") or "17:30", last_run=quality.get("lastRun") or "",
+    )
+    drop_next, drop_done = next_daily(
+        now, dropship.get("prepareTime") or dropship.get("sendTime") or "14:00",
+        last_run=dropship.get("lastRun") or "",
+    )
+    gb_next, gb_done = next_daily(
+        now, gb.get("sendTime") or "02:30", last_run=gb.get("lastRun") or "",
+    )
+    spu_next, spu_done = next_daily(
+        now, spu.get("runTime") or "09:00", last_run=spu.get("lastRun") or "",
+    )
+    plan_next, plan_done = next_daily(
+        now, spu.get("runTime") or "09:00", last_run=spu.get("planLastRun") or "",
+    )
+    insole_next, insole_done = next_insole(
+        now,
+        start=insole.get("startTime") or "09:30",
+        end=insole.get("endTime") or "18:30",
+        interval_minutes=int(insole.get("intervalMinutes") or 60),
+        last_slot=insole.get("lastSlot") or "",
+    )
+    keep_next = next_interval(
+        now, keep.get("lastOk") or "", int(keep.get("intervalSeconds") or 180),
+    )
+    cache = _safe_status(PAGE_CACHE_KEEPER.status)
+    cache_next = next_interval(
+        now, cache.get("lastOk") or "", int(cache.get("intervalSeconds") or CACHE_KEEP_SECONDS),
+    )
+    rows = [
+        schedule_row(
+            item_id="mirror", label="镜像增量", group="数据",
+            enabled=bool(mirror.get("enabled")),
+            running=bool(mirror.get("enabled")),
+            last_run=str(sync.get("syncedAt") or ""),
+            next_at=next_interval(now, sync.get("syncedAt") or "", 60),
+            ran_today=bool(str(sync.get("syncedAt") or "").startswith(today)),
+            last_error=str(mirror.get("lastError") or ""),
+            detail=str(sync.get("sourceStatus") or ""),
+            now=now,
+        ),
+        schedule_row(
+            item_id="pageCache", label="看板热缓存", group="数据",
+            enabled=bool(cache.get("enabled")), running=bool(cache.get("running")),
+            last_run=str(cache.get("lastOk") or ""), next_at=cache_next,
+            ran_today=bool(str(cache.get("lastOk") or "").startswith(today)),
+            last_error=str(cache.get("lastError") or ""),
+            detail=f"每 {cache.get('intervalSeconds') or CACHE_KEEP_SECONDS} 秒续热"
+            + (f"（{('、'.join(cache.get('hotYears') or []) or '本年')}）"),
+            now=now,
+        ),
+        schedule_row(
+            item_id="gb", label="国标目录同步", group="数据",
+            enabled=bool(gb.get("enabled")), running=bool(gb.get("running")),
+            last_run=str(gb.get("lastRun") or ""), next_at=gb_next,
+            ran_today=gb_done, last_error=str(gb.get("lastError") or ""),
+            detail=f"每天 {gb.get('sendTime') or '02:30'}", now=now,
+        ),
+        schedule_row(
+            item_id="reminder", label="交期催办", group="通知",
+            enabled=bool(reminder.get("enabled")), running=bool(reminder.get("running")),
+            last_run=str(reminder.get("lastRun") or ""), next_at=rem_next,
+            ran_today=rem_done, last_error=str(reminder.get("lastError") or ""),
+            detail=f"每天 {reminder.get('sendTime') or '08:30'}", now=now,
+        ),
+        schedule_row(
+            item_id="quality", label="品控日报", group="通知",
+            enabled=bool(quality.get("enabled")), running=bool(quality.get("running")),
+            last_run=str(quality.get("lastRun") or ""), next_at=qty_next,
+            ran_today=qty_done, last_error=str(quality.get("lastError") or ""),
+            detail=f"每天 {quality.get('sendTime') or '17:30'}", now=now,
+        ),
+        schedule_row(
+            item_id="dropship", label="代发抓取", group="业务",
+            enabled=bool(dropship.get("enabled")), running=bool(dropship.get("running")),
+            last_run=str(dropship.get("lastRun") or ""), next_at=drop_next,
+            ran_today=drop_done, last_error=str(dropship.get("lastError") or ""),
+            detail=f"每天 {dropship.get('prepareTime') or '14:00'}", now=now,
+        ),
+        schedule_row(
+            item_id="insole", label="抖音换鞋垫", group="业务",
+            enabled=bool(insole.get("enabled")), running=bool(insole.get("running")),
+            last_run=str(insole.get("lastSlot") or insole.get("lastRun") or ""),
+            next_at=insole_next, ran_today=insole_done,
+            last_error=str(insole.get("lastError") or ""),
+            detail=f"{insole.get('startTime') or '09:30'}–{insole.get('endTime') or '18:30'} 每 {insole.get('intervalMinutes') or 60} 分钟",
+            now=now,
+        ),
+        schedule_row(
+            item_id="spu", label="鞋服/百货结果表", group="业务",
+            enabled=bool(spu.get("enabled")), running=bool(spu.get("running")),
+            last_run=str(spu.get("lastRun") or ""), next_at=spu_next,
+            ran_today=spu_done, last_error=str(spu.get("lastError") or ""),
+            detail=f"每天 {spu.get('runTime') or '09:00'}", now=now,
+        ),
+        schedule_row(
+            item_id="plan", label="生产计划刷新", group="业务",
+            enabled=bool(spu.get("enabled")), running=bool(spu.get("running")),
+            last_run=str(spu.get("planLastRun") or ""), next_at=plan_next,
+            ran_today=plan_done, last_error=str(spu.get("planLastError") or ""),
+            detail=f"每天 {spu.get('runTime') or '09:00'} 随结果表", now=now,
+        ),
+        schedule_row(
+            item_id="keepalive", label="ERP 登录态", group="通道",
+            enabled=bool(keep.get("enabled")), running=bool(keep.get("running")),
+            last_run=str(keep.get("lastOk") or ""), next_at=keep_next,
+            ran_today=bool(str(keep.get("lastOk") or "").startswith(today)),
+            last_error=str(keep.get("lastError") or ""),
+            detail=f"每 {keep.get('intervalSeconds') or 180} 秒", now=now,
+        ),
+        schedule_row(
+            item_id="jobs", label="任务队列", group="通道",
+            enabled=bool(jobs.get("enabled")), running=bool(jobs.get("running")),
+            last_run="", next_at=None, ran_today=None,
+            last_error=str(jobs.get("lastError") or ""),
+            detail=f"排队 {jobs.get('queued') or 0}", now=now,
+        ),
+        schedule_row(
+            item_id="stream", label="钉钉 Stream", group="通道",
+            enabled=bool(stream.get("enabled")), running=bool(stream.get("running")),
+            last_run="", next_at=None, ran_today=None,
+            last_error=str(stream.get("lastError") or ""),
+            detail="长连" if stream.get("running") else "未连接", now=now,
+        ),
+    ]
+    return build_schedules(now, rows)
 
 
 def _mirror_warning(sync_state):
@@ -286,42 +620,74 @@ def _mirror_warning(sync_state):
 
 
 def followup_delivery_cache():
-    """交期台账：全库跟单池，不按年度截断。"""
+    """交期台账：全库跟单池，不按年度截断。过期先返回上一份。"""
     now = time.monotonic()
     with _cache_lock:
         cached = _followup_cache.get("all")
         if cached and cached["expires"] > now:
             return cached
+        stale = bool(cached and cached.get("staleUntil", 0) > now)
+    if stale:
+        _schedule_followup_rebuild()
+        return cached
     with _followup_lock:
         now = time.monotonic()
         with _cache_lock:
             cached = _followup_cache.get("all")
             if cached and cached["expires"] > now:
                 return cached
-        years = fetch_realtime_years(REALTIME_ENV_PATH)
-        rows = fetch_followup_purchase_rows(REALTIME_ENV_PATH)
-        source = "供应链 API 本地实时镜像 · 跟单池"
-        sync_state = fetch_realtime_sync_state(REALTIME_ENV_PATH)
-        warning = _mirror_warning(sync_state)
-        delivery = build_delivery_payload(rows, source)
-        delivery["meta"].update(
-            warning=warning, availableYears=years,
-            selectedYear=years[0] if years else "",
-            databaseNow=sync_state["databaseNow"], syncedAt=sync_state["syncedAt"],
-            syncLagMinutes=sync_state["syncLagMinutes"], fresh=sync_state["fresh"],
-            sourceStatus=sync_state.get("sourceStatus", ""),
-            timezone="Asia/Shanghai", pool="followup",
-        )
-        today = business_today().isoformat()
-        delivery["meta"]["today"] = today
-        cached = {
-            "expires": time.monotonic() + CACHE_TTL_SECONDS,
-            "delivery": delivery,
-            "rows": rows,
-        }
-        with _cache_lock:
-            _followup_cache["all"] = cached
-        return cached
+            if cached and cached.get("staleUntil", 0) > now:
+                _schedule_followup_rebuild()
+                return cached
+        return _fill_followup_cache()
+
+
+def _schedule_followup_rebuild() -> None:
+    with _cache_lock:
+        if "followup" in _rebuilding:
+            return
+        _rebuilding.add("followup")
+
+    def worker():
+        try:
+            with _followup_lock:
+                _fill_followup_cache()
+        except Exception:
+            logger.exception("后台刷新交期缓存失败")
+        finally:
+            with _cache_lock:
+                _rebuilding.discard("followup")
+
+    threading.Thread(target=worker, name="followup-cache", daemon=True).start()
+
+
+def _fill_followup_cache():
+    years = fetch_realtime_years(REALTIME_ENV_PATH)
+    rows = fetch_followup_purchase_rows(REALTIME_ENV_PATH)
+    source = "供应链 API 本地实时镜像 · 跟单池"
+    sync_state = fetch_realtime_sync_state(REALTIME_ENV_PATH)
+    warning = _mirror_warning(sync_state)
+    delivery = build_delivery_payload(rows, source)
+    delivery["meta"].update(
+        warning=warning, availableYears=years,
+        selectedYear=years[0] if years else "",
+        databaseNow=sync_state["databaseNow"], syncedAt=sync_state["syncedAt"],
+        syncLagMinutes=sync_state["syncLagMinutes"], fresh=sync_state["fresh"],
+        sourceStatus=sync_state.get("sourceStatus", ""),
+        timezone="Asia/Shanghai", pool="followup",
+    )
+    today = business_today().isoformat()
+    delivery["meta"]["today"] = today
+    built = time.monotonic()
+    cached = {
+        "expires": built + CACHE_TTL_SECONDS,
+        "staleUntil": built + CACHE_TTL_SECONDS + CACHE_STALE_SECONDS,
+        "delivery": delivery,
+        "rows": rows,
+    }
+    with _cache_lock:
+        _followup_cache["all"] = cached
+    return cached
 
 
 def payloads(requested_year=None):
@@ -347,7 +713,7 @@ FORECAST = ForecastService.from_settings(setting, root=ROOT, env_path=REALTIME_E
 AGENT_STORE = AgentStore(agent_database_path(setting, ROOT))
 WEB_AUTH = WebAuth(AGENT_STORE)
 AUDIT = AuditLog(AGENT_STORE)
-WEB_BIND_HINT = "请先到钉钉群里发「绑定网页」，把私信里的 20 位码填到网页"
+WEB_BIND_HINT = "请先到钉钉群里发「绑定网页」，用私信里的花名和密码登录"
 DINGTALK_SENDER, STAFF_DIRECTORY, REMINDER_NOTIFIER = build_dingtalk(
     setting=setting, store=AGENT_STORE, audit=AUDIT, flag=flag, root=ROOT,
 )
@@ -404,11 +770,28 @@ DINGTALK_STREAM = DingTalkStreamChannel(
     client_secret=setting("DINGTALK_CLIENT_SECRET", ""),
     audit=AUDIT, enabled=flag(setting("DINGTALK_ENABLED", "false")),
     directory=STAFF_DIRECTORY, quality=QUALITY, memories=MEMORIES,
+    insole_scheduler=INSOLE_SCHEDULER,
     admin_user_ids=[
         item.strip() for item in setting("DINGTALK_ADMIN_USER_IDS", "").split(",")
         if item.strip()
     ],
 )
+DINGTALK_STREAM.plan_updater = PLAN_UPDATER
+SPU_SCHEDULER.sender = DINGTALK_SENDER if DINGTALK_SENDER.configured else None
+SPU_SCHEDULER.audit = AUDIT
+SPU_SCHEDULER.alert_enabled = flag(setting("SPU_PLAN_ALERT_ENABLED", "true"), default=True)
+PLAN_UPDATER.sender = SPU_SCHEDULER.sender
+PLAN_UPDATER.audit = AUDIT
+PLAN_UPDATER.alert_enabled = SPU_SCHEDULER.alert_enabled
+INSOLE_SCHEDULER.sender = DINGTALK_SENDER
+INSOLE_SCHEDULER.audit = AUDIT
+INSOLE_SCHEDULER.directory = STAFF_DIRECTORY
+INSOLE_SCHEDULER.mirror = REALTIME_MIRROR
+AGENT.insole_scheduler = INSOLE_SCHEDULER
+if not INSOLE_SCHEDULER.conversation_id:
+    INSOLE_SCHEDULER.conversation_id = str(
+        getattr(DINGTALK_SENDER, "group_conversation_id", "") or ""
+    )
 MAINTENANCE = MaintenanceScheduler(
     store=AGENT_STORE, root=ROOT,
     retention_days=int(setting("AGENT_RETENTION_DAYS", "90") or 90),
@@ -505,6 +888,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.redirect(LEGACY_PAGES.get(path, HOME))
         if path == "/api/health":
             return self.health()
+        if self._is_panel_api(path) and not self.require_web_login():
+            return
+        if path == "/api/now":
+            now = business_now()
+            return self.json_response({
+                "ok": True,
+                "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "today": now.date().isoformat(),
+                "tz": "Asia/Shanghai",
+            })
         quality_file = re.fullmatch(r"/api/quality/reports/(\d{8})/([a-f0-9]{16})\.xlsx", path)
         if quality_file:
             return self.quality_report_file(quality_file.group(1), quality_file.group(2))
@@ -536,6 +929,18 @@ class Handler(BaseHTTPRequestHandler):
             return self.agent_contract_file(agent_file.group(1), agent_file.group(2))
         if path.startswith("/api/agent/") or path.startswith("/api/forecast/"):
             return self.agent_get(path, parsed)
+        if path == "/api/spu/summary":
+            return self.spu_summary(parsed)
+        if path == "/api/spu/analyze":
+            return self.spu_analyze_get(parsed)
+        if path == "/api/purchase-drafts/template":
+            return self.purchase_draft_template()
+        draft_file = re.fullmatch(r"/api/purchase-drafts/([a-f0-9]{24})/file", path)
+        if draft_file:
+            return self.purchase_draft_file(draft_file.group(1))
+        draft_get = re.fullmatch(r"/api/purchase-drafts/([a-f0-9]{24})", path)
+        if draft_get:
+            return self.purchase_draft_get(draft_get.group(1))
         if path in ("/api/dashboard", "/api/delivery"):
             year = parse_qs(parsed.query).get("year", [None])[0]
             year = year if year and re.fullmatch(r"\d{4}", year) else None
@@ -550,6 +955,8 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(urlparse(self.path).path)
         if path.startswith("/api/exchange/"):
             return self.exchange_post(path)
+        if self._is_panel_api(path) and not self.require_web_login():
+            return
         if path == "/api/contracts/images/sync":
             return self.contract_image_sync()
         if path == "/api/agent/contracts/generate":
@@ -560,6 +967,20 @@ class Handler(BaseHTTPRequestHandler):
             return self.agent_post(path)
         if path == "/api/contracts/gb/recommend":
             return self.contract_gb_recommend()
+        if path == "/api/spu/refresh":
+            return self.spu_refresh()
+        if path == "/api/spu/analyze":
+            return self.spu_analyze()
+        if path == "/api/spu/plan-source":
+            return self.spu_plan_upload()
+        if path == "/api/purchase-drafts":
+            return self.purchase_draft_create()
+        draft_confirm = re.fullmatch(r"/api/purchase-drafts/([a-f0-9]{24})/confirm", path)
+        if draft_confirm:
+            return self.purchase_draft_confirm(draft_confirm.group(1))
+        draft_save = re.fullmatch(r"/api/purchase-drafts/([a-f0-9]{24})", path)
+        if draft_save:
+            return self.purchase_draft_save(draft_save.group(1))
         if path not in ("/api/contracts/generate", "/api/contracts/preview"):
             self.send_error(404, "Not Found")
             return
@@ -612,6 +1033,18 @@ class Handler(BaseHTTPRequestHandler):
             parse_constant=_reject_json_constant,
         )
 
+    def _is_panel_api(self, path):
+        if path in ("/api/dashboard", "/api/delivery", "/api/now"):
+            return True
+        return path.startswith(("/api/contracts/", "/api/spu/", "/api/purchase-drafts"))
+
+    def require_web_login(self):
+        token = self.agent_web_token()
+        if token and WEB_AUTH.get_session(token):
+            return True
+        self.json_response({"ok": False, "error": WEB_BIND_HINT}, 401)
+        return False
+
     def require_agent_token(self, *, allow_web_session=False):
         expected = setting("AGENT_API_TOKEN", "").strip()
         supplied = self.headers.get("Authorization", "")
@@ -630,7 +1063,7 @@ class Handler(BaseHTTPRequestHandler):
         if allow_web_session:
             self.json_response({
                 "ok": False,
-                "error": "请先用钉钉「绑定网页」的 20 位码绑定，或填写正确的 AGENT_API_TOKEN。不要把身份码填进 Token 框。",
+                "error": "请先用钉钉「绑定网页」拿到的花名和密码登录，或填写正确的 AGENT_API_TOKEN。",
             }, 401)
             return False
         self.json_response({"ok": False, "error": "Agent 接口认证失败"}, 401)
@@ -831,6 +1264,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.json_response({"ok": False, "error": str(exc)}, exc.status)
         if isinstance(exc, WebAuthError):
             return self.json_response({"ok": False, "error": str(exc)}, 400)
+        if isinstance(exc, (ExchangeError, OrderSourceError)):
+            return self.json_response({"ok": False, "error": str(exc)}, getattr(exc, "status", 400))
         if isinstance(exc, ForecastUnavailable):
             return self.json_response({"ok": False, "error": str(exc)}, 503)
         if isinstance(exc, (LLMError, DingTalkError)):
@@ -849,6 +1284,14 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             query = parse_qs(parsed.query)
+            if path == "/api/agent/me":
+                principal = self.agent_principal(required=True)
+                return self.json_response({
+                    "ok": True,
+                    "operator": principal["operator"],
+                    "buyerName": principal["operator"],
+                    "userId": principal["userId"],
+                })
             if path == "/api/agent/status":
                 return self.json_response({
                     "ok": True,
@@ -859,6 +1302,7 @@ class Handler(BaseHTTPRequestHandler):
                     "reservedTools": RESERVED_TOOLS,
                     "quality": QUALITY_SCHEDULER.status(),
                     "dropship": DROPSHIP_SCHEDULER.status(),
+                    "insoleSchedule": INSOLE_SCHEDULER.status(),
                     "jobs": JOB_WORKER.status(),
                     "outbox": {"pending": OUTBOX.pending_count()},
                 })
@@ -954,6 +1398,22 @@ class Handler(BaseHTTPRequestHandler):
 
     def agent_post(self, path):
         try:
+            if path == "/api/agent/login":
+                body = self.read_json_body(max_size=2 * 1024 * 1024)
+                result = WEB_AUTH.login(
+                    username=str(body.get("username") or body.get("operator") or ""),
+                    password=str(body.get("password") or ""),
+                    directory=STAFF_DIRECTORY,
+                )
+                return self.json_response({"ok": True, **result})
+            if path == "/api/agent/logout":
+                body = {}
+                try:
+                    body = self.read_json_body(max_size=2 * 1024 * 1024)
+                except ValueError:
+                    body = {}
+                WEB_AUTH.revoke(self.agent_web_token(body))
+                return self.json_response({"ok": True})
             if path == "/api/agent/web-bind":
                 body = self.read_json_body(max_size=2 * 1024 * 1024)
                 result = WEB_AUTH.consume_code(
@@ -1237,7 +1697,13 @@ class Handler(BaseHTTPRequestHandler):
     def health(self):
         """数据库探活 + 各子系统状态。库连不上也要把子系统状态报全，那正是最需要看的时候。"""
         # 异常类型名不带库地址和账号，健康检查无鉴权，不要回具体报错文本。
-        payload = {"ok": True, "database": "connected"}
+        now = business_now()
+        payload = {
+            "ok": True,
+            "database": "connected",
+            "now": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "today": now.date().isoformat(),
+        }
         try:
             with connect(REALTIME_ENV_PATH, autocommit=True) as conn:
                 with conn.cursor() as cursor:
@@ -1277,8 +1743,227 @@ class Handler(BaseHTTPRequestHandler):
             },
             "quality": _safe_status(QUALITY_SCHEDULER.status),
             "dropship": _safe_status(DROPSHIP_SCHEDULER.status),
+            "insoleSchedule": _safe_status(INSOLE_SCHEDULER.status),
+            "spuSnapshot": _safe_status(SPU_SCHEDULER.status),
+            "spuPlanUpload": _safe_status(PLAN_UPDATER.status),
+            "source": cached_source_card(),
+            "schedules": health_schedules(),
         })
         self.json_response(payload, 200 if payload["ok"] else 503)
+
+    def _spu_board(self, parsed=None):
+        query = parsed.query if parsed is not None else urlparse(self.path).query
+        return normalize_board((parse_qs(query).get("board") or ["apparel"])[0])
+
+    def spu_summary(self, parsed=None):
+        """SPU 看板：读对应结果表，不触发重算。`board=baihuo` 为自营百货。"""
+        board = self._spu_board(parsed)
+        try:
+            payload = load_style_snapshot(REALTIME_ENV_PATH, board=board)
+        except Exception:
+            logger.exception("SPU snapshot read failed")
+            return self.json_response({"ok": False, "error": "SPU 结果表暂时不可用"}, 503)
+        payload["refreshing"] = SPU_REFRESH_LOCK.locked()
+        payload["refresh"] = dict(SPU_REFRESH_STATE)
+        from .spu_plan.analyze import load_day_analyses
+        payload["analyses"] = load_day_analyses(board=board)
+        return self.json_response(payload)
+
+    def spu_refresh(self):
+        """后台重算结果表（约一分钟）；已在跑就直接返回 busy。"""
+        board = self._spu_board()
+        if not SPU_REFRESH_LOCK.acquire(blocking=False):
+            return self.json_response({"ok": True, "started": False, "busy": True, "board": board})
+
+        def run():
+            try:
+                result = build_style_alerts(REALTIME_ENV_PATH, board=board)
+                save_style_snapshot(REALTIME_ENV_PATH, result, board=board)
+                SPU_REFRESH_STATE.update(
+                    finishedAt=business_timestamp(), lastError="",
+                )
+            except SpuDataMissing as exc:
+                SPU_REFRESH_STATE.update(lastError=str(exc))
+            except Exception as exc:
+                logger.exception("SPU snapshot refresh failed")
+                SPU_REFRESH_STATE.update(lastError=str(exc)[:500])
+            finally:
+                SPU_REFRESH_LOCK.release()
+
+        SPU_REFRESH_STATE.update(startedAt=business_timestamp(), lastError="")
+        threading.Thread(target=run, name="spu-refresh", daemon=True).start()
+        return self.json_response({"ok": True, "started": True, "busy": False, "board": board})
+
+    def purchase_draft_create(self):
+        """看板勾选 → 采购单草稿（预览 JSON + 本机 xlsx）。不写 ERP。"""
+        try:
+            body = self.read_json_body()
+        except ValueError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        if not isinstance(body, dict):
+            return self.json_response({"ok": False, "error": "请求不是对象"}, 400)
+        style_ids = body.get("styleIds") or body.get("style_ids") or []
+        if not isinstance(style_ids, list):
+            return self.json_response({"ok": False, "error": "styleIds 必须是数组"}, 400)
+        quantities = body.get("quantities") if isinstance(body.get("quantities"), dict) else {}
+        try:
+            principal = self.agent_principal(body)
+            draft = create_purchase_draft(
+                board=str(body.get("board") or "apparel"),
+                style_ids=style_ids,
+                quantities=quantities,
+                env_path=REALTIME_ENV_PATH,
+                operator=principal.get("operator") or "",
+            )
+        except PurchaseDraftError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        except Exception:
+            logger.exception("purchase draft create failed")
+            return self.json_response({"ok": False, "error": "采购单草稿暂时不可用"}, 503)
+        return self.json_response(public_draft(draft))
+
+    def purchase_draft_save(self, draft_id):
+        try:
+            body = self.read_json_body()
+            draft = apply_draft_edits(load_purchase_draft(draft_id), body)
+        except PurchaseDraftError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        except Exception:
+            logger.exception("purchase draft save failed")
+            return self.json_response({"ok": False, "error": "保存草稿失败"}, 503)
+        return self.json_response(public_draft(draft))
+
+    def purchase_draft_confirm(self, draft_id):
+        try:
+            body = self.read_json_body()
+            draft = load_purchase_draft(draft_id)
+            result = submit_purchase_draft(
+                draft, DIGITAL_WORKER.runtime,
+                env_path=REALTIME_ENV_PATH, body=body,
+            )
+        except PurchaseDraftError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        except ErpUnknownResult as exc:
+            return self.json_response({"ok": False, "error": str(exc), "unknown": True}, 409)
+        except (ErpError, ValueError) as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        except Exception:
+            logger.exception("purchase draft confirm failed")
+            return self.json_response({"ok": False, "error": "写入 ERP 失败"}, 503)
+        return self.json_response(result)
+
+    def purchase_draft_get(self, draft_id):
+        try:
+            draft = load_purchase_draft(draft_id)
+        except PurchaseDraftError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 404)
+        return self.json_response(public_draft(draft))
+
+    def purchase_draft_file(self, draft_id):
+        try:
+            draft = load_purchase_draft(draft_id)
+        except PurchaseDraftError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 404)
+        path = draft_xlsx_path(draft_id)
+        if not path.is_file():
+            return self.json_response({"ok": False, "error": "采购单文件已不在"}, 404)
+        return self.xlsx_response(path, draft.get("filename") or f"{draft_id}-采购单草稿.xlsx")
+
+    def purchase_draft_template(self):
+        path = write_blank_purchase_template()
+        return self.xlsx_response(path, "采购单模板.xlsx")
+
+    def _spu_snapshot_or_error(self, board="apparel"):
+        try:
+            return load_style_snapshot(REALTIME_ENV_PATH, board=board), None
+        except Exception:
+            logger.exception("SPU snapshot read failed")
+            return None, self.json_response({"ok": False, "error": "SPU 结果表暂时不可用"}, 503)
+
+    def _spu_snapshot_for_style(self, style_id: str, board=None):
+        """分析时先看指定看板，再在另一张结果表找。"""
+        from .spu_plan.analyze import find_style
+
+        preferred = normalize_board(board) if board else None
+        order = [preferred] if preferred else []
+        for name in BOARDS:
+            if name not in order:
+                order.append(name)
+        for name in order:
+            snapshot, error = self._spu_snapshot_or_error(name)
+            if error:
+                return None, None, error
+            if find_style(snapshot, style_id) is not None:
+                return snapshot, name, None
+        return None, None, None
+
+    def spu_analyze_get(self, parsed):
+        """读当天/昨日缓存，不调模型。"""
+        from .spu_plan.analyze import load_cached_analysis
+
+        style_id = str((parse_qs(parsed.query).get("styleId") or [""])[0]).strip()
+        if not style_id or len(style_id) > 64:
+            return self.json_response({"ok": False, "error": "styleId 不正确"}, 400)
+        cached = load_cached_analysis(style_id)
+        if cached is None:
+            return self.json_response({
+                "ok": True, "styleId": style_id, "analysis": "",
+                "analyzedAt": "", "day": "", "cached": False, "stale": False,
+            })
+        return self.json_response(cached)
+
+    def spu_analyze(self):
+        """单款分析：当天有缓存直接回；否则模型先调工具再写缓存。"""
+        from .spu_plan.analyze import find_style, run_style_analysis
+
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0 or length > 4096:
+                raise ValueError("请求内容大小不正确")
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            style_id = str(body.get("styleId") or "").strip()
+            if not style_id or len(style_id) > 64:
+                raise ValueError("styleId 不正确")
+            board = body.get("board")
+        except (ValueError, json.JSONDecodeError) as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        snapshot, _board, error = self._spu_snapshot_for_style(style_id, board)
+        if error:
+            return error
+        if snapshot is None or find_style(snapshot, style_id) is None:
+            return self.json_response({"ok": False, "error": "该款式不在当前结果表里"}, 404)
+        try:
+            result = run_style_analysis(
+                style_id, snapshot=snapshot,
+                llm=AGENT.llm if AGENT.enabled else None,
+                force=bool(body.get("force")),
+            )
+        except ValueError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 400)
+        except RuntimeError as exc:
+            return self.json_response({"ok": False, "error": str(exc)}, 503)
+        except LLMError as exc:
+            return self.json_response({"ok": False, "error": f"模型调用失败：{exc}"}, 502)
+        return self.json_response(result)
+
+    def spu_plan_upload(self):
+        """网页上传订货表：校验四张表后覆盖源文件并后台重生成生产计划表。"""
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        if length <= 0 or length > MAX_UPLOAD_BYTES:
+            return self.json_response({"ok": False, "error": "文件大小不正确（上限 40MB）"}, 400)
+        data = self.rfile.read(length)
+        try:
+            checked = PLAN_UPDATER.update(data, origin="web")
+        except PlanSourceError as exc:
+            status = 409 if "还在重生成" in str(exc) else 400
+            return self.json_response({"ok": False, "error": str(exc)}, status)
+        return self.json_response({
+            "ok": True, "started": True, "styles": checked.get("styles"),
+            "message": "已保存订货表，正在重生成生产计划表（约 3 分钟）",
+        })
 
     def quality_report_file(self, compact_date, sig):
         secret = setting("QUALITY_REPORT_LINK_SECRET", "")
@@ -1438,10 +2123,23 @@ def main():
         QUALITY_SCHEDULER.start()
         logger.info("每日品控日报已启用：%s", QUALITY_SCHEDULER.status()["sendTime"])
     DROPSHIP_SCHEDULER.start()
+    INSOLE_SCHEDULER.start()
+    if REALTIME_ENV_PATH:
+        warm_insole_lines_cache(setting, REALTIME_ENV_PATH)
+    SPU_SCHEDULER.start()
+    if SPU_SCHEDULER.enabled:
+        logger.info("鞋服 SPU 结果表每日重算已启用：%s", SPU_SCHEDULER.status()["runTime"])
     if DROPSHIP_SCHEDULER.enabled:
         logger.info(
             "每日代发已启用：%s 开始抓取，抓到后发群并私聊（不覆盖已填表）",
             DROPSHIP_SCHEDULER.status()["prepareTime"],
+        )
+    if INSOLE_SCHEDULER.enabled:
+        logger.info(
+            "抖音换鞋垫定时已启用：%s–%s 每 %s 分钟一轮",
+            INSOLE_SCHEDULER.status()["startTime"],
+            INSOLE_SCHEDULER.status()["endTime"],
+            INSOLE_SCHEDULER.status()["intervalMinutes"],
         )
     MAINTENANCE.start()
     JOB_WORKER.start()
@@ -1455,16 +2153,22 @@ def main():
         logger.info("ERP 登录态随服务启停（浏览器 + cookie，不固定订单页）")
     elif ERP_KEEPALIVE.enabled:
         logger.info("ERP 登录态保活未启动：%s", keep_status.get("lastError") or "未配置")
+    PAGE_CACHE_KEEPER.start()
+    logger.info("看板/台账热缓存已启用：%s 秒后续热，之后每 %s 秒刷新",
+                PAGE_CACHE_KEEPER.initial_delay, PAGE_CACHE_KEEPER.interval)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        PAGE_CACHE_KEEPER.stop()
         REALTIME_MIRROR_SCHEDULER.stop()
         GB_STANDARDS_SCHEDULER.stop()
         REMINDER_SCHEDULER.stop()
         QUALITY_SCHEDULER.stop()
         DROPSHIP_SCHEDULER.stop()
+        INSOLE_SCHEDULER.stop()
+        SPU_SCHEDULER.stop()
         MAINTENANCE.stop()
         JOB_WORKER.stop()
         DINGTALK_STREAM.stop()

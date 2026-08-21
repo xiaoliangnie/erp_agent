@@ -14,7 +14,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import evidence, exchange_page
+from . import evidence, exchange_page, purchase_create
 from .config import ALLOWED_COMMANDS, load_digital_worker, load_worker_secrets
 from .errors import ErpError, ErpUnknownResult
 from .session import BrowserSession, playwright_available
@@ -169,6 +169,13 @@ class DigitalRuntime:
 
     def _run(self, command: str, payload: dict) -> dict:
         with self._lock:
+            if command == "erp.create_purchase_order":
+                self.session.login_if_needed(headed=not self.config.get("headless", True))
+                self.session.save_state()
+                return purchase_create.create_purchase_order(
+                    self.session.page, payload,
+                    owner_co_id=str(self.config.get("ownerCoId") or "10235039"),
+                )
             self._ensure_page()
             if payload.get("confirm"):
                 delay = payload.get("delayMs", payload.get("delay_ms"))

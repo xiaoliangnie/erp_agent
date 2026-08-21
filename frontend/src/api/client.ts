@@ -1,14 +1,22 @@
 /*
  * 同源接口调用。
  *
- * 三类鉴权在这里区分清楚，页面不自己拼 header：
- *   看板 / 台账 / 合同     无鉴权
- *   /api/exchange/*      Bearer EXCHANGE_API_TOKEN
- *   /api/agent/*         网页会话 X-Agent-Web-Token，或 Bearer AGENT_API_TOKEN
- * AGENT_API_TOKEN 只从 sessionStorage 读，永远不写进 URL。已绑定网页后可以不填。
- * 网页身份码换到的 webToken 放 localStorage，关掉标签页不用重绑。
- * 操作人姓名放在 POST JSON 中，避免中文姓名被塞进只支持 Latin-1 的 HTTP 请求头。
+ * 页面接口和 /api/agent/* 都带 X-Agent-Web-Token（localStorage）。
+ * 脚本仍可用 Bearer AGENT_API_TOKEN；Worker 用 EXCHANGE_WORKER_TOKEN。
+ * 未登录不能进面板。会话 30 天。
  */
+
+export const WEB_TOKEN_KEY = "agentWebToken";
+export const AUTH_EXPIRED_EVENT = "agent-auth-expired";
+
+export function readWebToken(): string {
+  return (localStorage.getItem(WEB_TOKEN_KEY) ?? "").trim();
+}
+
+export function webAuthHeaders(): Record<string, string> {
+  const webToken = readWebToken();
+  return webToken ? { "X-Agent-Web-Token": webToken } : {};
+}
 
 export class ApiError extends Error {
   readonly status: number;
@@ -51,21 +59,26 @@ async function request<T>(path: string, options: RequestOptions, auth?: Credenti
   if (auth) {
     const token = auth.token.trim();
     if (token) headers.Authorization = `Bearer ${token}`;
-    const webToken = auth.webToken?.trim();
-    if (webToken) headers["X-Agent-Web-Token"] = webToken;
   }
+  const webToken = auth?.webToken?.trim() || readWebToken();
+  if (webToken) headers["X-Agent-Web-Token"] = webToken;
   const response = await fetch(path, {
     method: options.method ?? "GET",
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     signal: options.signal,
   });
-  if (!response.ok) throw new ApiError(await readError(response), response.status);
+  if (!response.ok) {
+    if (response.status === 401 && !path.endsWith("/api/agent/login")) {
+      window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    }
+    throw new ApiError(await readError(response), response.status);
+  }
   if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 
-/** 看板、台账、合同这类页面接口，无鉴权。 */
+/** 页面接口。未登录会被 401；已登录自动带网页会话。 */
 export const publicApi = {
   get: <T>(path: string, options: RequestOptions = {}) => request<T>(path, options),
   post: <T>(path: string, body: unknown, options: RequestOptions = {}) =>
@@ -92,13 +105,13 @@ export const agentApi = {
  */
 export async function fetchBlob(path: string, auth?: Credentials): Promise<Blob> {
   const headers: Record<string, string> = {};
-  if (auth) {
-    headers.Authorization = `Bearer ${auth.token.trim()}`;
-    const webToken = auth.webToken?.trim();
-    if (webToken) headers["X-Agent-Web-Token"] = webToken;
-  }
+  if (auth?.token.trim()) headers.Authorization = `Bearer ${auth.token.trim()}`;
+  Object.assign(headers, webAuthHeaders());
   const response = await fetch(path, { headers });
-  if (!response.ok) throw new ApiError(await readError(response), response.status);
+  if (!response.ok) {
+    if (response.status === 401) window.dispatchEvent(new Event(AUTH_EXPIRED_EVENT));
+    throw new ApiError(await readError(response), response.status);
+  }
   return await response.blob();
 }
 

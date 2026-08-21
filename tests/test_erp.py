@@ -50,7 +50,7 @@ class DigitalWorkerConfigTests(unittest.TestCase):
         self.assertTrue(status["enabled"])
         self.assertFalse(status["hasPassword"])
         self.assertEqual("10235039", status["ownerCoId"])
-        self.assertEqual(("erp.exchange_items",), ALLOWED_COMMANDS)
+        self.assertEqual(("erp.exchange_items", "erp.create_purchase_order"), ALLOWED_COMMANDS)
 
     def test_explicit_disable_is_kill_switch(self):
         status = load_digital_worker(

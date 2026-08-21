@@ -88,6 +88,11 @@ a { color: var(--series-1); }
 }
 .topbar nav a:hover { color: var(--text-primary); border-bottom-color: var(--text-primary); }
 .topbar nav a[aria-current="page"] { color: var(--text-primary); font-weight: 600; border-bottom-color: var(--series-1); }
+.topbar-user {
+  display: flex; align-items: center; gap: 8px;
+  font-size: 12px; color: var(--text-secondary);
+}
+.topbar-user .btn { padding: 3px 8px; }
 
 /* ───────────────────────── 表单原语 ───────────────────────── */
 .field { display: flex; flex-direction: column; gap: 4px; }
@@ -130,6 +135,25 @@ input:disabled, select:disabled, textarea:disabled { opacity: .55; cursor: not-a
 .credentials-grid { display: flex; flex-wrap: wrap; gap: 8px; }
 .credentials-grid > input { flex: 1 1 130px; min-width: 0; }
 .credentials-grid > .btn { flex: none; white-space: nowrap; }
+
+.login-screen {
+  max-width: 420px;
+  margin: 72px auto 40px;
+  padding: 0 24px;
+}
+.login-screen h1 {
+  margin: 0 0 8px;
+  font-size: 22px;
+  font-weight: 650;
+  letter-spacing: .04em;
+}
+.login-screen .login-form {
+  margin-top: 18px;
+  padding: 16px 18px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-1);
+}
 
 .reset {
   background: transparent; border: 0; border-bottom: 1px solid var(--border);

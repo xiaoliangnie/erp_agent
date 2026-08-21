@@ -2,8 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-采购看板 / 交期提醒台账 / 采购合同生成 / 订单换货 / 代发订单 / 采购助手对话 / 工作台。一个 Vite + React + TS
-单页应用（六条路由）+ 一个 Python 标准库 HTTP 服务。数据源是
+采购看板 / 交期提醒台账 / 鞋服SPU / 自营百货 / 采购合同生成 / 订单换货 / 代发订单 / 工作台。一个 Vite + React + TS
+单页应用（七条导航；`/chat` `/exchange` 先藏）+ 一个 Python 标准库 HTTP 服务。数据源是
 供应链安全代理 API 维护的本地可写 MySQL 镜像。业务术语、文件名、注释和文档一律用中文，改动时保持一致。
 
 `AGENTS.md` 有提交与代码风格约定；`README.md` 记录全部业务口径；
@@ -30,7 +30,7 @@ npm run typecheck                                # tsc --noEmit，build 里也�
 python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py   # 快速语法检查
 
 # 离线用例。`discover` 用不了：tests/ 不是包，要按模块名列出
-.venv/bin/python -m unittest tests.test_agent tests.test_identity tests.test_forecast tests.test_delivery_reminders tests.test_exchange tests.test_order_source tests.test_product_images tests.test_realtime_mirror tests.test_gb_standards tests.test_contract_gb tests.test_dingtalk tests.test_codex_oauth tests.test_health_watch tests.test_payload_contract tests.test_http_auth tests.test_contracts tests.test_source_cache tests.test_quality tests.test_supplier_master tests.test_erp tests.test_insole tests.test_dropship
+.venv/bin/python -m unittest tests.test_agent tests.test_identity tests.test_forecast tests.test_forecast_prep tests.test_delivery_reminders tests.test_exchange tests.test_order_source tests.test_product_images tests.test_realtime_mirror tests.test_gb_standards tests.test_contract_gb tests.test_dingtalk tests.test_codex_oauth tests.test_health_watch tests.test_payload_contract tests.test_http_auth tests.test_contracts tests.test_source_cache tests.test_ops_status tests.test_quality tests.test_supplier_master tests.test_erp tests.test_insole tests.test_dropship tests.test_spu_plan tests.test_purchase_draft
 .venv/bin/python -m unittest tests.test_contracts   # 离线夹具；CONTRACT_LIVE_TESTS=1 才连库
 .venv/bin/python -m unittest tests.test_agent.ConfirmFlowTests   # 单个类
 
@@ -49,7 +49,20 @@ python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py   # 快
 .venv/bin/python scripts/run_dingtalk_cli.py status         # 钉钉 Stream / 发送通道 / 绑定
 .venv/bin/python scripts/health_watch.py                    # 拉 /api/health，异常发钉钉
 .venv/bin/python scripts/health_watch.py --dry-run          # 只评估，不发钉钉
+.venv/bin/python scripts/run_insole_schedule.py             # 立刻跑一轮抖音鞋垫定时任务
+.venv/bin/python scripts/run_insole_schedule.py --status    # 只看调度状态
 
+# 鞋服 SPU 总表（读镜像；库存/出库已进 60 秒同步；--inventory-history 补不动销款）
+.venv/bin/python scripts/run_spu_alerts.py
+.venv/bin/python scripts/run_spu_alerts.py --board baihuo
+.venv/bin/python scripts/run_spu_alerts.py --sync
+
+# 生产计划表（标签「重点产品」圈款；订货量读员工订货表，系统只供库存/在途/净销量）
+.venv/bin/python scripts/run_production_plan.py --source /path/to/订货表.xlsx
+.venv/bin/python scripts/run_production_plan.py --notify  # 生成后把当月需补货/及时入库推钉钉群
+
+# F1 旁路报告（质量 / 回测 / k_H），不写线上模型目录
+.venv/bin/python scripts/run_forecast_prep.py
 # 训练并落工件到 FORECAST_MODEL_DIR，--forecaster 缺省用仓库里的 Baseline
 .venv/bin/python scripts/train_forecast_model.py --csv 销售明细.csv --forecaster mypkg.model:MyForecaster
 
@@ -83,8 +96,8 @@ python3 -m py_compile backend/*.py backend/*/*.py scripts/*.py server.py   # 快
 Agent 链路复用同一份查询和同一份缓存，不另开数据源：
 
 ```
-前端 /chat 页 · 钉钉 Stream
-  → backend/app.py            /api/agent/chat（Bearer AGENT_API_TOKEN）
+钉钉 Stream（网页 /chat 已隐藏）
+  → backend/app.py            /api/agent/chat（网页会话或 Bearer AGENT_API_TOKEN）
   → backend/agent/runner.py   工具循环，上限 AGENT_MAX_TOOL_STEPS
   → backend/agent/tools.py    工具注册表：L0 直接执行，L1/L2 转 pending_action 等人工确认
   → 确定性实现               database.py · delivery_reminders.py · contracts.py · exchange/ · forecast/
@@ -93,17 +106,19 @@ Agent 链路复用同一份查询和同一份缓存，不另开数据源：
 
 `server.py` 只是 `backend.app.main` 的入口。服务用标准库 `ThreadingHTTPServer` 手写，
 没有 Web 框架，运行期依赖是 PyMySQL、openpyxl、Pillow（钉钉 Stream 才需要 `dingtalk-stream`）；新增接口
-就是在 `Handler.do_GET/do_POST` 里加分支。`source_cache()` 按年度缓存 30 秒，页面和
-Agent 工具（`agent_rows()`）共用这一份，短时间内不会重复压库。
+就是在 `Handler.do_GET/do_POST` 里加分支。`source_cache()` 按年度缓存 30 秒，过期后
+先返回上一份（10 分钟内）再后台刷新；`PageCacheKeeper` 自己续热，进页尽量打中内存。
+页面和 Agent 工具（`agent_rows()`）共用这一份。
 实时库连不上就直接报错，**不回退旧库**——避免员工把历史快照当成实时数据。
 国标目录由 `backend/gb_standards.py` 写入同一镜像库的 `gb_standards` 表，不经过供应链代理。
 
-### 前端：一个单页应用，六条路由
+### 前端：一个单页应用，七条导航
 
 ```
 frontend/index.html · frontend/src/main.tsx     Vite 入口，root 是 frontend/
-  → src/App.tsx                                 六个页面按 React.lazy 分块
-  → src/routes.ts                                /dashboard /ledger /contract /exchange /chat /workbench
+  → src/App.tsx                                 页面按 React.lazy 分块
+  → src/routes.ts                                /dashboard /ledger /spu /baihuo /purchase /contract /status
+                                                 `/chat` `/workbench` `/exchange` 重定向到 `/status`
                                                  路径用 ASCII 且只写这一处，标题仍是中文
   → src/pages/<page>/                            每页一个目录：Page + 视图模型 + 局部 CSS
   → src/api/client.ts                            publicApi / exchangeApi / agentApi
@@ -222,7 +237,7 @@ Agent 业务库是本地 SQLite（`AGENT_DATABASE_PATH`），表名与架构方�
 ERP 写入走 `DigitalRuntime.run("erp.exchange_items")`：写入前快照、写入后
 `loadOrder` 回读 SKU，对不上不记成功；已经是目标 SKU 则跳过改单。JSON 证据落
 `files/data/erp-evidence/`（`ERP_EVIDENCE_DIR`）。结果未知抛 `ErpUnknownResult`，不得重试。
-正式建单和其他出库仍关闭。
+看板建采购单走 `/purchase` 二次确认 + `erp.create_purchase_order`（`editor.aspx` 的 `_ACP('Confirm')`）。其他出库仍关闭。
 
 ### 预测子系统的边界
 
@@ -230,9 +245,13 @@ ERP 写入走 `DigitalRuntime.run("erp.exchange_items")`：写入前快照、写
 只是占位实现。工件目录 `metadata.json` 里的 `forecaster` 字段（`模块:类名`）是服务端与
 模型实现之间**唯一的耦合点**，换实现不改调用方。接入步骤见 `docs/预测.md`。
 
-销售出库表和现势库存表还没进实时库，表名列名做成了 `FORECAST_SALES_*` /
-`FORECAST_INVENTORY_*` 配置。**库存缺失时 `order_suggestion` 直接报错说明缺哪些 SKU，
-不用 0 兜底**——与合同生成同一哲学。在途待入库已可用（采购明细 数量 − 已入库）。
+鞋服 SPU 用 `realtime_inventory` / `realtime_sales_outbounds`，已进 60 秒 `sync_all`
+（库存/出库/售后放最后；失败不拖垮采购/订单）。生产计划表近月净销再扣
+`realtime_sales_returns` 的实收 `r_qty`（按 `receive_date`）。不动销款可再
+`run_spu_alerts.py --sync` 按款补齐。
+订货建议仍走 `FORECAST_SALES_*` / `FORECAST_INVENTORY_*`，不要默默接那两张表。
+**库存缺失时 `order_suggestion` 直接报错说明缺哪些 SKU，不用 0 兜底**——与合同生成同一哲学。
+在途待入库已可用（采购明细 数量 − 已入库）。
 
 ### 跟单三档催办口径只有一份实现
 
@@ -248,11 +267,12 @@ ERP 写入走 `DigitalRuntime.run("erp.exchange_items")`：写入前快照、写
 - `.env`：服务、Agent、钉钉配置，在 `backend/app.py` 导入时由 `load_all_env` 读入；
   `setting()` 让进程环境变量优先于 `.env`
 - 页面走 `frontend/dist/` SPA 托管；`STATIC_FILES` 白名单只剩换货核心 JS（油猴脚本已退役，路径仍提供）
-- `/api/contracts/*` 页面用、无鉴权（资源路径限制在 `files/outputs/` 下）；`/api/exchange/*`
+- `/api/dashboard` `/api/delivery` `/api/now` `/api/contracts/*` `/api/spu/*` `/api/purchase-drafts*`
+  网页须登录（`X-Agent-Web-Token`）；`/api/health`、品控签名链接仍公开。`/api/exchange/*`
   双 token（页面 `EXCHANGE_API_TOKEN` / worker `EXCHANGE_WORKER_TOKEN`）；
-  `/api/agent/*`、`/api/forecast/*` 用 Bearer `AGENT_API_TOKEN` 常量时间比对，
-  未配置 token 时返回 503 保持关闭
-- `AGENT_ENABLED` 默认 `false`；关闭时对话接口返回 503，看板与合同链路不受影响
+  `/api/agent/*` 网页用登录后的 `X-Agent-Web-Token`（钉钉「绑定网页」发花名+密码，会话 30 天）；
+  脚本和 `/api/forecast/*` 仍用 Bearer `AGENT_API_TOKEN` 常量时间比对，未配置 token 时预测 503
+- `AGENT_ENABLED` 默认 `false`；关闭时对话接口返回 503，看板页面仍须登录才能打开
 - `DINGTALK_ENABLED` 是总闸：关闭则不装配发送通道，催办/品控日报也发不出去。
   `DINGTALK_REMINDER_ENABLED` 另管每日定时催办（不依赖大模型）。
   应用机器人 `groupMessages/send` 官方不支持 @。催办已绑定员工走

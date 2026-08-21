@@ -540,6 +540,45 @@ def fetch_supplier_price_history(env_path, seller, sku_ids, *, exclude_po_id=Non
     return history
 
 
+def fetch_last_suppliers(env_path, keys: list[str]) -> dict[str, str]:
+    """款式编码 / SKU → 最近一笔未取消采购的供应商简称。"""
+    unique = [str(key).strip() for key in dict.fromkeys(keys or []) if str(key).strip()]
+    if not unique or not env_path:
+        return {}
+    found: dict[str, str] = {}
+    try:
+        with connect(env_path, autocommit=True) as conn:
+            with conn.cursor() as cursor:
+                for index in range(0, len(unique), 400):
+                    chunk = unique[index:index + 400]
+                    marks = ",".join(["%s"] * len(chunk))
+                    cursor.execute(
+                        f"""
+                        SELECT i.sku_id, i.i_id, m.seller
+                        FROM `{REALTIME_ITEM_TABLE}` i
+                        JOIN `{REALTIME_MAIN_TABLE}` m ON m.po_id = i.po_id
+                        WHERE (i.sku_id IN ({marks}) OR i.i_id IN ({marks}))
+                          AND COALESCE(m.seller, '') <> ''
+                          AND COALESCE(m.status, '') NOT IN ('Cancelled', 'Delete', 'Merged')
+                        ORDER BY m.po_date DESC, i.po_id DESC
+                        """,
+                        tuple(chunk + chunk),
+                    )
+                    for row in cursor.fetchall() or []:
+                        seller = str(row.get("seller") or "").strip()
+                        if not seller:
+                            continue
+                        sku = str(row.get("sku_id") or "").strip()
+                        style = str(row.get("i_id") or "").strip()
+                        if sku and sku not in found:
+                            found[sku] = seller
+                        if style and style not in found:
+                            found[style] = seller
+    except Exception:
+        return found
+    return found
+
+
 def fetch_contract_order_choices(env_path="hanli.env", limit=100, query=""):
     """搜索本年度可用于生成合同的采购单，供页面选择。"""
     limit = max(1, min(int(limit), 1000))

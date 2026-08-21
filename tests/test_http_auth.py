@@ -132,6 +132,23 @@ class HttpAuthTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertTrue(payload.get("webToken"))
 
+    def test_login_does_not_need_shared_token(self):
+        sender_id = "u-web-login"
+        app_mod.STAFF_DIRECTORY.upsert("测登录", dingtalk_user_id=sender_id, role="operator")
+        issued = app_mod.WEB_AUTH.issue_account(sender_id=sender_id, buyer_name="测登录")
+        status, payload = self.request(
+            "/api/agent/login", method="POST",
+            body={"username": "测登录", "password": issued["password"]},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload.get("webToken"))
+        me_status, me = self.request(
+            "/api/agent/me",
+            headers={"X-Agent-Web-Token": payload["webToken"]},
+        )
+        self.assertEqual(200, me_status)
+        self.assertEqual("测登录", me.get("operator"))
+
     def test_quality_decide_requires_bearer(self):
         self.assertEqual(401, self.request("/api/agent/quality/abcdef/resolve", method="POST", body={})[0])
 
@@ -255,14 +272,39 @@ class HttpAuthTests(unittest.TestCase):
         self.assertTrue(erp.get("hasUsername"))
         self.assertTrue(erp.get("hasPassword"))
 
-    def test_dashboard_and_contracts_have_no_bearer(self):
+    def test_now_requires_web_login(self):
+        status, payload = self.request("/api/now")
+        self.assertEqual(401, status)
+        self.assertIn("绑定网页", payload.get("error", ""))
+        session = self.issue_web_session()
+        status, payload = self.request(
+            "/api/now", headers={"X-Agent-Web-Token": session["webToken"]},
+        )
+        self.assertEqual(200, status)
+        self.assertTrue(payload.get("ok"))
+        self.assertRegex(str(payload.get("now") or ""), r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        self.assertEqual("Asia/Shanghai", payload.get("tz"))
+
+    def test_dashboard_and_contracts_require_web_login(self):
         with patch.object(app_mod, "source_cache", return_value={"dashboard": {"meta": {"rows": 0}}}):
-            status, _ = self.request("/api/dashboard")
+            status, payload = self.request("/api/dashboard")
+        self.assertEqual(401, status)
+        self.assertIn("绑定网页", payload.get("error", ""))
+        session = self.issue_web_session()
+        with patch.object(app_mod, "source_cache", return_value={"dashboard": {"meta": {"rows": 0}}}):
+            status, _ = self.request(
+                "/api/dashboard",
+                headers={"X-Agent-Web-Token": session["webToken"]},
+            )
         self.assertEqual(200, status)
         with patch("backend.app.fetch_contract_order_choices", return_value=[]):
-            status, payload = self.request("/api/contracts/orders")
+            status, payload = self.request(
+                "/api/contracts/orders",
+                headers={"X-Agent-Web-Token": session["webToken"]},
+            )
         self.assertEqual(200, status)
         self.assertEqual([], payload.get("orders"))
+        self.assertEqual(401, self.request("/api/dashboard", token=AGENT_TOKEN)[0])
 
 
 if __name__ == "__main__":

@@ -7,10 +7,14 @@
 export const ROUTES = {
   dashboard: "/dashboard",
   ledger: "/ledger",
+  spu: "/spu",
+  baihuo: "/baihuo",
+  purchase: "/purchase",
   contract: "/contract",
   exchange: "/exchange",
   chat: "/chat",
   workbench: "/workbench",
+  status: "/status",
 } as const;
 
 export interface NavItem {
@@ -23,8 +27,9 @@ export interface NavItem {
 export const NAV_ITEMS: NavItem[] = [
   { path: ROUTES.dashboard, label: "采购看板", keepsYear: true },
   { path: ROUTES.ledger, label: "交期提醒台账", keepsYear: true },
+  { path: ROUTES.spu, label: "鞋服SPU", keepsYear: false },
+  { path: ROUTES.baihuo, label: "自营百货", keepsYear: false },
+  { path: ROUTES.purchase, label: "建立采购单", keepsYear: false },
   { path: ROUTES.contract, label: "采购合同", keepsYear: false },
-  { path: ROUTES.exchange, label: "订单换货", keepsYear: false },
-  { path: ROUTES.chat, label: "采购助手", keepsYear: false },
-  { path: ROUTES.workbench, label: "工作台", keepsYear: false },
+  { path: ROUTES.status, label: "工作台", keepsYear: false },
 ];

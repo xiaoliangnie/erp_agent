@@ -73,6 +73,14 @@ TARGET_PREFIXES = ("XZ25401308-099", "XZ25401308099")
 INSOLE_WRITTEN_PATH = DATA_DIR / "insole_written.json"
 WRITTEN_TTL_HOURS = 48
 WRITTEN_REASON = "本批已写入，镜像尚未跟上"
+DONE_STATUS = "已处理"
+DONE_LIMIT = 20
+INSOLE_LINES_TTL = 60
+INSOLE_LINES_STALE = 300
+INSOLE_OID_CHUNK = 400
+_lines_cache: dict = {}
+_lines_lock = threading.Lock()
+_lines_rebuilding: set[str] = set()
 RESERVED_REASON = "他人待确认或正在写入"
 RESERVED_STATUSES = frozenset({"pending", "confirmed"})
 _WRITE_LOCK = threading.Lock()
@@ -549,12 +557,116 @@ def _aggregate_orders(lines: list[dict]) -> list[dict]:
     return rows
 
 
+def _chunks(values: list[str], size: int = INSOLE_OID_CHUNK):
+    step = max(1, int(size))
+    for index in range(0, len(values), step):
+        yield values[index:index + step]
+
+
+def merge_insole_lines(headers: dict[str, dict], items: list[dict]) -> list[dict]:
+    """单头 + 明细在内存拼行，避免镜像上 CAST JOIN 扫全表。"""
+    lines = []
+    for item in items:
+        oid = str(item.get("o_id") or "").strip()
+        header = headers.get(oid)
+        if not header:
+            continue
+        lines.append({**header, **item, "o_id": oid})
+    lines.sort(key=lambda row: (str(row.get("o_id") or ""), str(row.get("sku_id") or "")), reverse=True)
+    return lines
+
+
+def invalidate_insole_lines_cache() -> None:
+    with _lines_lock:
+        _lines_cache.clear()
+
+
+def _lines_cache_key(env: str, shops) -> str:
+    return f"{env}|{','.join(shop_keys(shops))}"
+
+
+def _sync_payload(sync: dict) -> dict:
+    return {
+        "status": str(sync.get("status") or ""),
+        "lastSuccessAt": str(sync.get("last_success_at") or ""),
+        "errorMessage": str(sync.get("error_message") or ""),
+    }
+
+
 def fetch_insole_lines(setting: Callable[[str, str], str], env_path: str,
                        *, o_ids: list[str] | None = None, shops=None) -> tuple[list[dict], dict]:
     """从订单镜像拉出仍含源鞋垫 SKU 的整单明细。
 
-    未指定单号时只拉查询池店铺、且状态仍可能处理的单，避免扫已发货那几千行。
+    未指定单号时只拉查询池店铺、且状态仍可能处理的单。清单查询走 60 秒缓存，
+    过期先回上一份再后台刷新，避免钉钉连着问两次都扫库。
     """
+    wanted = [str(item).strip() for item in (o_ids or []) if str(item).strip()]
+    env = str(setting("EXCHANGE_ORDER_DATABASE_ENV_FILE", "") or "").strip() or env_path
+    cache_key = "" if wanted else _lines_cache_key(env, shops)
+    if cache_key:
+        now = time.monotonic()
+        with _lines_lock:
+            cached = _lines_cache.get(cache_key)
+            if cached and cached["expires"] > now:
+                return list(cached["lines"]), dict(cached["sync"])
+            stale = bool(cached and cached.get("staleUntil", 0) > now)
+        if stale:
+            _schedule_lines_rebuild(setting, env_path, shops, cache_key)
+            return list(cached["lines"]), dict(cached["sync"])
+    lines, sync = _query_insole_lines(setting, env_path, o_ids=wanted, shops=shops)
+    if cache_key:
+        now = time.monotonic()
+        with _lines_lock:
+            _lines_cache[cache_key] = {
+                "lines": list(lines),
+                "sync": dict(sync),
+                "expires": now + INSOLE_LINES_TTL,
+                "staleUntil": now + INSOLE_LINES_STALE,
+            }
+    return lines, sync
+
+
+def _schedule_lines_rebuild(setting, env_path, shops, cache_key: str) -> None:
+    with _lines_lock:
+        if cache_key in _lines_rebuilding:
+            return
+        _lines_rebuilding.add(cache_key)
+
+    def worker():
+        try:
+            lines, sync = _query_insole_lines(setting, env_path, o_ids=[], shops=shops)
+            now = time.monotonic()
+            with _lines_lock:
+                _lines_cache[cache_key] = {
+                    "lines": list(lines),
+                    "sync": dict(sync),
+                    "expires": now + INSOLE_LINES_TTL,
+                    "staleUntil": now + INSOLE_LINES_STALE,
+                }
+        except Exception:
+            logger.exception("后台刷新鞋垫定位缓存失败")
+        finally:
+            with _lines_lock:
+                _lines_rebuilding.discard(cache_key)
+
+    threading.Thread(target=worker, name="insole-lines-cache", daemon=True).start()
+
+
+def warm_insole_lines_cache(setting: Callable[[str, str], str], env_path: str,
+                            *, shops=None) -> None:
+    """服务起来后先扫一轮进缓存，避免员工第一条钉钉再等冷查询。"""
+    def worker():
+        try:
+            fetch_insole_lines(setting, env_path, shops=shops)
+            logger.info("鞋垫定位缓存已预热")
+        except Exception:
+            logger.warning("鞋垫定位缓存预热失败", exc_info=True)
+
+    threading.Thread(target=worker, name="insole-cache-warm", daemon=True).start()
+
+
+def _query_insole_lines(setting: Callable[[str, str], str], env_path: str,
+                        *, o_ids: list[str], shops=None) -> tuple[list[dict], dict]:
     availability = source_status(setting)
     if not availability["configured"]:
         raise OrderSourceError(availability.get("message") or "订单镜像尚未配置")
@@ -583,60 +695,87 @@ def fetch_insole_lines(setting: Callable[[str, str], str], env_path: str,
     status_col = _identifier(setting("EXCHANGE_ORDER_STATUS_COLUMN", "status"), "EXCHANGE_ORDER_STATUS_COLUMN", required=False)
     shop_col = _identifier(setting("EXCHANGE_ORDER_SHOP_COLUMN", "shop_name"), "EXCHANGE_ORDER_SHOP_COLUMN", required=False)
     date_col = _identifier(setting("EXCHANGE_ORDER_DATE_COLUMN", "order_date"), "EXCHANGE_ORDER_DATE_COLUMN", required=False)
-    style_sql = f"i.`{item_style}`" if item_style else "''"
-    name_sql = f"i.`{item_name}`" if item_name else "''"
-    props_sql = f"i.`{item_props}`" if item_props else "''"
-    qty_sql = f"i.`{item_qty}`" if item_qty else "''"
-    so_sql = f"o.`{so_col}`" if so_col else "''"
-    status_sql = f"o.`{status_col}`" if status_col else "''"
-    shop_sql = f"o.`{shop_col}`" if shop_col else "''"
-    date_sql = f"o.`{date_col}`" if date_col else "''"
-    wanted = [str(item).strip() for item in (o_ids or []) if str(item).strip()]
-    inner = f"SELECT DISTINCT `{item_oid}` FROM `{item_table}` WHERE `{item_sku}`=%s"
-    params: list = [SOURCE_SKU]
-    if wanted:
-        inner += " AND CAST(`{col}` AS CHAR) IN ({ph})".format(
-            col=item_oid, ph=",".join(["%s"] * len(wanted)),
-        )
-        params.extend(wanted)
-    filters = [f"i.`{item_oid}` IN ({inner})"]
-    if not wanted:
-        live = tuple(PROCESSABLE_STATUSES | PARKED_STATUSES)
-        if status_col:
-            filters.append(
-                f"o.`{status_col}` IN ({','.join(['%s'] * len(live))})"
-            )
-            params.extend(live)
-        keys = shop_keys(shops)
-        if shop_col and keys:
-            filters.append(
-                "(" + " OR ".join([f"o.`{shop_col}` LIKE %s"] * len(keys)) + ")"
-            )
-            params.extend([f"%{key}%" for key in keys])
-    sql = f"""
-        SELECT o.`{oid_col}` AS o_id, {so_sql} AS so_id, {status_sql} AS status,
-               {shop_sql} AS shop_name, {date_sql} AS order_date,
-               i.`{item_sku}` AS sku_id, {style_sql} AS i_id, {name_sql} AS name,
-               {props_sql} AS properties_value, {qty_sql} AS qty
-        FROM `{item_table}` i
-        JOIN `{order_table}` o ON CAST(o.`{oid_col}` AS CHAR)=CAST(i.`{item_oid}` AS CHAR)
-        WHERE {" AND ".join(filters)}
-        ORDER BY o.`{oid_col}` DESC, i.`{item_sku}`
-    """
+    style_sql = f"`{item_style}`" if item_style else "''"
+    name_sql = f"`{item_name}`" if item_name else "''"
+    props_sql = f"`{item_props}`" if item_props else "''"
+    qty_sql = f"`{item_qty}`" if item_qty else "''"
+    so_sql = f"`{so_col}`" if so_col else "''"
+    status_sql = f"`{status_col}`" if status_col else "''"
+    shop_sql = f"`{shop_col}`" if shop_col else "''"
+    date_sql = f"`{date_col}`" if date_col else "''"
+    wanted = [str(item).strip() for item in o_ids or [] if str(item).strip()]
+    started = time.monotonic()
     with connect(env, autocommit=True) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
                 """SELECT status, last_success_at, error_message
                    FROM realtime_sync_state WHERE source_name='orders' LIMIT 1"""
             )
-            sync = cursor.fetchone() or {}
-            cursor.execute(sql, params)
-            lines = list(cursor.fetchall() or [])
-    return lines, {
-        "status": str(sync.get("status") or ""),
-        "lastSuccessAt": str(sync.get("last_success_at") or ""),
-        "errorMessage": str(sync.get("error_message") or ""),
-    }
+            sync = _sync_payload(cursor.fetchone() or {})
+            sku_sql = f"SELECT DISTINCT `{item_oid}` AS o_id FROM `{item_table}` WHERE `{item_sku}`=%s"
+            sku_params: list = [SOURCE_SKU]
+            if wanted:
+                sku_sql += " AND `{col}` IN ({ph})".format(
+                    col=item_oid, ph=",".join(["%s"] * len(wanted)),
+                )
+                sku_params.extend(wanted)
+            cursor.execute(sku_sql, sku_params)
+            sku_oids = [
+                str(row.get("o_id") or "").strip()
+                for row in (cursor.fetchall() or [])
+                if str(row.get("o_id") or "").strip()
+            ]
+            if not sku_oids:
+                return [], sync
+            headers: dict[str, dict] = {}
+            live = tuple(PROCESSABLE_STATUSES | PARKED_STATUSES)
+            keys = shop_keys(shops)
+            for chunk in _chunks(sku_oids):
+                marks = ",".join(["%s"] * len(chunk))
+                filters = [f"`{oid_col}` IN ({marks})"]
+                params: list = list(chunk)
+                if not wanted:
+                    if status_col:
+                        filters.append(
+                            f"`{status_col}` IN ({','.join(['%s'] * len(live))})"
+                        )
+                        params.extend(live)
+                    if shop_col and keys:
+                        filters.append(
+                            "(" + " OR ".join([f"`{shop_col}` LIKE %s"] * len(keys)) + ")"
+                        )
+                        params.extend([f"%{key}%" for key in keys])
+                cursor.execute(
+                    f"""SELECT `{oid_col}` AS o_id, {so_sql} AS so_id,
+                               {status_sql} AS status, {shop_sql} AS shop_name,
+                               {date_sql} AS order_date
+                        FROM `{order_table}`
+                        WHERE {" AND ".join(filters)}""",
+                    params,
+                )
+                for row in cursor.fetchall() or []:
+                    oid = str(row.get("o_id") or "").strip()
+                    if oid:
+                        headers[oid] = dict(row)
+            if not headers:
+                return [], sync
+            items: list[dict] = []
+            for chunk in _chunks(list(headers)):
+                marks = ",".join(["%s"] * len(chunk))
+                cursor.execute(
+                    f"""SELECT `{item_oid}` AS o_id, `{item_sku}` AS sku_id,
+                               {style_sql} AS i_id, {name_sql} AS name,
+                               {props_sql} AS properties_value, {qty_sql} AS qty
+                        FROM `{item_table}`
+                        WHERE `{item_oid}` IN ({marks})""",
+                    list(chunk),
+                )
+                items.extend(dict(row) for row in (cursor.fetchall() or []))
+    lines = merge_insole_lines(headers, items)
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if elapsed_ms >= 800:
+        logger.info("鞋垫定位分步查询 %s 单 / %s 行，用时 %sms", len(headers), len(lines), elapsed_ms)
+    return lines, sync
 
 
 def locate_insole_orders(
@@ -715,16 +854,65 @@ def public_order(row: dict) -> dict:
         "sizeNote": row.get("size_note") or "",
         "sourceSku": row.get("source_sku") or SOURCE_SKU,
         "reason": row.get("reason") or "",
+        "at": row.get("at") or "",
     }
 
 
-def format_insole_list(located: dict, *, limit: int = 5) -> str:
+def _done_order(row: dict | None = None, *, oid="", target="", at="", reason=WRITTEN_REASON) -> dict:
+    payload = public_order({
+        **(row or {}),
+        "o_id": (row or {}).get("o_id") or oid,
+        "target_sku": (row or {}).get("target_sku") or target,
+        "status": DONE_STATUS,
+        "reason": reason,
+        "at": at or (row or {}).get("at") or "",
+    })
+    payload["status"] = DONE_STATUS
+    payload["reason"] = reason
+    return payload
+
+
+def recent_done_orders(*, setting=None, root=None, extra=None, limit: int = DONE_LIMIT) -> list[dict]:
+    """刚写成功的单：镜像可能还是 Question，清单里要立刻显示已处理。"""
+    written = load_written_insole_orders(setting, root=root)
+    rows = []
+    seen = set()
+    for item in extra or []:
+        if not isinstance(item, dict):
+            continue
+        oid = str(item.get("oId") or item.get("o_id") or "").strip()
+        if not oid or oid in seen:
+            continue
+        seen.add(oid)
+        rows.append(item if item.get("oId") else _done_order(
+            oid=oid,
+            target=str(item.get("targetSku") or item.get("target_sku") or ""),
+            at=str(item.get("at") or ""),
+        ))
+    for oid, meta in sorted(
+        written.items(),
+        key=lambda item: str(item[1].get("at") or ""),
+        reverse=True,
+    ):
+        if oid in seen:
+            continue
+        seen.add(oid)
+        rows.append(_done_order(
+            oid=oid,
+            target=str(meta.get("target_sku") or ""),
+            at=str(meta.get("at") or ""),
+        ))
+    return rows[: max(1, int(limit))]
+
+
+def format_insole_list(located: dict, *, limit: int = 5, pending_confirm: bool = True) -> str:
     """钉钉 / 对话用的订单清单，只展开处理信息与目标鞋垫。"""
     processable = located.get("processable") or []
     parked = located.get("parked") or []
+    pool = str(located.get("shop") or "").replace(",", "/") or "抖音/快手/视频号"
     lines = [
         f"鞋垫待处理 {located.get('processableCount') or 0} 单"
-        f"（抖音/快手/视频号；Question / WaitConfirm；半码按码数舍去小数后映射）。",
+        f"（{pool}；Question / WaitConfirm；半码按码数舍去小数后映射）。",
     ]
     shown = processable[: max(1, int(limit))]
     if shown:
@@ -736,7 +924,10 @@ def format_insole_list(located: dict, *, limit: int = 5) -> str:
         )
     extra = len(processable) - len(shown)
     if extra > 0:
-        lines.append(f"还有 {extra} 单未展开，确认后按完整清单处理。")
+        if pending_confirm:
+            lines.append(f"还有 {extra} 单未展开，确认后按完整清单处理。")
+        else:
+            lines.append(f"还有 {extra} 单未展开，按完整清单写入。")
     if parked:
         reasons = defaultdict(int)
         for row in parked:
@@ -791,7 +982,8 @@ def format_insole_result(result: dict | None, *, limit: int = 5, elapsed_ms=None
         elapsed = result.get("elapsedMs")
         if elapsed is None:
             elapsed = result.get("elapsed_ms")
-    headline = f"【任务完成】鞋垫换货：成功 {ok}，跳过 {skipped}，失败 {failed}"
+    kind = str(result.get("headline") or "鞋垫换货").strip() or "鞋垫换货"
+    headline = f"【任务完成】{kind}：成功 {ok}，跳过 {skipped}，失败 {failed}"
     pretty = format_elapsed(elapsed)
     if pretty:
         headline += f"，用时 {pretty}"
@@ -831,6 +1023,101 @@ def format_insole_result(result: dict | None, *, limit: int = 5, elapsed_ms=None
     if extra_n > 0:
         lines.append(f"其余 {extra_n} 单已缩略。")
     return "\n".join(lines)
+
+
+def format_insole_start(located: dict | None, *, slot: str = "", trigger: str = "schedule",
+                        limit: int = 5) -> str:
+    """定时/手动开跑时的清单，不要求员工再确认。"""
+    located = located or {}
+    count = int(located.get("processableCount") or 0)
+    if trigger == "manual":
+        headline = f"【开始执行】手动触发抖音换鞋垫：本轮 {count} 单"
+    elif slot:
+        headline = f"【开始执行】定时抖音换鞋垫 {slot}：本轮 {count} 单"
+    else:
+        headline = f"【开始执行】定时抖音换鞋垫：本轮 {count} 单"
+    return "\n".join([
+        headline + "。",
+        format_insole_list(located, limit=limit, pending_confirm=False),
+    ])
+
+
+def format_insole_idle(located: dict | None = None, *, slot: str = "",
+                       trigger: str = "schedule") -> str:
+    """本轮没有可写订单。有人工待确认时不要说成「没有待处理」。"""
+    located = located or {}
+    parked = list(located.get("parked") or [])
+    parked_n = int(located.get("parkedCount") or len(parked) or 0)
+    reserved = [
+        row for row in (located.get("skipped") or [])
+        if str(row.get("reason") or "").startswith(RESERVED_REASON)
+    ]
+    if trigger == "manual":
+        headline = "【本轮结束】手动触发抖音换鞋垫"
+    elif slot:
+        headline = f"【本轮结束】定时抖音换鞋垫 {slot}"
+    else:
+        headline = "【本轮结束】定时抖音换鞋垫"
+    if reserved:
+        body = f"有 {len(reserved)} 单在人工待确认，本轮不抢"
+    else:
+        body = "没有待处理订单"
+    extras = []
+    if parked_n:
+        reasons = defaultdict(int)
+        for row in parked:
+            reasons[str(row.get("reason") or "暂不处理")] += 1
+        if reasons:
+            extras.append("；".join(f"{name} {count}" for name, count in reasons.items()))
+        else:
+            extras.append(f"暂不处理 {parked_n} 单")
+    if extras:
+        body += f"（{'；'.join(extras)}）"
+    return f"{headline}：{body}。"
+
+
+def build_insole_log(processable: list[dict], executed: dict | None) -> list[dict]:
+    """把写入结果对齐到定位清单，供结果日志和回写镜像。"""
+    executed = executed or {}
+    ok_ids = {str(item.get("o_id") or "") for item in executed.get("succeeded") or []}
+    fail_map = {
+        str(item.get("o_id") or ""): str(item.get("error") or item.get("reason") or "")
+        for item in executed.get("failed") or []
+    }
+    skip_map = {
+        str(item.get("o_id") or ""): str(item.get("reason") or "")
+        for item in executed.get("plans") or [] if not item.get("ok")
+    }
+    log = []
+    for row in processable:
+        oid = str(row.get("o_id") or "")
+        target = row.get("target_sku") or ""
+        if oid in ok_ids:
+            log.append({"oId": oid, "targetSku": target, "result": "ok"})
+        elif oid in fail_map:
+            log.append({
+                "oId": oid, "targetSku": target,
+                "result": "failed", "error": fail_map[oid],
+            })
+        else:
+            log.append({
+                "oId": oid, "targetSku": target,
+                "result": "skipped", "error": skip_map.get(oid, ""),
+            })
+    return log
+
+
+def persist_insole_success(log: list[dict], *, env_path: str, root=None, mirror=None) -> list[dict]:
+    """把成功写入的单记进台账并回写镜像。"""
+    writes = [
+        {"o_id": item["oId"], "target_sku": item.get("targetSku") or ""}
+        for item in log if item.get("result") == "ok" and item.get("oId")
+    ]
+    if writes:
+        remember_insole_writes(writes, root=root)
+        sync_insole_mirror(env_path, writes, mirror=mirror)
+        invalidate_insole_lines_cache()
+    return writes
 
 
 def exchange_job_for(target_sku: str, o_ids: list[str]) -> dict:
@@ -914,3 +1201,84 @@ def execute_insole_orders(runtime: Any, orders: list[dict]) -> dict:
             "reconciliation": executed.get("reconciliation") or {},
             "evidence": executed.get("evidence") or {},
         }
+
+
+def list_insole_board(
+    setting: Callable[[str, str], str] | None = None,
+    env_path: str = "",
+    *,
+    shop: str = DEFAULT_SHOP,
+    viewer: str | None = None,
+    root=None,
+) -> dict:
+    """网页换货页用的鞋垫清单。"""
+    located = locate_insole_orders(
+        setting, env_path, shop=shop, viewer=viewer, root=root,
+    )
+    from_locate = [
+        _done_order(row)
+        for row in located.get("skipped") or []
+        if row.get("reason") == WRITTEN_REASON
+    ]
+    done = recent_done_orders(setting=setting, root=root, extra=from_locate)
+    return {
+        "shop": located["shop"],
+        "sourceSku": located["sourceSku"],
+        "sync": located["sync"],
+        "processableCount": located["processableCount"],
+        "parkedCount": located["parkedCount"],
+        "skippedCount": located["skippedCount"],
+        "doneCount": len(done),
+        "processable": [public_order(row) for row in located["processable"]],
+        "parked": [public_order(row) for row in located["parked"]],
+        "done": done,
+    }
+
+
+def process_one_insole_order(
+    o_id,
+    *,
+    setting: Callable[[str, str], str] | None = None,
+    env_path: str = "",
+    erp: Any = None,
+    root=None,
+    mirror=None,
+    viewer: str | None = None,
+    shop: str = DEFAULT_SHOP,
+) -> dict:
+    """网页点「处理」：只写这一单，点击即确认。"""
+    oid = str(o_id or "").strip()
+    if not oid:
+        raise ExchangeError("请指定内部单号")
+    started = time.monotonic()
+    located = locate_insole_orders(
+        setting, env_path, shop=shop, o_ids=[oid],
+        viewer=viewer, root=root,
+    )
+    if not located["processable"]:
+        if located["parked"]:
+            raise ExchangeError(f"{oid} 是发货中，暂不处理")
+        skipped = located["skipped"]
+        if skipped:
+            raise ExchangeError(str(skipped[0].get("reason") or "这单现在不能处理"))
+        raise ExchangeError("找不到可处理的鞋垫订单")
+    result = execute_insole_orders(erp, located["processable"])
+    log = build_insole_log(located["processable"], result)
+    persist_insole_success(
+        log, env_path=env_path, root=root, mirror=mirror,
+    )
+    order = public_order(located["processable"][0])
+    done = _done_order(located["processable"][0]) if result["okCount"] else None
+    return {
+        "okCount": result["okCount"],
+        "skippedCount": result["skippedCount"],
+        "failedCount": result["failedCount"],
+        "attempted": result["attempted"],
+        "elapsedMs": int((time.monotonic() - started) * 1000),
+        "order": order,
+        "done": done,
+        "log": log,
+        "failed": result.get("failed") or [],
+        "reconciliation": result.get("reconciliation") or {},
+        "evidence": result.get("evidence") or {},
+    }

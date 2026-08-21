@@ -1,0 +1,74 @@
+.status-page {
+  max-width: 1100px;
+  margin: 20px 0 40px;
+  padding: 0 24px;
+  display: grid;
+  gap: 22px;
+}
+
+.status-note { margin: 0; }
+
+.status-chips {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.status-chip {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-1);
+  padding: 12px 14px;
+}
+
+.status-chip h2 {
+  margin: 2px 0 4px;
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.status-chip.is-ok { border-color: color-mix(in srgb, var(--good) 35%, var(--border)); }
+.status-chip.is-bad { border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); }
+
+.status-table-wrap h2 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.status-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 10px;
+}
+
+.status-table th,
+.status-table td {
+  text-align: left;
+  padding: 8px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.status-table th {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+}
+
+.status-table tr.is-late td:first-child strong,
+.status-table tr.is-error td:first-child strong,
+.status-table tr.is-due td:first-child strong {
+  color: var(--critical);
+}
+
+.status-table tr.is-off { color: var(--text-muted); }
+
+.status-error { color: var(--critical); }
+
+.status-identity {
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-1);
+}

@@ -5,23 +5,29 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
 from backend.agent import AgentRunner, AgentStore, AuditLog, PendingActions, SessionStore
-from backend.agent.intents import INSOLE_PROCESS, INSOLE_QUERY, classify_intent
+from backend.agent.intents import INSOLE_PROCESS, INSOLE_QUERY, INSOLE_SCHEDULE, classify_intent
+from backend.exchange import ExchangeError
+from backend.exchange.insole import (
+    RESERVED_REASON, SOURCE_SKU, WRITTEN_REASON, classify_insole_row,
+    execute_insole_orders, format_elapsed, format_insole_idle, format_insole_list,
+    format_insole_result, format_insole_start, load_executed_insole_writes,
+    load_insole_writes, load_reserved_insole_orders,
+    invalidate_insole_lines_cache, list_insole_board, locate_insole_orders,
+    merge_insole_lines, mm_from_props, process_one_insole_order,
+    remember_insole_writes, resolve_insole_size,
+    sync_insole_mirror, target_sku_for_mm, _query_insole_lines,
+)
+from backend.exchange.insole_scheduler import DouyinInsoleScheduler, slot_at
 from backend.agent.router import needs_llm_review, route_message
 from backend.agent.permissions import CAPABILITY_INSOLE_PROCESS, check_capability
 from backend.agent.tools import PermissionDenied, ToolContext, build_registry
 from backend.dingtalk.identity import StaffDirectory
 from backend.dingtalk.stream import DingTalkStreamChannel
-from backend.exchange.insole import (
-    RESERVED_REASON, SOURCE_SKU, WRITTEN_REASON, classify_insole_row,
-    execute_insole_orders, format_elapsed, format_insole_list, format_insole_result,
-    load_executed_insole_writes, load_insole_writes, load_reserved_insole_orders,
-    locate_insole_orders, mm_from_props, remember_insole_writes, resolve_insole_size,
-    sync_insole_mirror, target_sku_for_mm,
-)
 
 
 LINES = [
@@ -206,6 +212,86 @@ class LocateTests(unittest.TestCase):
         self.assertIn("11550002", reasons)
         skipped = {row["o_id"] for row in located["skipped"]}
         self.assertIn("11550003", skipped)
+
+    def test_query_uses_oid_index_not_cast(self):
+        captured = []
+
+        class Cursor:
+            def execute(self, sql, params=None):
+                captured.append(sql)
+
+            def fetchone(self):
+                return {}
+
+            def fetchall(self):
+                return []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        class Conn:
+            def cursor(self):
+                return Cursor()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+        with patch("backend.exchange.insole.source_status", return_value={"configured": True}), \
+                patch("backend.exchange.insole._mirror_state", return_value=""), \
+                patch("backend.exchange.insole.connect", return_value=Conn()):
+            lines, _sync = _query_insole_lines(lambda key, default="": default, "hanli.env", o_ids=[])
+        self.assertEqual([], lines)
+        self.assertTrue(captured)
+        self.assertFalse(any("CAST(" in sql for sql in captured))
+
+    def test_list_board_and_process_one(self):
+        located = locate_insole_orders(lines=LINES, shop="抖音")
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch("backend.exchange.insole.locate_insole_orders", return_value=located):
+            board = list_insole_board(root=tmp)
+        self.assertEqual(2, board["processableCount"])
+        self.assertEqual("11549976", board["processable"][0]["oId"])
+        self.assertEqual([], board["done"])
+        one = locate_insole_orders(lines=LINES, shop="抖音", o_ids=["11549976"])
+        runtime = FakeErp()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("backend.exchange.insole.locate_insole_orders", return_value=one):
+                result = process_one_insole_order(
+                    "11549976", erp=runtime, env_path="", root=tmp,
+                )
+            self.assertEqual(1, result["okCount"])
+            self.assertEqual("11549976", result["order"]["oId"])
+            self.assertEqual("已处理", result["done"]["status"])
+            self.assertIn("11549976", load_insole_writes(root=tmp))
+            leftover = locate_insole_orders(lines=LINES, shop="抖音")
+            with patch("backend.exchange.insole.locate_insole_orders", return_value=leftover):
+                after = list_insole_board(root=tmp)
+            self.assertTrue(any(item["oId"] == "11549976" for item in after["done"]))
+            self.assertEqual("已处理", after["done"][0]["status"])
+        parked = locate_insole_orders(lines=LINES, shop="抖音", o_ids=["11550002"])
+        with patch("backend.exchange.insole.locate_insole_orders", return_value=parked):
+            with self.assertRaisesRegex(ExchangeError, "发货中"):
+                process_one_insole_order("11550002", erp=FakeErp(), env_path="")
+
+    def test_merge_lines_and_invalidate_cache(self):
+        headers = {"11549976": {"o_id": "11549976", "status": "Question", "shop_name": "抖音"}}
+        items = [
+            {"o_id": "11549976", "sku_id": SOURCE_SKU},
+            {"o_id": "999", "sku_id": "OTHER"},
+        ]
+        lines = merge_insole_lines(headers, items)
+        self.assertEqual(1, len(lines))
+        self.assertEqual(SOURCE_SKU, lines[0]["sku_id"])
+        from backend.exchange import insole as module
+        module._lines_cache["k"] = {"lines": lines, "sync": {}, "expires": 1, "staleUntil": 1}
+        invalidate_insole_lines_cache()
+        self.assertEqual({}, module._lines_cache)
 
     def test_default_pool_includes_kuaishou_and_channels(self):
         extra = [
@@ -532,6 +618,12 @@ class IntentTests(unittest.TestCase):
         self.assertEqual("submit_exchange_dry_run", exchange.tool)
         overdue = classify_intent("今年逾期多少")
         self.assertEqual("dashboard_summary", overdue.tool)
+        scheduled = classify_intent("手动跑抖音鞋垫")
+        self.assertEqual(INSOLE_SCHEDULE, scheduled.name)
+        self.assertEqual({"shop": "抖音"}, scheduled.arguments)
+        self.assertFalse(needs_llm_review(scheduled))
+        self.assertEqual("workflow", route_message("跑一轮换鞋垫").route)
+        self.assertEqual(INSOLE_PROCESS, classify_intent("查询一下现在抖音需要更换的鞋垫订单，进行处理").name)
 
 
 class PermissionTests(unittest.TestCase):
@@ -809,5 +901,217 @@ class DingTalkInsoleTests(unittest.TestCase):
         self.assertEqual([], self.erp.calls)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class ScheduleTests(unittest.TestCase):
+    def test_slot_window(self):
+        start, end = (9, 30), (18, 30)
+        self.assertIsNone(slot_at(datetime(2026, 8, 19, 9, 29), start=start, end=end))
+        self.assertEqual(
+            "2026-08-19 09:30",
+            slot_at(datetime(2026, 8, 19, 9, 30), start=start, end=end),
+        )
+        self.assertEqual(
+            "2026-08-19 09:30",
+            slot_at(datetime(2026, 8, 19, 10, 29), start=start, end=end),
+        )
+        self.assertEqual(
+            "2026-08-19 10:30",
+            slot_at(datetime(2026, 8, 19, 10, 30), start=start, end=end),
+        )
+        self.assertEqual(
+            "2026-08-19 18:30",
+            slot_at(datetime(2026, 8, 19, 18, 30), start=start, end=end),
+        )
+        self.assertIsNone(slot_at(datetime(2026, 8, 19, 18, 31), start=start, end=end))
+
+    def test_start_and_idle_text(self):
+        located = locate_insole_orders(lines=LINES, shop="抖音")
+        start = format_insole_start(located, slot="2026-08-19 09:30")
+        self.assertIn("【开始执行】定时抖音换鞋垫 2026-08-19 09:30", start)
+        self.assertIn("11549976", start)
+        self.assertNotIn("确认后按完整清单", start)
+        idle = format_insole_idle({
+            "parkedCount": 1,
+            "parked": [{"reason": "发货中本批不处理"}],
+            "skipped": [],
+        }, slot="2026-08-19 09:30")
+        self.assertIn("没有待处理订单", idle)
+        self.assertIn("发货中本批不处理 1", idle)
+        reserved = format_insole_idle({
+            "parkedCount": 1,
+            "parked": [{"reason": "发货中本批不处理"}],
+            "skipped": [{"reason": RESERVED_REASON + "（安安）"}],
+        }, slot="2026-08-19 16:30")
+        self.assertIn("人工待确认", reserved)
+        self.assertNotIn("没有待处理订单", reserved)
+
+    def _scheduler(self, runtime, locate, sender=None, root=None):
+        def setting(name, default=""):
+            return default
+
+        if root is None:
+            root = Path(tempfile.mkdtemp())
+        scheduler = DouyinInsoleScheduler(
+            setting=setting, env_path="", runtime=runtime,
+            root=root,
+            enabled=False, sender=sender,
+        )
+        scheduler._locate = locate
+        return scheduler
+
+    def test_tick_skips_outside_and_repeats_same_slot(self):
+        calls = []
+
+        class Runtime:
+            def try_exclusive(self):
+                return True
+
+            def release_exclusive(self):
+                return None
+
+            def exclusive(self):
+                return threading.RLock()
+
+            def prepare(self):
+                return {}
+
+            def run(self, command, payload):
+                calls.append(payload)
+                oids = [item.get("o_id") for item in payload.get("plans") or []]
+                return {
+                    "succeeded": [{"o_id": oid} for oid in oids],
+                    "failed": [], "attempted": len(oids), "elapsedMs": 10,
+                }
+
+        located = locate_insole_orders(lines=LINES, shop="抖音")
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self._scheduler(Runtime(), lambda: located, root=Path(tmp))
+            early = scheduler.tick(now=datetime(2026, 8, 19, 9, 0))
+            self.assertTrue(early.get("skipped"))
+            first = scheduler.tick(now=datetime(2026, 8, 19, 9, 30))
+            self.assertTrue(first.get("ok"))
+            self.assertIn("【开始执行】", first.get("startText") or "")
+            self.assertIn("【任务完成】", first.get("doneText") or "")
+            self.assertEqual(1, len(calls))
+            again = scheduler.tick(now=datetime(2026, 8, 19, 10, 10))
+            self.assertEqual("本档已跑过", again.get("reason"))
+            self.assertEqual(1, len(calls))
+
+    def test_busy_erp_does_not_consume_slot(self):
+        class Busy:
+            def try_exclusive(self):
+                return False
+
+        located = locate_insole_orders(lines=LINES, shop="抖音")
+        scheduler = self._scheduler(Busy(), lambda: located)
+        skipped = scheduler.tick(now=datetime(2026, 8, 19, 9, 30))
+        self.assertTrue(skipped.get("skipped"))
+        self.assertIn("占用", skipped.get("reason") or "")
+        self.assertEqual(set(), scheduler.done_slots)
+        manual = scheduler.run_once(trigger="manual", notify=False)
+        self.assertTrue(manual.get("failed"))
+        self.assertIn("占用", manual.get("reply") or "")
+
+    def test_notify_goes_to_group_not_oto(self):
+        notes = []
+        oto = []
+
+        class Sender:
+            app_ready = True
+            group_conversation_id = "cid"
+
+            def reply_text(self, *, conversation_id, text, at_user_ids=()):
+                notes.append((conversation_id, text, tuple(at_user_ids or ())))
+                return {}
+
+            def send_oto_markdown(self, title, text, *, user_ids=()):
+                oto.append((title, text, tuple(user_ids or ())))
+                return {}
+
+        located = {
+            "processable": [], "parked": [], "skipped": [],
+            "processableCount": 0, "parkedCount": 0, "skippedCount": 0, "oIds": [],
+        }
+        scheduler = self._scheduler(object(), lambda: located, sender=Sender())
+        scheduler.conversation_id = "cid"
+        scheduler.oto_buyers = ("安安",)
+        scheduler.oto_user_ids = ("user-anan",)
+        first = scheduler.tick(now=datetime(2026, 8, 19, 9, 30))
+        self.assertTrue(first.get("empty"))
+        self.assertEqual(1, len(notes))
+        self.assertEqual("cid", notes[0][0])
+        self.assertEqual((), notes[0][2])
+        self.assertEqual([], oto)
+
+    def test_empty_slot_notifies_once(self):
+        notes = []
+
+        class Sender:
+            app_ready = True
+            group_conversation_id = "cid"
+
+            def reply_text(self, *, conversation_id, text, at_user_ids=()):
+                notes.append(text)
+                return {}
+
+            def send_oto_markdown(self, title, text, *, user_ids=()):
+                return {}
+
+        located = {
+            "processable": [], "parked": [], "skipped": [],
+            "processableCount": 0, "parkedCount": 0, "skippedCount": 0, "oIds": [],
+        }
+        scheduler = self._scheduler(object(), lambda: located, sender=Sender())
+        scheduler.conversation_id = "cid"
+        first = scheduler.tick(now=datetime(2026, 8, 19, 9, 30))
+        self.assertTrue(first.get("empty"))
+        self.assertEqual(1, len(notes))
+        self.assertIn("没有待处理订单", notes[0])
+        second = scheduler.tick(now=datetime(2026, 8, 19, 9, 45))
+        self.assertEqual("本档已跑过", second.get("reason"))
+        self.assertEqual(1, len(notes))
+
+    def test_restart_does_not_renotify_same_slot(self):
+        notes = []
+
+        class Sender:
+            app_ready = True
+            group_conversation_id = "cid"
+
+            def reply_text(self, *, conversation_id, text, at_user_ids=()):
+                notes.append(text)
+                return {}
+
+        located = {
+            "processable": [], "parked": [{"reason": "发货中本批不处理"}],
+            "skipped": [], "processableCount": 0, "parkedCount": 1,
+            "skippedCount": 0, "oIds": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = self._scheduler(object(), lambda: located, sender=Sender(), root=root)
+            first.conversation_id = "cid"
+            first.tick(now=datetime(2026, 8, 19, 16, 45))
+            self.assertEqual(1, len(notes))
+            restarted = self._scheduler(object(), lambda: located, sender=Sender(), root=root)
+            restarted.conversation_id = "cid"
+            again = restarted.tick(now=datetime(2026, 8, 19, 16, 50))
+            self.assertEqual("本档已跑过", again.get("reason"))
+            self.assertEqual(1, len(notes))
+
+    def test_recover_slots_from_audit(self):
+        class Audit:
+            def list_deliveries(self, *, kind="", status="", limit=50):
+                if kind == "insole_schedule_done":
+                    return [{"detail": {"slot": "2026-08-19 16:30"}, "status": "sent"}]
+                return []
+
+        located = {
+            "processable": [], "parked": [], "skipped": [],
+            "processableCount": 0, "parkedCount": 0, "skippedCount": 0, "oIds": [],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            scheduler = self._scheduler(object(), lambda: located, root=Path(tmp))
+            scheduler.audit = Audit()
+            scheduler._recover_done_slots()
+            skipped = scheduler.tick(now=datetime(2026, 8, 19, 16, 50))
+            self.assertEqual("本档已跑过", skipped.get("reason"))

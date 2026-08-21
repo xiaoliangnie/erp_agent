@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { TopBar } from "../../components/TopBar";
-import { errorText, openBlob, publicApi } from "../../api/client";
+import { errorText, openBlob, publicApi, webAuthHeaders } from "../../api/client";
 import { DEFAULT_RATES, INVOICE_LABELS } from "./types";
 import type { ContractItem, ContractOptions, InvoiceType, OrderChoice, ProductImageJob } from "./types";
 import { GbPicker } from "./GbPicker";
@@ -256,7 +256,7 @@ export default function ContractPage() {
     try {
       const response = await fetch("/api/contracts/preview", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...webAuthHeaders() },
         body: JSON.stringify(body),
       });
       if (!response.ok) {
@@ -287,7 +287,7 @@ export default function ContractPage() {
     try {
       const response = await fetch("/api/contracts/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...webAuthHeaders() },
         body: JSON.stringify(body),
       });
       if (!response.ok) {

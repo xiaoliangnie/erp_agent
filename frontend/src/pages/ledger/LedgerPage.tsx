@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { TopBar } from "../../components/TopBar";
 import { LoadFailed, Loading } from "../../components/PageState";
-import { agentApi, errorText } from "../../api/client";
-import { useCredentials } from "../../hooks/useCredentials";
+import { agentApi } from "../../api/client";
+import { useAuth } from "../../auth/AuthContext";
 import { usePayload } from "../../hooks/usePayload";
 import { decodeDelivery } from "../../data/payload";
 import type { DeliveryData } from "../../data/payload";
@@ -66,15 +66,15 @@ function sortedOptions(values: string[] | undefined): { index: number; label: st
 export default function LedgerPage() {
   const [params, setParams] = useSearchParams();
   const year = params.get("year");
-  const { data, error, loading, reload } = usePayload<DeliveryData>("/api/delivery", null, decodeDelivery);
+  const { data, error, loading, refreshing, reload } = usePayload<DeliveryData>("/api/delivery", null, decodeDelivery);
 
-  if (loading) return <Loading label="正在读取交期数据…" />;
-  if (error) return <LoadFailed message={error} onRetry={reload} />;
+  if (loading && !data) return <Loading label="正在读取交期数据…" />;
+  if (error && !data) return <LoadFailed message={error} onRetry={reload} />;
   if (!data) return <LoadFailed message="接口没有返回数据。" onRetry={reload} />;
-  return <Ledger data={data} year={year} onYear={(next) => setParams({ year: next })} />;
+  return <Ledger data={data} year={year} refreshing={refreshing} onYear={(next) => setParams({ year: next })} />;
 }
 
-function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | null; onYear: (year: string) => void }) {
+function Ledger({ data, year, refreshing, onYear }: { data: DeliveryData; year: string | null; refreshing?: boolean; onYear: (year: string) => void }) {
   const { dict, meta } = data;
   const orders = useMemo(() => buildOrders(data), [data]);
 
@@ -95,7 +95,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
   const [opened, setOpened] = useState<LedgerOrder | null>(null);
   const [pushNote, setPushNote] = useState("");
   const [pushing, setPushing] = useState(false);
-  const { credentials, update, ensureBound, filled, bound } = useCredentials("agent");
+  const { credentials, loggedIn, noteAuthError } = useAuth();
 
   // 换年度是整页重取，筛选跟着回到初始值。
   useEffect(() => {
@@ -170,8 +170,8 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
 
   async function sendReminders() {
     if (needCount === 0 || pushing) return;
-    if (!filled) {
-      setPushNote("请先填写姓名和钉钉私信里的网页身份码，再发送提醒。");
+    if (!loggedIn) {
+      setPushNote("请先登录（顶栏或工作台），再发送提醒。");
       return;
     }
     const who = buyerName ? `（仅 ${buyerName}）` : "";
@@ -186,7 +186,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
     setPushing(true);
     setPushNote("");
     try {
-      const auth = await ensureBound();
+      const auth = credentials;
       const result = await agentApi.post<{
         sent?: boolean;
         skipped?: boolean;
@@ -222,7 +222,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
         + (unbound ? `未绑定未发：${unbound}。` : ""),
       );
     } catch (error: unknown) {
-      setPushNote(errorText(error));
+      setPushNote(noteAuthError(error));
     } finally {
       setPushing(false);
     }
@@ -252,6 +252,7 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
       {meta.etaMin
         ? ` · 交期 ${meta.etaMin} ~ ${meta.etaMax}（${((meta.etaCoverage ?? 0) * 100).toFixed(0)}% 的行有交期）`
         : ""}
+      {refreshing ? " · 正在更新…" : ""}
     </>
   );
 
@@ -362,34 +363,14 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
               </div>
             </div>
             <div className="ledger-push">
-              <div className="credentials-grid">
-                <input
-                  type="password"
-                  autoComplete="off"
-                  placeholder="AGENT_API_TOKEN（可选）"
-                  value={credentials.token}
-                  onChange={(event) => update({ token: event.target.value })}
-                />
-                <input
-                  autoComplete="off"
-                  placeholder="钉钉/采购员姓名"
-                  value={credentials.operator}
-                  onChange={(event) => update({ operator: event.target.value })}
-                />
-                {bound ? null : (
-                  <input
-                    autoComplete="off"
-                    placeholder="钉钉私信 20 位网页身份码"
-                    value={credentials.bindCode ?? ""}
-                    onChange={(event) => update({ bindCode: event.target.value })}
-                  />
-                )}
+              <div className="small">
+                {loggedIn ? `以 ${credentials.operator} 发送` : "登录后才能发送提醒"}
               </div>
               <div className="push-actions">
                 <button
                   type="button"
                   className="btn"
-                  disabled={needCount === 0 || pushing}
+                  disabled={needCount === 0 || pushing || !loggedIn}
                   onClick={() => void sendReminders()}
                 >
                   {pushing ? "发送中…" : "发送提醒"}
@@ -407,8 +388,8 @@ function Ledger({ data, year, onYear }: { data: DeliveryData; year: string | nul
           {pushNote ? (
             <div className="notice">
               {pushNote}{" "}
-              {pushNote.includes("姓名") || pushNote.includes("Token") || pushNote.includes("未在员工绑定") ? (
-                <a href={ROUTES.chat}>打开采购助手 →</a>
+              {pushNote.includes("登录") || pushNote.includes("绑定网页") ? (
+                <a href={ROUTES.status}>去工作台登录 →</a>
               ) : null}
             </div>
           ) : null}

@@ -11,7 +11,7 @@ DEFAULT_ORDER_LIST_URL = "https://www.erp321.com/app/order/order/list.aspx"
 DEFAULT_STORAGE_STATE = "files/data/secrets/erp-ai-state.json"
 DEFAULT_EVIDENCE_DIR = "files/data/erp-evidence"
 WORKER_ID = "erp-ai-procurement"
-ALLOWED_COMMANDS = ("erp.exchange_items",)
+ALLOWED_COMMANDS = ("erp.exchange_items", "erp.create_purchase_order")
 
 
 def _flag(value, default=False) -> bool:

@@ -1,11 +1,27 @@
 import { useCallback, useState } from "react";
-import { agentApi, type Credentials } from "../api/client";
+import { agentApi, errorText, type Credentials } from "../api/client";
 
 const WEB_TOKEN_KEY = "agentWebToken";
+const BIND_CODE_RE = /^[0-9a-fA-F]{20}$/;
 
 function readWebToken(prefix: string): string {
   if (prefix !== "agent") return "";
   return localStorage.getItem(WEB_TOKEN_KEY) ?? "";
+}
+
+/** 钉钉私信身份码是 20 位十六进制；共享 Token 按约定是更长的随机串。 */
+export function looksLikeBindCode(value: string): boolean {
+  return BIND_CODE_RE.test(value.trim());
+}
+
+function shouldForgetWebSession(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return (
+    text.includes("绑定网页")
+    || text.includes("身份码")
+    || text.includes("网页署名")
+    || text.includes("AGENT_API_TOKEN")
+  );
 }
 
 /**
@@ -35,15 +51,30 @@ export function useCredentials(prefix: string) {
       if (prefix === "agent") {
         const webToken = next.webToken?.trim() ?? "";
         if (webToken) localStorage.setItem(WEB_TOKEN_KEY, webToken);
+        else localStorage.removeItem(WEB_TOKEN_KEY);
       }
     },
     [prefix, tokenKey, operatorKey],
   );
 
+  const forgetWebSession = useCallback(() => {
+    if (prefix !== "agent") return;
+    localStorage.removeItem(WEB_TOKEN_KEY);
+    setCredentials((current) => ({ ...current, webToken: "" }));
+  }, [prefix]);
+
+  const noteBindError = useCallback((error: unknown) => {
+    if (shouldForgetWebSession(error)) forgetWebSession();
+    return errorText(error);
+  }, [forgetWebSession]);
+
   const hasToken = credentials.token.trim() !== "";
   const hasName = credentials.operator.trim() !== "";
   const hasWeb = prefix !== "agent" || Boolean(credentials.webToken?.trim());
-  const canBind = prefix === "agent" && hasName && Boolean(credentials.bindCode?.trim());
+  const tokenAsCode = prefix === "agent" && looksLikeBindCode(credentials.token);
+  const canBind = prefix === "agent" && hasName && (
+    Boolean(credentials.bindCode?.trim()) || tokenAsCode
+  );
   const filled = prefix === "agent" ? hasName && (hasWeb || canBind) : hasToken && hasName;
   const bound = prefix !== "agent" || Boolean(credentials.webToken?.trim());
 
@@ -52,27 +83,39 @@ export function useCredentials(prefix: string) {
       remember(credentials);
       return credentials;
     }
-    if (credentials.webToken?.trim()) {
-      remember(credentials);
-      return credentials;
+    const operator = credentials.operator.trim();
+    let token = credentials.token.trim();
+    let code = credentials.bindCode?.trim() ?? "";
+    if (!code && looksLikeBindCode(token)) {
+      code = token;
+      token = "";
     }
-    const code = credentials.bindCode?.trim() ?? "";
-    if (!code) throw new Error("请填写钉钉私信里的 20 位网页身份码");
-    const result = await agentApi.post<{ webToken: string; operator: string }>(
-      "/api/agent/web-bind",
-      { operator: credentials.operator.trim(), code },
-      { token: credentials.token, operator: credentials.operator },
-    );
-    const next: Credentials = {
-      token: credentials.token,
-      operator: result.operator || credentials.operator,
-      webToken: result.webToken,
-      bindCode: "",
-    };
-    remember(next);
-    setCredentials(next);
-    return next;
+    if (code) {
+      const result = await agentApi.post<{ webToken: string; operator: string }>(
+        "/api/agent/web-bind",
+        { operator, code },
+        { token, operator },
+      );
+      const next: Credentials = {
+        token,
+        operator: result.operator || operator,
+        webToken: result.webToken,
+        bindCode: "",
+      };
+      remember(next);
+      setCredentials(next);
+      return next;
+    }
+    if (credentials.webToken?.trim()) {
+      const next = { ...credentials, token, operator };
+      remember(next);
+      return next;
+    }
+    throw new Error("请填写钉钉私信里的 20 位网页身份码");
   }, [credentials, prefix, remember]);
 
-  return { credentials, update, remember, ensureBound, filled, bound };
+  return {
+    credentials, update, remember, ensureBound, forgetWebSession, noteBindError,
+    filled, bound,
+  };
 }

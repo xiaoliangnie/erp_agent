@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import type { ReactNode } from "react";
 import { Link, useLocation, useSearchParams } from "react-router-dom";
+import { useAuth } from "../auth/AuthContext";
 import { NAV_ITEMS } from "../routes";
 
 interface TopBarProps {
@@ -12,6 +13,7 @@ export function TopBar({ title, sub }: TopBarProps) {
   const { pathname } = useLocation();
   const [params] = useSearchParams();
   const year = params.get("year");
+  const { ready, loggedIn, operator, logout } = useAuth();
 
   // 单页应用换路由不会自己改标题，多标签页并排时靠它区分。
   useEffect(() => {
@@ -23,6 +25,16 @@ export function TopBar({ title, sub }: TopBarProps) {
       <h1>{title}</h1>
       {sub ? <div className="sub">{sub}</div> : null}
       <div className="spacer" />
+      {ready ? (
+        <div className="topbar-user">
+          {loggedIn ? (
+            <>
+              <span>{operator}</span>
+              <button type="button" className="btn" onClick={() => void logout()}>退出</button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
       <nav aria-label="页面导航">
         {NAV_ITEMS.filter((item) => item.path !== pathname).map((item) => (
           <Link key={item.path} to={item.keepsYear && year ? `${item.path}?year=${encodeURIComponent(year)}` : item.path}>

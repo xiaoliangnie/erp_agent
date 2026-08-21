@@ -13,7 +13,10 @@ from unittest.mock import patch
 from backend.agent.store import AgentStore
 from backend.dingtalk.identity import StaffDirectory
 from backend.dingtalk.sender import DingTalkError
-from backend.dingtalk.stream import DingTalkStreamChannel
+from backend.dingtalk.stream import (
+    DingTalkStreamChannel, inbound_progress_text,
+    PROGRESS_INSOLE_QUERY, PROGRESS_QUERY,
+)
 
 
 class FakeAudit:
@@ -155,6 +158,65 @@ class StreamTests(unittest.TestCase):
         self.assertIn("绑定", reply)
         self.assertNotEqual(seen["loop_thread"], seen["handle_thread"])
 
+    def test_reply_later_does_not_block_ack_path(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        replies = []
+
+        class Handler:
+            def reply_text(self, reply, message):
+                replies.append((reply, getattr(message, "message_id", "")))
+
+        message = SimpleNamespace(
+            text=SimpleNamespace(content="帮助"),
+            message_id="async-ack",
+            conversation_id="cid",
+            sender_staff_id="u1",
+            sender_id="u1",
+            sender_nick="小钉",
+            conversation_type="2",
+        )
+        asyncio.run(self.channel._reply_later(Handler(), message, {"msgtype": "text"}))
+        self.assertTrue(replies)
+        self.assertIn("绑定", replies[0][0])
+
+    def test_inbound_progress_skips_fast_commands(self):
+        self.assertEqual("", inbound_progress_text("帮助"))
+        self.assertEqual("", inbound_progress_text("确认"))
+        self.assertEqual("", inbound_progress_text("绑定 利特"))
+        self.assertEqual("", inbound_progress_text("新话题"))
+        self.assertEqual("", inbound_progress_text("查单", conversation_type="1"))
+        self.assertEqual(PROGRESS_INSOLE_QUERY, inbound_progress_text(
+            "查询一下现在抖音需要更换的鞋垫订单", conversation_type="2",
+        ))
+        self.assertEqual(PROGRESS_QUERY, inbound_progress_text(
+            "604264 到货了吗", conversation_type="2",
+        ))
+
+    def test_reply_later_sends_progress_before_answer(self):
+        import asyncio
+        from types import SimpleNamespace
+
+        replies = []
+
+        class Handler:
+            def reply_text(self, reply, message):
+                replies.append(reply)
+
+        message = SimpleNamespace(
+            text=SimpleNamespace(content="604264 到货了吗"),
+            message_id="async-progress",
+            conversation_id="cid",
+            sender_staff_id="u1",
+            sender_id="u1",
+            sender_nick="小钉",
+            conversation_type="2",
+        )
+        asyncio.run(self.channel._reply_later(Handler(), message, {"msgtype": "text"}))
+        self.assertGreaterEqual(len(replies), 2)
+        self.assertEqual(PROGRESS_QUERY, replies[0])
+
     def test_bare_confirm_uses_latest_pending(self):
         self.directory.upsert("李四", dingtalk_user_id="u9")
         reply = self.handle("确认", sender_id="u9", sender_name="别名", message_id="cf0")
@@ -252,8 +314,9 @@ class StreamTests(unittest.TestCase):
         reply = self.handle("绑定网页", sender_id="u1", sender_name="张三", message_id="web-1")
         self.assertIn("私信", reply)
         self.assertEqual(1, len(sender.sent))
-        match = re.search(r"网页身份码：([0-9a-f]{20})", sender.sent[0]["text"])
+        match = re.search(r"密码：(\S+)", sender.sent[0]["text"])
         self.assertIsNotNone(match)
+        self.assertIn("花名：张三", sender.sent[0]["text"])
         self.assertNotIn(match.group(1), reply)
 
     def test_web_bind_unbound_and_employee_private(self):
@@ -269,6 +332,63 @@ class StreamTests(unittest.TestCase):
         )
         self.assertIn("群里", private)
         self.assertEqual([], sender.sent)
+
+    def test_admin_reissues_web_accounts(self):
+        sender = RecordingOtoSender()
+        self.channel.sender = sender
+        self.directory.upsert("韩立", dingtalk_user_id="u-admin", role="admin")
+        self.directory.upsert("张三", dingtalk_user_id="u1")
+        self.directory.upsert("利特", dingtalk_user_id="u-lite")
+        self.directory.upsert("李佳冬（利特）", dingtalk_user_id="u-lite")
+        reply = self.handle(
+            "补发网页账号", sender_id="u-admin", sender_name="韩立",
+            message_id="reissue-all",
+        )
+        self.assertIn("已私信 3 人", reply)
+        self.assertNotIn("密码：", reply)
+        self.assertEqual(3, len(sender.sent))
+        for item in sender.sent:
+            self.assertEqual("网页登录", item["title"])
+            self.assertIn("【网页登录】", item["text"])
+            match = re.search(r"密码：(\S+)", item["text"])
+            self.assertIsNotNone(match)
+            self.assertNotIn(match.group(1), reply)
+        one = self.handle(
+            "补发网页账号 张三", sender_id="u-admin", sender_name="韩立",
+            message_id="reissue-one",
+        )
+        self.assertIn("张三", one)
+        self.assertIn("其中 1 人是重置", one)
+        self.assertEqual(4, len(sender.sent))
+        missing = self.handle(
+            "补发网页账号 路人", sender_id="u-admin", sender_name="韩立",
+            message_id="reissue-miss",
+        )
+        self.assertIn("找不到", missing)
+        employee = self.handle(
+            "补发网页账号", sender_id="u1", sender_name="张三",
+            message_id="reissue-emp",
+        )
+        self.assertNotIn("已私信", employee)
+
+    def test_bind_approve_sends_web_login(self):
+        sender = RecordingOtoSender()
+        self.channel.sender = sender
+        self.directory.upsert("韩立", dingtalk_user_id="u-admin", role="admin")
+        self.handle("绑定 张三", sender_id="u1", sender_name="小钉", message_id="bw-1")
+        approved = self.handle(
+            "同意绑定", sender_id="u-admin", sender_name="韩立",
+            message_id="bw-ok", conversation_type="1",
+        )
+        self.assertIn("已同意", approved)
+        web = [item for item in sender.sent if item["title"] == "网页登录"]
+        self.assertEqual(1, len(web))
+        self.assertIn("管理员已同意绑定「张三」", web[0]["text"])
+        self.assertIn("花名：张三", web[0]["text"])
+        self.assertIn("密码：", web[0]["text"])
+        match = re.search(r"密码：(\S+)", web[0]["text"])
+        self.assertIsNotNone(match)
+        self.assertNotIn(match.group(1), approved)
 
     def test_super_admin_can_set_and_cannot_demote_hanli(self):
         self.directory.upsert("韩立", dingtalk_user_id="u-admin", role="admin")

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { TopBar } from "../../components/TopBar";
-import { agentApi, errorText } from "../../api/client";
+import { agentApi } from "../../api/client";
 import { useCredentials } from "../../hooks/useCredentials";
 import { newId } from "../../lib/id";
 import { ExecutedCard, PendingCard } from "./ActionCard";
@@ -27,7 +27,7 @@ function readSessionKey(): string {
 }
 
 export default function ChatPage() {
-  const { credentials, update, ensureBound, filled, bound } = useCredentials("agent");
+  const { credentials, update, ensureBound, forgetWebSession, noteBindError, filled, bound } = useCredentials("agent");
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [messages, setMessages] = useState<Message[]>([
     { id: "greeting", role: "system", text: GREETING },
@@ -59,7 +59,7 @@ export default function ChatPage() {
   useEffect(() => {
     if (bootstrapped.current || !autoConnectStoredCredentials.current) return;
     bootstrapped.current = true;
-    connect().catch((error: unknown) => setMessage(errorText(error)));
+    connect().catch((error: unknown) => setMessage(noteBindError(error)));
   }, [connect]);
 
   const send = useCallback(
@@ -97,7 +97,7 @@ export default function ChatPage() {
           ),
         );
       } catch (error) {
-        const text = errorText(error);
+        const text = noteBindError(error);
         setMessages((current) =>
           current.map((item) => (item.id === replyId ? { ...item, pending: false, error: true, text } : item)),
         );
@@ -105,7 +105,7 @@ export default function ChatPage() {
         setSending(false);
       }
     },
-    [ensureBound, sending],
+    [ensureBound, noteBindError, sending],
   );
 
   const decide = useCallback(async (messageId: string, actionId: string, decision: "confirm" | "cancel") => {
@@ -242,10 +242,15 @@ export default function ChatPage() {
               <button
                 type="button"
                 className="btn"
-                onClick={() => connect().catch((error: unknown) => setMessage(errorText(error)))}
+                onClick={() => connect().catch((error: unknown) => setMessage(noteBindError(error)))}
               >
                 连接
               </button>
+              {bound ? (
+                <button type="button" className="btn" onClick={() => forgetWebSession()}>
+                  重新绑定
+                </button>
+              ) : null}
             </div>
             <div className="small" style={{ marginTop: 7 }}>
               {bound

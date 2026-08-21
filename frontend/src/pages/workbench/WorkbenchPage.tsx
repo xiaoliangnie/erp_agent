@@ -1,9 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
 import { TopBar } from "../../components/TopBar";
-import { agentApi, errorText } from "../../api/client";
+import { agentApi } from "../../api/client";
 import { useCredentials } from "../../hooks/useCredentials";
-import { ROUTES } from "../../routes";
 import { ExecutedCard, PendingCard } from "../chat/ActionCard";
 import type { ExecutedAction } from "../chat/types";
 import type { WorkbenchPayload, WorkItem } from "./types";
@@ -46,7 +44,7 @@ function previewText(item: WorkItem): string {
 }
 
 export default function WorkbenchPage() {
-  const { credentials, update, ensureBound, filled, bound } = useCredentials("agent");
+  const { credentials, update, ensureBound, forgetWebSession, noteBindError, filled, bound } = useCredentials("agent");
   const [payload, setPayload] = useState<WorkbenchPayload | null>(null);
   const [executed, setExecuted] = useState<Record<string, ExecutedAction>>({});
   const [message, setMessage] = useState("");
@@ -72,7 +70,7 @@ export default function WorkbenchPage() {
   useEffect(() => {
     if (bootstrapped.current || !autoConnect.current) return;
     bootstrapped.current = true;
-    load().catch((error: unknown) => setMessage(errorText(error)));
+    load().catch((error: unknown) => setMessage(noteBindError(error)));
   }, [load]);
 
   const decide = useCallback(async (actionId: string, decision: "confirm" | "cancel") => {
@@ -140,10 +138,15 @@ export default function WorkbenchPage() {
               type="button"
               className="btn"
               disabled={loading}
-              onClick={() => load().catch((error: unknown) => setMessage(errorText(error)))}
+              onClick={() => load().catch((error: unknown) => setMessage(noteBindError(error)))}
             >
               {loading ? "刷新中…" : "刷新"}
             </button>
+            {bound ? (
+              <button type="button" className="btn" onClick={() => forgetWebSession()}>
+                重新绑定
+              </button>
+            ) : null}
           </div>
           {message ? <div className="status error">{message}</div> : null}
         </section>
@@ -191,7 +194,7 @@ export default function WorkbenchPage() {
                             className="btn primary"
                             disabled={loading}
                             onClick={() => decideQuality(qualityIssueId(item), "resolve")
-                              .catch((error: unknown) => setMessage(errorText(error)))}
+                              .catch((error: unknown) => setMessage(noteBindError(error)))}
                           >
                             关闭
                           </button>
@@ -200,16 +203,14 @@ export default function WorkbenchPage() {
                             className="btn danger"
                             disabled={loading}
                             onClick={() => decideQuality(qualityIssueId(item), "cancel")
-                              .catch((error: unknown) => setMessage(errorText(error)))}
+                              .catch((error: unknown) => setMessage(noteBindError(error)))}
                           >
                             撤销
                           </button>
                         </div>
                       ) : null}
                       {item.kind === "exchange_job" ? (
-                        <div className="action-row">
-                          <Link className="btn" to={ROUTES.exchange}>去换货页二次确认</Link>
-                        </div>
+                        <p className="small">换货不在网页执行，请到钉钉确认处理。</p>
                       ) : null}
                     </>
                   )}

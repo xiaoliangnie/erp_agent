@@ -38,14 +38,14 @@ const RECENT_ORDER_LIMIT = 20;
 export default function DashboardPage() {
   const [params, setParams] = useSearchParams();
   const year = params.get("year");
-  const { data, error, loading, reload } = usePayload<DashboardData>("/api/dashboard", year, decodeDashboard);
+  const { data, error, loading, refreshing, reload } = usePayload<DashboardData>("/api/dashboard", year, decodeDashboard);
 
-  if (loading) return <Loading />;
-  if (error) return <LoadFailed message={error} onRetry={reload} />;
+  if (loading && !data) return <Loading />;
+  if (error && !data) return <LoadFailed message={error} onRetry={reload} />;
   if (!data) return <LoadFailed message="接口没有返回数据。" onRetry={reload} />;
   return (
     <TooltipProvider>
-      <Dashboard data={data} year={year} onYear={(next) => setParams({ year: next })} />
+      <Dashboard data={data} year={year} refreshing={refreshing} onYear={(next) => setParams({ year: next })} />
     </TooltipProvider>
   );
 }
@@ -56,7 +56,7 @@ function sortedOptions(values: string[] | undefined) {
     .sort((a, b) => a.label.localeCompare(b.label, "zh-CN"));
 }
 
-function Dashboard({ data, year, onYear }: { data: DashboardData; year: string | null; onYear: (year: string) => void }) {
+function Dashboard({ data, year, refreshing, onYear }: { data: DashboardData; year: string | null; refreshing?: boolean; onYear: (year: string) => void }) {
   const { dict, meta, orders } = data;
   const today = meta.today || meta.maxDate;
 
@@ -143,6 +143,7 @@ function Dashboard({ data, year, onYear }: { data: DashboardData; year: string |
       数据源 <b title={meta.warning ?? undefined}>{meta.source}</b> · 查询于 {meta.databaseNow || meta.generated}
       {meta.syncedAt ? ` · 最近同步 ${meta.syncedAt}` : ""} · 业务日期 {meta.minDate} ~ {meta.maxDate} ·{" "}
       {int(meta.orders)} 单 / {int(meta.rows)} 行明细
+      {refreshing ? " · 正在更新…" : ""}
       {meta.warning ? <> · <b className="critical">{meta.warning}</b></> : null}
     </>
   );

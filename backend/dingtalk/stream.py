@@ -20,11 +20,17 @@ import threading
 import time
 
 from ..agent.actions import ActionError
+from ..agent.intents import INSOLE_PROCESS, INSOLE_QUERY, INSOLE_SCHEDULE
 from ..agent.router import needs_llm_review, route_message
 from ..agent.runner import AgentDisabled
 from ..staff_names import parse_buyer_names
 from ..agent.users import is_confirmed_admin_name
-from ..agent.web_auth import WebAuth, WebAuthError
+from ..agent.web_auth import (
+    WebAuth,
+    WebAuthError,
+    format_web_login_notice,
+    web_login_url,
+)
 from .bindings import (
     BindRequests,
     already_bound,
@@ -51,6 +57,9 @@ BARE_CONFIRM_PATTERN = re.compile(
 BARE_CANCEL_PATTERN = re.compile(r"^\s*(取消|作废|不执行)(?:\s*[，,。；;：:].*)?\s*$")
 BIND_PATTERN = re.compile(r"^\s*(?:绑定|我是)\s+(.+?)\s*$")
 WEB_BIND_PATTERN = re.compile(r"^\s*(绑定网页|绑定网站|绑定\s*web)\s*$")
+ADMIN_REISSUE_WEB = re.compile(
+    r"^\s*(补发网页账号|补发网页密码|开通网页账号)(?:\s+(.+))?\s*$"
+)
 ADMIN_SET_ROLE = re.compile(r"^\s*设置管理员\s+(.+?)\s*$")
 ADMIN_UNSET_ROLE = re.compile(r"^\s*取消管理员\s+(.+?)\s*$")
 ADMIN_LIST_BINDS = re.compile(r"^\s*(待绑定|绑定申请|查看绑定)\s*$")
@@ -66,15 +75,59 @@ USAGE_TEXT = (
     "功能使用说明：\n"
     "1. 绑定身份：第一次到群里发「绑定 你的采购员姓名」，管理员同意后才能确认写操作。"
     "花名和「真名（花名）」绑一个即可，也可以「绑定 利特、李佳冬（利特）」。"
-    "网页再发「绑定网页」，私信里的 20 位码填到对话页，姓名必须对得上。\n"
+    "管理员同意后会私信网页花名和密码；忘记了到群里发「绑定网页」重置。"
+    "登录一次 30 天不用再输。\n"
     "2. 查询采购 / 交期：直接问，例如「604264 到货了吗」「今年逾期多少」。\n"
-    "3. 抖音鞋垫更换操作：先说「查询一下现在抖音需要更换的鞋垫订单，进行处理」，核对清单后回「确认」。完成后会发【任务完成】。\n"
+    "3. 抖音鞋垫更换操作：先说「查询一下现在抖音需要更换的鞋垫订单，进行处理」，核对清单后回「确认」。"
+    "完成后会发【任务完成】。每天 09:30–18:30 每小时自动跑一轮抖音鞋垫（先发【开始执行】再发总结）；"
+    "群里说「手动跑抖音鞋垫」立刻再跑一轮，不用确认。\n"
     "4. 品控登记：品控 佰特 604264 鞋垫开胶 3 双；品控查询 今天；品控关闭 编号；撤销品控 编号。\n"
     "5. 确认与取消：回复「确认」执行当前待办，「取消」放弃；也可以带编号。\n"
     "6. 换话题 / 记忆：换话题发「新话题」。记住偏好发「记住 …」，删除发「忘记 …」。\n"
     "7. 私聊：员工私聊只收催办和任务确认，查询请到群里 @我。"
 )
 HELP_TEXT = INTRO_TEXT + "\n\n" + USAGE_TEXT
+FAST_COMMANDS = frozenset({"帮助", "help", "?", "？"})
+PROGRESS_QUERY = "收到，正在查…"
+PROGRESS_INSOLE_QUERY = "正在定位鞋垫订单…"
+PROGRESS_INSOLE_PROCESS = "正在整理待处理清单…"
+
+
+def inbound_plain_text(text: str) -> str:
+    return re.sub(r"@[^\s]+\s*", "", str(text or "")).strip()
+
+
+def inbound_progress_text(text: str, *, conversation_type: str = "",
+                          admin: bool = False) -> str:
+    """慢查询先回一句，避免员工以为机器人没收到。"""
+    cleaned = inbound_plain_text(text)
+    if not cleaned or cleaned in FAST_COMMANDS:
+        return ""
+    if any(pattern.match(cleaned) for pattern in (
+        CONFIRM_PATTERN, BARE_CONFIRM_PATTERN, CANCEL_PATTERN, BARE_CANCEL_PATTERN,
+        BIND_PATTERN, WEB_BIND_PATTERN,
+    )):
+        return ""
+    if admin and any(pattern.match(cleaned) for pattern in (
+        ADMIN_REISSUE_WEB, ADMIN_SET_ROLE, ADMIN_UNSET_ROLE, ADMIN_LIST_BINDS,
+        ADMIN_APPROVE_ALL, ADMIN_APPROVE, ADMIN_REJECT_ALL, ADMIN_REJECT,
+    )):
+        return ""
+    if is_private_conversation(conversation_type) and not admin:
+        return ""
+    routed = route_message(cleaned)
+    if getattr(routed, "route", "") == "command":
+        return ""
+    intent = routed.intent
+    if intent is None:
+        return PROGRESS_QUERY
+    if intent.name == INSOLE_SCHEDULE:
+        return ""
+    if intent.name == INSOLE_QUERY:
+        return PROGRESS_INSOLE_QUERY
+    if intent.name == INSOLE_PROCESS:
+        return PROGRESS_INSOLE_PROCESS
+    return PROGRESS_QUERY
 PRIVATE_HELP_TEXT = (
     "我是采购助手。私聊只接收催办和任务确认，不开放对话。\n\n"
     "功能使用说明：\n"
@@ -84,7 +137,7 @@ PRIVATE_HELP_TEXT = (
 )
 PRIVATE_REFUSE_TEXT = (
     "我是采购助手。私聊只接收催办和任务确认。查询、换鞋垫、品控请到群里 @我。"
-    "绑定也请到群里发「绑定 姓名」；网页再发「绑定网页」。"
+    "绑定也请到群里发「绑定 姓名」。网页花名和密码在私信里，忘记了到群里发「绑定网页」。"
 )
 ADMIN_HELP_TEXT = (
     "我是采购助手。你是管理员，私聊可以使用全部能力。\n\n"
@@ -94,7 +147,9 @@ ADMIN_HELP_TEXT = (
     "如果同时有鞋垫等待办，光回「确认」会先执行待办，不会误批绑定。\n"
     "3. 拒绝：拒绝绑定 1；拒绝绑定全部\n"
     "角色：韩立私信「设置管理员 姓名」/「取消管理员 姓名」。普通管理员权限与韩立相同，只是不能改角色。\n"
-    "「绑定 姓名」会把你自己绑到该采购员名。\n\n"
+    "「绑定 姓名」会把你自己绑到该采购员名。\n"
+    "网页账号：发「补发网页账号」给所有已绑定员工私信花名和新密码；"
+    "「补发网页账号 利特」只发给一个人。密码不会出现在群里。\n\n"
     + USAGE_TEXT
 )
 
@@ -153,10 +208,11 @@ class DingTalkStreamChannel:
 
     def __init__(self, *, runner, sender: DingTalkSender, client_id: str, client_secret: str,
                  audit, enabled: bool = False, directory=None, quality=None, memories=None,
-                 admin_user_ids=(),
+                 admin_user_ids=(), insole_scheduler=None,
                  initial_backoff_seconds: float = 30, max_backoff_seconds: float = 600):
         self.runner = runner
         self.sender = sender
+        self.insole_scheduler = insole_scheduler
         self.client_id = str(client_id or "").strip()
         self.client_secret = str(client_secret or "").strip()
         self.audit = audit
@@ -180,6 +236,7 @@ class DingTalkStreamChannel:
         self.restart_count = 0
         self._in_flight_confirms: set[str] = set()
         self._confirm_threads: list[threading.Thread] = []
+        self._insole_schedule_busy = False
 
     @property
     def configured(self) -> bool:
@@ -272,18 +329,9 @@ class DingTalkStreamChannel:
             async def process(self, callback):
                 message = stream.ChatbotMessage.from_dict(callback.data)
                 channel.remember_incoming_webhook(message)
-                # handle 里会走 Playwright Sync API，不能停在 Stream 的 asyncio 循环上。
-                reply = await channel.handle_async(
-                    text=getattr(getattr(message, "text", None), "content", "") or "",
-                    message_id=getattr(message, "message_id", "") or "",
-                    conversation_id=getattr(message, "conversation_id", "") or "",
-                    sender_id=getattr(message, "sender_staff_id", "")
-                    or getattr(message, "sender_id", "") or "",
-                    sender_name=getattr(message, "sender_nick", "") or "",
-                    conversation_type=getattr(message, "conversation_type", "") or "",
-                )
-                if reply:
-                    self.reply_text(reply, message)
+                data = callback.data if isinstance(callback.data, dict) else {}
+                # 先 ACK，再后台查/写。定位鞋垫或跑模型时不能挡住下一条钉钉消息。
+                asyncio.create_task(channel._reply_later(self, message, data))
                 return stream.AckMessage.STATUS_OK, "OK"
 
         patch_stream_ssl()
@@ -314,6 +362,103 @@ class DingTalkStreamChannel:
         """把同步 handle 挪出 Stream 的 asyncio 循环，避免 Playwright Sync API 报错。"""
         return await asyncio.to_thread(self.handle, **kwargs)
 
+    async def _reply_later(self, handler, message, data) -> None:
+        """ACK 之后再回消息：慢查询不占用 Stream 下一条。"""
+        started = time.monotonic()
+        try:
+            if str((data or {}).get("msgtype") or "") == "file":
+                content = (data or {}).get("content") or {}
+                reply = await asyncio.to_thread(
+                    self.handle_file,
+                    file_name=str(content.get("fileName") or ""),
+                    download_code=str(content.get("downloadCode") or ""),
+                    conversation_id=getattr(message, "conversation_id", "") or "",
+                    sender_id=getattr(message, "sender_staff_id", "")
+                    or getattr(message, "sender_id", "") or "",
+                )
+            else:
+                text = getattr(getattr(message, "text", None), "content", "") or ""
+                sender_id = (
+                    getattr(message, "sender_staff_id", "")
+                    or getattr(message, "sender_id", "") or ""
+                )
+                sender_name = getattr(message, "sender_nick", "") or ""
+                conversation_type = getattr(message, "conversation_type", "") or ""
+                progress = inbound_progress_text(
+                    text,
+                    conversation_type=conversation_type,
+                    admin=self._is_admin(sender_id, sender_name),
+                )
+                if progress:
+                    try:
+                        await asyncio.to_thread(handler.reply_text, progress, message)
+                    except Exception:
+                        logger.warning("钉钉进度回执发送失败", exc_info=True)
+                reply = await self.handle_async(
+                    text=text,
+                    message_id=getattr(message, "message_id", "") or "",
+                    conversation_id=getattr(message, "conversation_id", "") or "",
+                    sender_id=sender_id,
+                    sender_name=sender_name,
+                    conversation_type=conversation_type,
+                )
+            if reply:
+                await asyncio.to_thread(handler.reply_text, reply, message)
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            if elapsed_ms >= 800:
+                logger.info("钉钉处理回消息用时 %sms", elapsed_ms)
+        except Exception:
+            logger.exception("钉钉后台回消息失败")
+
+    def handle_file(self, *, file_name: str, download_code: str,
+                    conversation_id: str, sender_id: str) -> str:
+        """员工发 xlsx 给机器人 → 更新订货表并重生成生产计划表。
+
+        只认 .xlsx；必须已绑定；重生成完成后再发一条结果到同一会话。
+        """
+        updater = getattr(self, "plan_updater", None)
+        if updater is None or not file_name.lower().endswith(".xlsx"):
+            return ""
+        if self.directory is not None:
+            bound = self.directory.get_by_dingtalk_user_id(sender_id)
+            if not (bound and bound.get("buyerName")):
+                return "请先在群里发「绑定 姓名」完成绑定，再发订货表。"
+        if not download_code:
+            return "没拿到文件下载凭证，请重新发送一次。"
+        try:
+            data = self.sender.fetch_robot_file(download_code)
+        except Exception as exc:
+            logger.warning("下载订货表失败：%s", exc)
+            return f"文件下载失败：{exc}"
+
+        def notify(text: str) -> None:
+            try:
+                self.sender.reply_text(conversation_id=conversation_id, text=text)
+            except Exception:
+                logger.exception("订货表更新结果通知失败")
+
+        from ..spu_plan.plan_source import PlanSourceError
+
+        try:
+            checked = updater.update(data, origin=f"dingtalk:{sender_id}", notify=notify)
+        except PlanSourceError as exc:
+            return f"订货表没有更新：{exc}"
+        if self.audit is not None:
+            try:
+                self.audit.record_delivery(
+                    channel="dingtalk", target=conversation_id,
+                    kind="plan_source_upload", status="received",
+                    detail={"fileName": file_name, "sender": sender_id,
+                            "styles": checked.get("styles")},
+                    idempotency_key=f"plan-source-{download_code[:48]}",
+                )
+            except Exception:
+                logger.exception("订货表上传审计失败")
+        return (
+            f"已收到「{file_name}」，校验通过（重点产品订货 {checked['styles']} 款）。"
+            f"正在重生成生产计划表，约 3 分钟，完成后这里会再发结果。"
+        )
+
     def remember_incoming_webhook(self, message) -> None:
         """把入站 sessionWebhook 缓存下来，催办主动群发才能真正 @ 到人。"""
         sender = self.sender
@@ -329,7 +474,7 @@ class DingTalkStreamChannel:
     def handle(self, *, text: str, message_id: str, conversation_id: str, sender_id: str,
                sender_name: str = "", conversation_type: str = "") -> str:
         """处理一条钉钉消息并返回要回复的文本。同一 message_id 只处理一次。"""
-        text = re.sub(r"@[^\s]+\s*", "", str(text or "")).strip()
+        text = inbound_plain_text(text)
         admin = self._is_admin(sender_id, sender_name)
         private = is_private_conversation(conversation_type)
         if not text:
@@ -421,6 +566,15 @@ class DingTalkStreamChannel:
                     return handled
             intent_handler = getattr(self.runner, "handle_intent", None)
             routed = route_message(text)
+            if (
+                routed.intent
+                and routed.intent.name == INSOLE_SCHEDULE
+                and self._can_notify()
+            ):
+                return self._handle_insole_schedule(
+                    conversation_id=conversation_id, sender_id=sender_id,
+                    operator=operator,
+                )
             if intent_handler is not None and not needs_llm_review(routed.intent):
                 intent_answer = intent_handler(
                     text, session_key=session_key, operator=operator,
@@ -462,6 +616,38 @@ class DingTalkStreamChannel:
         return (
             f"已开始写入 {count} 单，完成后会再发一条【任务完成】结果日志。"
             f"请稍等，不要重复确认。"
+        )
+
+    def _handle_insole_schedule(self, *, conversation_id: str, sender_id: str,
+                                operator: str) -> str:
+        scheduler = self.insole_scheduler or getattr(self.runner, "insole_scheduler", None)
+        if scheduler is None:
+            return "抖音鞋垫定时任务未装配。"
+        if self._insole_schedule_busy or getattr(scheduler, "_busy", threading.Lock()).locked():
+            return "上一轮抖音鞋垫还在跑，完成后会发总结，请不要重复触发。"
+        self._insole_schedule_busy = True
+
+        def worker():
+            try:
+                result = scheduler.run_once(trigger="manual", operator=operator or "manual")
+                if result.get("failed") and not result.get("doneText"):
+                    text = str(result.get("reply") or result.get("reason") or "执行失败")
+                    self._notify_done(conversation_id, sender_id, text)
+            except Exception as exc:
+                logger.exception("钉钉手动触发抖音鞋垫失败")
+                self._notify_done(
+                    conversation_id, sender_id,
+                    f"【任务失败】抖音换鞋垫执行失败：{exc}",
+                )
+            finally:
+                self._insole_schedule_busy = False
+
+        thread = threading.Thread(target=worker, name="dingtalk-insole-schedule", daemon=True)
+        self._confirm_threads.append(thread)
+        thread.start()
+        return (
+            "正在跑一轮抖音鞋垫，不需要再确认。"
+            "找到单会发【开始执行】，写完再发总结。"
         )
 
     def _handle_confirm(self, execute, *, conversation_id: str, sender_id: str,
@@ -584,38 +770,122 @@ class DingTalkStreamChannel:
 
     def _issue_web_bind(self, sender_id: str, sender_name: str, *, private: bool, admin: bool) -> str:
         if private and not admin:
-            return "绑定网页请到群里 @我 发「绑定网页」，身份码会私信给你。"
+            return "开通网页账号请到群里 @我 发「绑定网页」，花名和密码会私信给你。"
         if self.directory is None:
-            return "员工目录未就绪，暂时不能发网页身份码。"
+            return "员工目录未就绪，暂时不能开通网页账号。"
         bound = self.directory.get_by_dingtalk_user_id(sender_id)
         if not bound:
             return "请先到群里发「绑定 你的采购员姓名」，管理员同意后再发「绑定网页」。"
+        try:
+            issued = self._issue_web_account(bound)
+        except WebAuthError as exc:
+            return str(exc)
+        notice = self._web_account_notice(issued)
+        sent = self._send_oto(sender_id, "网页登录", notice)
+        if private:
+            return notice
+        if sent:
+            return "网页登录账号已私信给你。用花名和密码登录，30 天不用再输。不要把密码发到群里。"
+        return "账号已生成，但私信发送失败。请再发一次「绑定网页」，或检查机器人是否已开通单聊。"
+
+    def reissue_web_accounts(self, name: str = "") -> str:
+        """给已绑定员工补发网页花名和新密码。返回给管理员的摘要，不含密码。"""
+        if self.directory is None:
+            return "员工目录未就绪，暂时不能补发网页账号。"
+        try:
+            targets = self._bound_web_targets(name)
+        except ValueError as exc:
+            return str(exc)
+        if not targets:
+            return "没有已绑定且带钉钉账号的员工，没法补发。"
+        sent_names = []
+        failed_names = []
+        reset_count = 0
+        passwords = []
+        for bound in targets:
+            sender = str(bound.get("dingtalkUserId") or "").strip()
+            label = str(bound.get("buyerName") or sender)
+            try:
+                issued = self._issue_web_account(bound)
+            except WebAuthError as exc:
+                failed_names.append(f"{label}（{exc}）")
+                continue
+            if issued.get("reset"):
+                reset_count += 1
+            notice = self._web_account_notice(issued)
+            passwords.append(str(issued.get("password") or ""))
+            if self._send_oto(sender, "网页登录", notice):
+                sent_names.append(issued.get("username") or label)
+            else:
+                failed_names.append(f"{label}（私信失败）")
+        lines = [
+            "已给已绑定员工补发网页登录账号。密码只走私信，不会出现在这条回复里。",
+            f"已私信 {len(sent_names)} 人"
+            + (f"：{'、'.join(sent_names)}" if sent_names else ""),
+        ]
+        if reset_count:
+            lines.append(f"其中 {reset_count} 人是重置，网页上已经登录的会退出。")
+        if failed_names:
+            lines.append(
+                "私信失败：" + "、".join(failed_names)
+                + "。请对方到群里发「绑定网页」，或检查机器人是否已开通单聊。"
+            )
+        reply = "\n".join(line for line in lines if line)
+        for secret in passwords:
+            if secret and secret in reply:
+                reply = reply.replace(secret, "********")
+        return reply
+
+    def _bound_web_targets(self, name: str = "") -> list[dict]:
+        name = str(name or "").strip()
+        if name:
+            bound = self.directory.find_binding(operator=name)
+            if not bound:
+                raise ValueError(f"找不到已绑定员工「{name}」")
+            if not bound.get("dingtalkUserId"):
+                raise ValueError(f"「{bound.get('buyerName') or name}」还没有钉钉账号，无法私信")
+            return [bound]
+        seen = set()
+        targets = []
+        for item in self.directory.list():
+            sender = str(item.get("dingtalkUserId") or "").strip()
+            if not sender or sender in seen:
+                continue
+            seen.add(sender)
+            targets.append(self.directory.get_by_dingtalk_user_id(sender) or item)
+        return targets
+
+    def _issue_web_account(self, bound: dict) -> dict:
+        sender_id = str(bound.get("dingtalkUserId") or "").strip()
+        buyer_name = str(bound.get("buyerName") or "").strip()
         user_id = str(bound.get("userId") or "")
         users = getattr(self.runner, "users", None)
-        if not user_id and users is not None:
+        if not user_id and users is not None and sender_id:
             hit = users.resolve_by_dingtalk(sender_id)
             if getattr(hit, "matched", False):
                 user_id = hit.user_id
+        return WebAuth(self.directory.store).issue_account(
+            sender_id=sender_id, buyer_name=buyer_name, user_id=user_id,
+        )
+
+    def _web_account_notice(self, issued: dict, *, preamble: str = "") -> str:
+        return format_web_login_notice(
+            username=issued.get("username") or issued.get("buyerName") or "",
+            password=issued.get("password") or "",
+            login_url=web_login_url(),
+            preamble=preamble,
+        )
+
+    def _deliver_web_account(self, sender_id: str, bound: dict, *, preamble: str = "") -> str:
+        """生成账号并私信。成功返回空串，失败返回给管理员看的短说明。"""
         try:
-            issued = WebAuth(self.directory.store).issue_code(
-                sender_id=sender_id,
-                buyer_name=bound.get("buyerName") or sender_name,
-                user_id=user_id,
-            )
+            issued = self._issue_web_account(bound)
         except WebAuthError as exc:
             return str(exc)
-        code_text = (
-            f"网页身份码：{issued['code']}\n"
-            f"对应采购员：{issued['buyerName']}\n"
-            "10 分钟内有效，只能用一次。在网页填写与钉钉绑定一致的姓名和这串码。"
-            "不要把码发到群里或转给别人。"
-        )
-        sent = self._send_oto(sender_id, "网页身份码", code_text)
-        if private:
-            return code_text
-        if sent:
-            return "身份码已私信给你，10 分钟内在网页填写姓名和 20 位码。不要把码发到群里。"
-        return "身份码已生成，但私信发送失败。请再发一次「绑定网页」，或检查机器人是否已开通单聊。"
+        notice = self._web_account_notice(issued, preamble=preamble)
+        if self._send_oto(sender_id, "网页登录", notice):
+            return ""
+        return "网页账号已生成但私信失败，请对方到群里发「绑定网页」"
 
     def _operator(self, sender_id: str, sender_name: str) -> str:
         if self.directory:
@@ -626,6 +896,9 @@ class DingTalkStreamChannel:
 
     def _handle_admin_bind_command(self, text: str, sender_id: str, sender_name: str,
                                    *, session_key: str = "", operator: str = ""):
+        reissue = ADMIN_REISSUE_WEB.match(text)
+        if reissue:
+            return self.reissue_web_accounts((reissue.group(2) or "").strip())
         if self.bind_requests is None:
             return None
         pending = self.bind_requests.list_pending()
@@ -705,12 +978,27 @@ class DingTalkStreamChannel:
                     self.bind_requests.reopen(request_id)
                     done.append(f"{request_id}：{exc}")
                     continue
-                self._notify_employee(
-                    decided["senderId"],
-                    f"管理员已同意绑定「{names}」。之后催办和确认都会对上这个身份。",
+                bind_note = (
+                    f"管理员已同意绑定「{names}」。之后催办和确认都会对上这个身份。"
+                )
+                bound = self.directory.get_by_dingtalk_user_id(decided["senderId"])
+                web_fail = ""
+                if bound:
+                    web_fail = self._deliver_web_account(
+                        decided["senderId"], bound, preamble=bind_note,
+                    )
+                if web_fail or not bound:
+                    self._notify_employee(
+                        decided["senderId"],
+                        bind_note if not web_fail else (
+                            bind_note + "\n\n网页登录请到群里发「绑定网页」领取花名和密码。"
+                        ),
+                    )
+                extra = "；网页账号已私信" if bound and not web_fail else (
+                    f"；{web_fail}" if web_fail else ""
                 )
                 self._notify_group_bind_success(decided)
-                done.append(f"已同意 {who} → {names}")
+                done.append(f"已同意 {who} → {names}{extra}")
             else:
                 self._notify_employee(
                     decided["senderId"],
@@ -770,9 +1058,13 @@ class DingTalkStreamChannel:
         except ValueError as exc:
             return str(exc)
         joined = "、".join(bound)
+        row = self.directory.get_by_dingtalk_user_id(sender_id)
+        web_fail = self._deliver_web_account(sender_id, row) if row else "还没有钉钉账号"
+        web_note = "网页登录账号已私信。" if not web_fail else f"{web_fail}。"
         return (
             f"已绑定：钉钉账号 {sender_name or sender_id} → 采购员「{joined}」。"
             "花名和「真名（花名）」会视为同一个人，催办 @ 和确认都能对上。"
+            f" {web_note}"
         )
 
     def _admin_bind_notice(self, request: dict) -> str:
